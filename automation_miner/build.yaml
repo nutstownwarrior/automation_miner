@@ -1,0 +1,21 @@
+---
+# Pinned to the Home Assistant base-python images rather than the plain Alpine
+# base, so the Python version is EXPLICIT and stable.
+#
+# The plain base image tracks whatever Python the current Alpine release ships
+# (3.14 at the time of writing), which silently changes under the add-on: a base
+# bump would move the interpreter and invalidate every pinned wheel in
+# requirements.txt without a single line of this repository changing. The
+# date-stamped tag pins Python, Alpine and the base build together.
+#
+# If you change the Python version here, update the `--python-version` used by
+# the "Image deps resolve to wheels" CI job to match - a test enforces that they
+# agree - and re-verify that every pin in requirements.txt still has a wheel.
+build_from:
+  amd64: ghcr.io/home-assistant/amd64-base-python:3.13-alpine3.23-2026.05.0
+  aarch64: ghcr.io/home-assistant/aarch64-base-python:3.13-alpine3.23-2026.05.0
+labels:
+  org.opencontainers.image.title: Automation Miner
+  org.opencontainers.image.description: Mines Home Assistant history for explainable automation suggestions
+  org.opencontainers.image.source: https://github.com/nutstownwarrior/automation_miner
+  org.opencontainers.image.licenses: MIT

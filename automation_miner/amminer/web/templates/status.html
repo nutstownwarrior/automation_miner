@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+{% set active = 'status' %}
+{% block content %}
+<h2>Status</h2>
+
+<section class="panel">
+  <h3>Data sources</h3>
+  {% if report %}
+  <dl class="metrics wide">
+    <div><dt>Recorder</dt><dd>{{ report.recorder.get('dialect') }} ({{ report.recorder.get('source') }})</dd></div>
+    <div><dt>Raw history</dt><dd>{{ report.recorder.get('history_days') }} days</dd></div>
+    <div><dt>purge_keep_days</dt><dd>{{ report.recorder.get('purge_keep_days') }}</dd></div>
+    <div><dt>Normalised schema</dt><dd>{{ 'yes' if report.recorder.get('normalised_schema') else 'no' }}</dd></div>
+    <div><dt>Context columns</dt><dd>{{ 'binary' if report.recorder.get('has_binary_context') else ('text' if report.recorder.get('has_text_context') else 'none') }}</dd></div>
+    <div><dt>Long-term statistics</dt><dd>{{ 'available' if report.recorder.get('has_statistics') else 'missing' }}</dd></div>
+    <div><dt>State rows analysed</dt><dd>{{ report.state_rows }}</dd></div>
+    <div><dt>Overrides detected</dt><dd>{{ report.overrides }}</dd></div>
+  </dl>
+
+  <h4>Entities</h4>
+  <dl class="metrics wide">
+    <div><dt>Total</dt><dd>{{ report.entities.get('total', 0) }}</dd></div>
+    <div><dt>Registry only</dt><dd>{{ report.entities.get('registry_only', 0) }}</dd></div>
+    <div><dt>States only (no unique_id)</dt><dd>{{ report.entities.get('states_only', 0) }}</dd></div>
+    <div><dt>With an area</dt><dd>{{ report.entities.get('with_area', 0) }}</dd></div>
+  </dl>
+
+  <h4>Causality</h4>
+  <dl class="metrics wide">
+    {% for cause, count in (report.causality or {}).items() %}
+    <div><dt>{{ cause }}</dt><dd>{{ count }}</dd></div>
+    {% endfor %}
+  </dl>
+
+  <h4>External signals detected</h4>
+  {% if report.signals %}
+  <ul class="plain small">
+    {% for role, entities in report.signals.items() %}
+    <li><strong>{{ role.replace('_', ' ') }}</strong>: {{ entities | join(', ') }}</li>
+    {% endfor %}
+  </ul>
+  {% else %}<p class="muted">None detected.</p>{% endif %}
+
+  {% if report.degradations %}
+  <h4>Degradations</h4>
+  <ul class="small">{% for d in report.degradations %}<li>{{ d }}</li>{% endfor %}</ul>
+  {% endif %}
+  {% else %}
+  <p class="muted">No analysis has run yet in this session.</p>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <h3>LLM</h3>
+  <dl class="metrics wide">
+    <div><dt>Provider</dt><dd>{{ llm.provider }}</dd></div>
+    <div><dt>Available</dt><dd>{{ 'yes' if llm.available else 'no' }}</dd></div>
+    {% if llm.base_url %}<div><dt>Endpoint</dt><dd>{{ llm.base_url }}</dd></div>{% endif %}
+    {% if llm.model %}<div><dt>Model</dt><dd>{{ llm.model }}</dd></div>{% endif %}
+  </dl>
+  {% if llm.error %}<p class="muted small">{{ llm.error }}</p>{% endif %}
+</section>
+
+<section class="panel">
+  <h3>Recent runs</h3>
+  <table class="grid">
+    <thead><tr><th>Started</th><th>Status</th><th>Surfaced</th><th>Rejected</th><th>Window</th></tr></thead>
+    <tbody>
+    {% for run in runs %}
+      <tr>
+        <td>{{ run.started_ts | int }}</td>
+        <td class="{{ 'ok' if run.status == 'ok' else 'warn' }}">{{ run.status }}</td>
+        <td>{{ run.stats.get('surfaced', 0) }}</td>
+        <td>{{ run.stats.get('rejected', 0) }}</td>
+        <td>{{ run.stats.get('window_days', 0) }} d</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="panel">
+  <h3>Stored data</h3>
+  <dl class="metrics wide">
+    {% for table, count in counts.items() %}<div><dt>{{ table }}</dt><dd>{{ count }}</dd></div>{% endfor %}
+  </dl>
+</section>
+{% endblock %}

@@ -1,0 +1,54 @@
+{% macro evidence_block(evidence) %}
+  {% if evidence %}
+  <div class="evidence">
+    <h4>Why this was suggested</h4>
+    {% if evidence.summary %}<p class="lead">{{ evidence.summary }}</p>{% endif %}
+    <ul>
+      {% for note in evidence.notes or [] %}<li>{{ note }}</li>{% endfor %}
+    </ul>
+    <dl class="metrics">
+      {% if evidence.occurrences %}<div><dt>Occurrences</dt><dd>{{ evidence.occurrences }}</dd></div>{% endif %}
+      {% if evidence.opportunities %}<div><dt>Opportunities</dt><dd>{{ evidence.opportunities }}</dd></div>{% endif %}
+      {% if evidence.consistency is not none %}<div><dt>Consistency</dt><dd>{{ '%.0f%%' % (evidence.consistency * 100) }}</dd></div>{% endif %}
+      {% if evidence.confidence is not none %}<div><dt>Confidence</dt><dd>{{ '%.0f%%' % (evidence.confidence * 100) }}</dd></div>{% endif %}
+      {% if evidence.lift is not none %}<div><dt>Lift</dt><dd>{{ '%.2f' % evidence.lift }}</dd></div>{% endif %}
+      {% if evidence.window_days %}<div><dt>Data window</dt><dd>{{ '%.0f' % evidence.window_days }} days</dd></div>{% endif %}
+    </dl>
+  </div>
+  {% endif %}
+{% endmacro %}
+
+{% macro backtest_block(backtest) %}
+  {% if backtest %}
+  <div class="backtest {{ 'pass' if backtest.passed else 'fail' }}">
+    <h4>Backtest against your real history</h4>
+    <p class="lead">{{ backtest.summary }}</p>
+    {% if backtest.simulated %}
+    <dl class="metrics">
+      <div><dt>Correct fires</dt><dd>{{ backtest.true_fires }}</dd></div>
+      <div><dt>Unwanted fires</dt><dd>{{ backtest.false_fires }}</dd></div>
+      <div><dt>Per week</dt><dd>{{ backtest.false_fires_per_week }}</dd></div>
+      <div><dt>Missed</dt><dd>{{ backtest.missed }}</dd></div>
+      {% if backtest.nuisance_fires %}<div><dt>Nuisance</dt><dd>{{ backtest.nuisance_fires }}</dd></div>{% endif %}
+    </dl>
+    {% endif %}
+    <p class="muted small">{{ backtest.reason }}</p>
+  </div>
+  {% endif %}
+{% endmacro %}
+
+{% macro conflict_block(conflicts) %}
+  {% if conflicts %}
+  <div class="conflicts">
+    <h4>Conflicts with what you already have</h4>
+    <ul>
+      {% for conflict in conflicts %}
+      <li class="sev-{{ conflict.severity }}">
+        <span class="tag {{ conflict.severity }}">{{ conflict.kind.replace('_', ' ') }}</span>
+        {{ conflict.message }}
+      </li>
+      {% endfor %}
+    </ul>
+  </div>
+  {% endif %}
+{% endmacro %}

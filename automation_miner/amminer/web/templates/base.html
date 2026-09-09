@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Automation Miner{% endblock %}</title>
+  <link rel="stylesheet" href="{{ base }}/static/app.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="pick">⛏</span>
+    <div>
+      <h1>Automation Miner</h1>
+      <p class="muted">v{{ version }} &middot; suggest-only, nothing acts by itself</p>
+    </div>
+  </div>
+  <nav>
+    <a href="{{ base }}/" class="{{ 'active' if active == 'suggestions' }}">Suggestions</a>
+    <a href="{{ base }}/gaps" class="{{ 'active' if active == 'gaps' }}">Gaps</a>
+    <a href="{{ base }}/audit" class="{{ 'active' if active == 'audit' }}">Audit</a>
+    <a href="{{ base }}/dismissed" class="{{ 'active' if active == 'dismissed' }}">Archive</a>
+    <a href="{{ base }}/status" class="{{ 'active' if active == 'status' }}">Status</a>
+    <button id="run-now" class="btn primary" type="button">Analyse now</button>
+  </nav>
+</header>
+
+<main>
+  {% block content %}{% endblock %}
+</main>
+
+<footer class="muted">
+  Automation Miner mines your own history. It never sends raw history anywhere,
+  and never enables an automation without you clicking Apply.
+</footer>
+
+<div id="toast" class="toast" hidden></div>
+<script>window.AMMINER_BASE = {{ base | tojson }};</script>
+<script src="{{ base }}/static/app.js"></script>
+</body>
+</html>

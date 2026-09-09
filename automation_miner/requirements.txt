@@ -1,0 +1,39 @@
+# --- web / runtime ---
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+jinja2==3.1.5
+httpx==0.28.1
+python-dateutil==2.9.0.post0
+PyYAML==6.0.2
+voluptuous==0.15.2
+croniter==6.0.0
+
+# Pinned explicitly so the image and CI agree on the major version: without it
+# pip can backtrack to pydantic 1.x while resolving under musl tags, and FastAPI
+# behaves differently on v1.
+pydantic==2.10.4
+
+# --- database access (pure-python drivers: musl/Alpine friendly) ---
+SQLAlchemy==2.0.36
+PyMySQL==1.1.1
+pg8000==1.31.2
+
+# --- mining ---
+# All three ship musllinux wheels, so the Alpine image needs no compiler.
+# See requirements-nodeps.txt for why mlxtend is installed separately.
+numpy==2.2.1
+pandas==2.2.3
+scipy==1.15.3
+
+# Deliberately NOT installed:
+#   scikit-learn - publishes no musllinux wheels for ANY version, so on the
+#     Alpine base it would be built from source (meson + OpenMP) on every arch.
+#     Nothing in this package imports it; it was only ever pulled in as an
+#     mlxtend dependency, which requirements-nodeps.txt avoids. If a future
+#     miner genuinely needs it, re-add it here and switch build.yaml to the
+#     Debian base images at the same time.
+#   matplotlib - another mlxtend dependency, useless in a headless add-on.
+#   stumpy / numba - optional matrix-profile acceleration; no musllinux wheels.
+#     amminer.miners.motif imports stumpy lazily and falls back cleanly.
+#   river - optional online learning, imported lazily if present.
+#   torch - never imported at startup; only if a future ML model needs it.

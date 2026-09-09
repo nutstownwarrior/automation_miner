@@ -1,0 +1,13 @@
+#!/command/with-contenv bashio
+# ==============================================================================
+# Automation Miner - main service
+# ==============================================================================
+declare log_level
+
+log_level="$(bashio::config 'log_level' 'info')"
+export AMMINER_LOG_LEVEL="${log_level}"
+export AMMINER_OPTIONS_PATH="/data/options.json"
+
+bashio::log.info "Starting Automation Miner..."
+
+exec python3 -m amminer

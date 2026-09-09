@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% set active = 'audit' %}
+{% block content %}
+<h2>Conflicts &amp; redundancy in your existing automations</h2>
+{% if not findings %}
+<div class="empty"><p>No conflicts found between your existing automations.</p></div>
+{% endif %}
+<ul class="plain findings">
+{% for f in findings %}
+  <li class="sev-{{ f.severity }}">
+    <span class="tag {{ f.severity }}">{{ f.kind.replace('_', ' ') }}</span>
+    {{ f.message }}
+    <span class="muted small">{{ f.automations | join(' / ') }}</span>
+  </li>
+{% endfor %}
+</ul>
+
+<h2>Overrides <span class="count">{{ overrides | length }}</span></h2>
+<p class="muted">
+  Times you corrected an automation within seconds. Each one counts as negative
+  feedback for that automation and positive evidence for what you actually wanted.
+</p>
+{% if override_counts %}
+<ul class="plain">
+{% for automation, count in override_counts.items() %}
+  <li><strong>{{ automation }}</strong> overridden <strong>{{ count }}</strong> times</li>
+{% endfor %}
+</ul>
+{% endif %}
+<table class="grid">
+  <thead><tr><th>Entity</th><th>Automation set</th><th>You set</th><th>After</th></tr></thead>
+  <tbody>
+  {% for o in overrides[:50] %}
+    <tr>
+      <td><code>{{ o.entity_id }}</code></td>
+      <td>{{ o.automation_state }}</td>
+      <td>{{ o.human_state }}</td>
+      <td>{{ '%.0f' % (o.delay_seconds or 0) }}s</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

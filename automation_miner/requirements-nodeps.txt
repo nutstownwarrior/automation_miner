@@ -1,0 +1,12 @@
+# Installed with `pip install --no-deps`.
+#
+# mlxtend declares scikit-learn, matplotlib and joblib as install requirements,
+# but the only part of it this add-on uses - mlxtend.frequent_patterns
+# (fpgrowth / apriori / association_rules) - needs nothing beyond numpy, pandas
+# and scipy, all of which requirements.txt already pins.
+#
+# Installing it without its dependency closure keeps scikit-learn (no musllinux
+# wheels) and matplotlib out of the image entirely.  amminer.miners.association
+# provides its own one-hot encoder so that mlxtend.preprocessing - the module
+# that does import scikit-learn - is never touched.
+mlxtend==0.23.4

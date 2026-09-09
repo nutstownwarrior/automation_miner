@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% set active = 'dismissed' %}
+{% block content %}
+<h2>Archive</h2>
+<p class="muted">Dismissed suggestions are never suggested again. Applied ones are listed for reference.</p>
+{% if not suggestions %}<div class="empty"><p>Nothing archived yet.</p></div>{% endif %}
+<ul class="plain findings">
+{% for s in suggestions %}
+  <li>
+    <span class="tag status">{{ s.status }}</span>
+    <strong>{{ s.title }}</strong>
+    <span class="muted small">{{ s.summary }}</span>
+    {% if s.status == 'dismissed' %}
+    <button class="btn ghost small" data-action="restore" data-id="{{ s.id }}">Restore</button>
+    {% endif %}
+  </li>
+{% endfor %}
+</ul>
+{% endblock %}

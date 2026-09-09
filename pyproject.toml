@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "automation-miner"
+version = "0.1.0"
+description = "Home Assistant add-on that mines history for explainable automation suggestions"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+[tool.setuptools]
+package-dir = { "" = "automation_miner" }
+
+[tool.setuptools.packages.find]
+where = ["automation_miner"]
+include = ["amminer*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["automation_miner"]
+addopts = "-q --strict-markers"
+filterwarnings = [
+  "ignore::DeprecationWarning",
+  "ignore::UserWarning",
+]
+markers = [
+  "mariadb: needs a live MariaDB/MySQL server (set AMMINER_TEST_MYSQL_URL)",
+  "slow: takes more than a couple of seconds",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4"]
+ignore = ["E501", "B008"]

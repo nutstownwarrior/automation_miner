@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% set active = 'gaps' %}
+{% block content %}
+<h2>Integration &amp; hardware gaps</h2>
+<p class="muted">Each of these comes from something your own history shows you want but cannot express today.</p>
+{% if not gaps %}<div class="empty"><p>No gaps detected.</p></div>{% endif %}
+<div class="cards">
+{% for g in gaps %}
+  {% set p = g.payload %}
+  <article class="card {{ 'muted-card' if g.status != 'new' }}">
+    <header>
+      <span class="tag">{{ p.kind }}</span>
+      <span class="score">{{ '%.2f' % (p.score or 0) }}</span>
+    </header>
+    <h3>{{ g.title }}</h3>
+    <h4>The gap</h4><p class="small">{{ p.gap }}</p>
+    <h4>What to add</h4><p class="small">{{ p.recommendation }}</p>
+    <h4>What you get</h4><p class="small">{{ p.benefit }}</p>
+    {% if p.evidence %}
+    <details><summary>Evidence</summary>
+      <ul class="small">{% for e in p.evidence %}<li>{{ e }}</li>{% endfor %}</ul>
+    </details>
+    {% endif %}
+    {% if g.status == 'new' %}
+    <footer class="actions">
+      <button class="btn ghost danger" data-action="dismiss-gap" data-id="{{ g.id }}">Not interested</button>
+    </footer>
+    {% endif %}
+  </article>
+{% endfor %}
+</div>
+{% endblock %}

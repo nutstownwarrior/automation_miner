@@ -1,0 +1,143 @@
+"""The add-on's own SQLite store: persistence, dismissals, feedback."""
+
+from __future__ import annotations
+
+from amminer.store.db import STATUS_ACCEPTED, STATUS_DISMISSED, STATUS_NEW, Store
+
+
+def add(store, suggestion_id="s1", miner="time_of_day", score=0.8, run_id=1):
+    return store.upsert_suggestion(
+        suggestion_id, miner, "Title", "Summary", score, {"actions": [{"service": "light.turn_on"}]}, run_id
+    )
+
+
+def test_schema_is_created_and_counts_start_empty(store):
+    assert store.get_meta("schema_version") == "1"
+    assert all(count == 0 for count in store.counts().values())
+
+
+def test_upsert_then_read_back(store):
+    assert add(store) == STATUS_NEW
+    stored = store.get_suggestion("s1")
+    assert stored["title"] == "Title"
+    assert stored["payload"]["actions"][0]["service"] == "light.turn_on"
+    assert stored["seen_count"] == 1
+
+
+def test_re_seeing_increments_without_resetting_status(store):
+    add(store)
+    store.set_status("s1", STATUS_ACCEPTED)
+    add(store, score=0.9)
+    stored = store.get_suggestion("s1")
+    assert stored["seen_count"] == 2
+    assert stored["score"] == 0.9
+    assert stored["status"] == STATUS_ACCEPTED
+
+
+def test_dismissal_is_sticky_across_runs(store):
+    add(store)
+    store.dismiss("s1", "not useful", signature="s1")
+    assert store.is_dismissed("s1") is True
+    # A later run rediscovers the same rule; it must stay dismissed.
+    assert add(store, run_id=2) == STATUS_DISMISSED
+    assert store.get_suggestion("s1")["status"] == STATUS_DISMISSED
+    assert store.list_suggestions(status=STATUS_NEW) == []
+
+
+def test_dismissed_signature_blocks_a_renamed_duplicate(store):
+    add(store)
+    store.dismiss("s1", signature="sig-abc")
+    assert store.is_dismissed("other", signature="sig-abc") is True
+    assert "sig-abc" in store.dismissed_signatures()
+
+
+def test_dismissal_records_feedback(store):
+    add(store)
+    store.dismiss("s1", "too noisy")
+    kinds = [f["kind"] for f in store.feedback_for("s1")]
+    assert "dismissed" in kinds
+    assert store.feedback_for("s1")[0]["payload"]["reason"] == "too noisy"
+
+
+def test_prune_removes_stale_new_suggestions_only(store):
+    add(store, "old", run_id=1)
+    add(store, "kept", run_id=2)
+    add(store, "accepted", run_id=1)
+    store.set_status("accepted", STATUS_ACCEPTED)
+    removed = store.prune_suggestions(run_id=2)
+    assert removed == 1
+    assert store.get_suggestion("old") is None
+    assert store.get_suggestion("kept") is not None
+    assert store.get_suggestion("accepted") is not None
+
+
+def test_backtest_round_trip(store):
+    add(store)
+    store.save_backtest("s1", {"precision": 0.9, "recall": 0.8, "true_fires": 9,
+                               "false_fires": 1, "missed": 2, "false_fires_per_week": 0.5,
+                               "passed": True, "summary": "good"})
+    stored = store.get_backtest("s1")
+    assert stored["precision_score"] == 0.9
+    assert stored["passed"] == 1
+    assert stored["payload"]["summary"] == "good"
+    # It is also attached when the suggestion is read.
+    assert store.get_suggestion("s1")["backtest"]["precision_score"] == 0.9
+
+
+def test_overrides_are_deduplicated(store):
+    from amminer.recorderdb.models import OverrideEvent
+
+    events = [
+        OverrideEvent("light.a", 100.0, "automation.x", "off", "on", 20.0),
+        OverrideEvent("light.a", 100.0, "automation.x", "off", "on", 20.0),  # duplicate
+        OverrideEvent("light.b", 200.0, "automation.x", "on", "off", 30.0),
+    ]
+    store.record_overrides(events)
+    store.record_overrides(events)  # a second run over the same window
+    assert store.counts()["overrides"] == 2
+    assert store.override_counts() == {"automation.x": 2}
+    assert len(store.overrides_for_automation("automation.x")) == 2
+
+
+def test_shadow_report(store):
+    add(store)
+    store.log_shadow_fire("s1", 100.0, matched=True)
+    store.log_shadow_fire("s1", 200.0, matched=True)
+    store.log_shadow_fire("s1", 300.0, matched=False)
+    report = store.shadow_report("s1")
+    assert report == {"fires": 3, "matched": 2, "unmatched": 1, "precision": 2 / 3}
+
+
+def test_runs_are_tracked(store):
+    run_id = store.start_run()
+    store.finish_run(run_id, "ok", {"surfaced": 4})
+    last = store.last_run()
+    assert last["status"] == "ok"
+    assert last["stats"]["surfaced"] == 4
+    assert len(store.recent_runs()) == 1
+
+
+def test_gap_suggestions_round_trip(store):
+    store.upsert_gap("g1", "hardware", "Add mmWave", {"gap": "no presence"})
+    assert len(store.list_gaps("new")) == 1
+    store.set_gap_status("g1", "dismissed")
+    assert store.list_gaps("new") == []
+    assert store.list_gaps()[0]["payload"]["gap"] == "no presence"
+
+
+def test_listing_filters_and_orders(store):
+    add(store, "a", miner="time_of_day", score=0.2)
+    add(store, "b", miner="association", score=0.9)
+    ordered = [s["id"] for s in store.list_suggestions()]
+    assert ordered == ["b", "a"]
+    assert [s["id"] for s in store.list_suggestions(miner="association")] == ["b"]
+
+
+def test_store_survives_reopen(tmp_path):
+    path = tmp_path / "state.db"
+    with Store(path) as store:
+        add(store)
+        store.dismiss("s1")
+    with Store(path) as store:
+        assert store.is_dismissed("s1") is True
+        assert store.get_suggestion("s1")["status"] == STATUS_DISMISSED
