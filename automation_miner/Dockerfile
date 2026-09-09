@@ -4,7 +4,6 @@ FROM ${BUILD_FROM}
 
 ENV LANG=C.UTF-8 \
     PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     AMMINER_STATE_DIR=/config
@@ -28,17 +27,26 @@ RUN apk add --no-cache tzdata libstdc++ \
 WORKDIR /opt/automation_miner
 
 COPY requirements.txt requirements-nodeps.txt ./
-RUN pip3 install --break-system-packages --no-cache-dir --only-binary=:all: -r requirements.txt \
-    && pip3 install --break-system-packages --no-cache-dir --no-deps -r requirements-nodeps.txt \
-    && find /usr/lib/python3*/site-packages -name '__pycache__' -type d -prune -exec rm -rf {} + \
-    && find /usr/lib/python3*/site-packages -name 'tests' -type d -prune -exec rm -rf {} +
+# --no-compile keeps the ~40 MB of build-time .pyc out of the image; the
+# running container writes its own bytecode cache on first start. Nothing here
+# hardcodes a site-packages path: base images disagree about it (Alpine's
+# python3 lives in /usr/lib, base-python builds into /usr/local), and guessing
+# wrong fails the build.
+RUN pip3 install --break-system-packages --no-cache-dir --no-compile \
+        --only-binary=:all: -r requirements.txt \
+    && pip3 install --break-system-packages --no-cache-dir --no-compile \
+        --no-deps -r requirements-nodeps.txt \
+    && python3 -c "import fastapi, mlxtend.frequent_patterns, numpy, pandas, sqlalchemy"
+
+ENV PYTHONPATH=/opt/automation_miner
 
 COPY amminer ./amminer
 COPY rootfs /
 
-RUN chmod -R +x /etc/s6-overlay/s6-rc.d
-
-ENV PYTHONPATH=/opt/automation_miner
+# Fail the build, not the user's first start, if the image cannot actually run
+# the add-on: this imports the whole dependency graph the service needs.
+RUN chmod -R +x /etc/s6-overlay/s6-rc.d \
+    && python3 -c "import amminer, amminer.pipeline, amminer.web.app; print('automation_miner', amminer.__version__)"
 
 LABEL \
     io.hass.name="Automation Miner" \

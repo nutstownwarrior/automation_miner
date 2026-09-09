@@ -299,6 +299,26 @@ def test_mlxtend_is_installed_without_its_dependency_closure():
     assert "--no-deps -r requirements-nodeps.txt" in dockerfile
 
 
+def test_dockerfile_hardcodes_no_site_packages_path():
+    """Base images disagree about where site-packages lives.
+
+    Alpine's python3 uses /usr/lib/pythonX.Y, base-python builds into
+    /usr/local. A hardcoded path failed the image build once already.
+    """
+    dockerfile = (ADDON_DIR / "Dockerfile").read_text()
+    assert "/usr/lib/python3" not in dockerfile
+    assert "/usr/local/lib/python3" not in dockerfile
+
+
+def test_dockerfile_smoke_imports_the_package():
+    """A broken image must fail the build, not the user's first start."""
+    dockerfile = (ADDON_DIR / "Dockerfile").read_text()
+    assert "import amminer" in dockerfile
+    assert "mlxtend.frequent_patterns" in dockerfile, (
+        "the build must prove mlxtend works without its dependency closure"
+    )
+
+
 def test_dockerfile_installs_wheels_only():
     """No compiler is installed, so a source build would fail the image build."""
     dockerfile = (ADDON_DIR / "Dockerfile").read_text()
