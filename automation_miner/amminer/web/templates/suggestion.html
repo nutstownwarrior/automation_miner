@@ -1,0 +1,93 @@
+{% extends "base.html" %}
+{% set active = 'suggestions' %}
+{% import "_macros.html" as m %}
+{% block title %}{{ suggestion.title }}{% endblock %}
+{% block content %}
+{% set p = suggestion.payload %}
+
+<p><a href="{{ base }}/" class="back">&larr; All suggestions</a></p>
+
+<article class="detail">
+  <header>
+    <span class="tag miner">{{ suggestion.miner.replace('_', ' ') }}</span>
+    <span class="score">{{ '%.2f' % suggestion.score }}</span>
+    <span class="tag status">{{ suggestion.status }}</span>
+  </header>
+  <h2>{{ suggestion.title }}</h2>
+  <p class="sentence lead">{{ p.sentence or suggestion.summary }}</p>
+
+  <section class="rule">
+    <h4>The rule</h4>
+    <dl class="rule-parts">
+      <dt>When</dt>
+      <dd>{% for t in p.trigger_text or [] %}<div>{{ t }}</div>{% else %}<div class="muted">no trigger</div>{% endfor %}</dd>
+      <dt>Only if</dt>
+      <dd>{% for c in p.condition_text or [] %}<div>{{ c }}</div>{% else %}<div class="muted">no conditions</div>{% endfor %}</dd>
+      <dt>Then</dt>
+      <dd>{% for a in p.action_text or [] %}<div>{{ a }}</div>{% else %}<div class="muted">no actions</div>{% endfor %}</dd>
+    </dl>
+  </section>
+
+  {{ m.backtest_block(p.backtest) }}
+  {{ m.evidence_block(p.evidence) }}
+  {{ m.conflict_block(p.conflicts) }}
+
+  {% if p.entity_names %}
+  <section class="entities">
+    <h4>Entities involved</h4>
+    <ul class="plain">
+      {% for entity_id, description in p.entity_names.items() %}
+      <li><code>{{ entity_id }}</code> &mdash; {{ description }}</li>
+      {% endfor %}
+    </ul>
+  </section>
+  {% endif %}
+
+  {% if shadow and shadow.fires %}
+  <section class="shadow">
+    <h4>Shadow-mode trial</h4>
+    <p>{{ shadow.fires }} would-be fires logged;
+      {% if shadow.precision is not none %}live precision {{ '%.0f%%' % (shadow.precision * 100) }}{% else %}not yet scored{% endif %}.</p>
+  </section>
+  {% endif %}
+
+  {% if preview %}
+  <section class="yaml">
+    <h4>Automation YAML
+      <span class="tag {{ 'ok' if preview.ok else 'warn' }}">{{ preview.source }}</span>
+    </h4>
+    {% if preview.validation %}
+    <ul class="validation">
+      <li class="{{ 'ok' if preview.validation.schema_ok else 'fail' }}">Schema valid</li>
+      <li class="{{ 'ok' if preview.validation.references_ok else 'fail' }}">All entities and services exist</li>
+      <li class="{{ 'ok' if preview.validation.check_config_ok else ('skip' if preview.validation.check_config_ok is none else 'fail') }}">
+        Home Assistant config check
+        {%- if preview.validation.check_config_ok is none %} (not reachable){% endif %}
+      </li>
+    </ul>
+    {% for error in preview.validation.errors %}<p class="warn small">{{ error }}</p>{% endfor %}
+    {% endif %}
+    {% for note in preview.notes or [] %}<p class="muted small">{{ note }}</p>{% endfor %}
+    <pre><code>{{ preview.yaml }}</code></pre>
+  </section>
+  {% endif %}
+
+  <footer class="actions big">
+    <button class="btn primary" data-action="apply" data-id="{{ suggestion.id }}"
+      {% if preview and not preview.ok %}disabled title="This rule did not pass validation"{% endif %}>
+      Apply to Home Assistant
+    </button>
+    <button class="btn" data-action="shadow" data-id="{{ suggestion.id }}">Shadow-test only</button>
+    <button class="btn ghost danger" data-action="dismiss" data-id="{{ suggestion.id }}">Dismiss for good</button>
+  </footer>
+
+  {% if feedback %}
+  <section class="feedback">
+    <h4>History</h4>
+    <ul class="plain small">
+      {% for item in feedback %}<li>{{ item.kind }} &mdash; <span class="muted">{{ item.ts | int }}</span></li>{% endfor %}
+    </ul>
+  </section>
+  {% endif %}
+</article>
+{% endblock %}

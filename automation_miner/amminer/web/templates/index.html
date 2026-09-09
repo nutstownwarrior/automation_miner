@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% set active = 'suggestions' %}
+{% import "_macros.html" as m %}
+{% block content %}
+
+{% if report and report.degradations %}
+<section class="notices">
+  <h3>What limited this run</h3>
+  <ul>
+    {% for note in report.degradations %}<li>{{ note }}</li>{% endfor %}
+  </ul>
+</section>
+{% endif %}
+
+{% if last_run %}
+<p class="muted small">
+  Last run {{ last_run.status }}{% if last_run.stats %} &middot;
+  {{ last_run.stats.get('state_rows', 0) }} state rows over
+  {{ last_run.stats.get('window_days', 0) }} days &middot;
+  {{ last_run.stats.get('surfaced', 0) }} surfaced,
+  {{ last_run.stats.get('rejected', 0) }} rejected by backtest{% endif %}
+</p>
+{% endif %}
+
+<h2>Suggestions <span class="count">{{ suggestions | length }}</span></h2>
+
+{% if not suggestions %}
+<div class="empty">
+  <p>No suggestions yet.</p>
+  <p class="muted">
+    Either the analysis has not run, or nothing in your history cleared the
+    backtest thresholds. Press <strong>Analyse now</strong>, or lower
+    <code>min_consistency</code> / <code>backtest_min_precision</code> in the add-on options.
+  </p>
+</div>
+{% endif %}
+
+<div class="cards">
+{% for s in suggestions %}
+  {% set p = s.payload %}
+  <article class="card" id="s-{{ s.id }}">
+    <header>
+      <span class="tag miner">{{ s.miner.replace('_', ' ') }}</span>
+      <span class="score" title="Confidence score">{{ '%.2f' % s.score }}</span>
+    </header>
+    <h3><a href="{{ base }}/suggestion/{{ s.id }}">{{ s.title }}</a></h3>
+    <p class="sentence">{{ p.sentence or s.summary }}</p>
+
+    {% if p.backtest and p.backtest.summary %}
+    <p class="small {{ 'ok' if p.backtest.passed else 'warn' }}">Backtest: {{ p.backtest.summary }}</p>
+    {% endif %}
+    {% if p.evidence and p.evidence.summary %}
+    <p class="small muted">Evidence: {{ p.evidence.summary }}</p>
+    {% endif %}
+    {% if p.conflicts %}
+    <p class="small warn">{{ p.conflicts | length }} conflict(s) - review before applying</p>
+    {% endif %}
+
+    <footer class="actions">
+      <a class="btn" href="{{ base }}/suggestion/{{ s.id }}">Review</a>
+      <button class="btn ghost" data-action="shadow" data-id="{{ s.id }}">Shadow-test</button>
+      <button class="btn ghost danger" data-action="dismiss" data-id="{{ s.id }}">Dismiss</button>
+    </footer>
+  </article>
+{% endfor %}
+</div>
+
+{% if gaps %}
+<h2>Gaps worth filling <span class="count">{{ gaps | length }}</span></h2>
+<div class="cards">
+{% for g in gaps[:3] %}
+  <article class="card subtle">
+    <header><span class="tag">{{ g.payload.kind }}</span></header>
+    <h3>{{ g.title }}</h3>
+    <p class="small">{{ g.payload.gap }}</p>
+    <a class="btn ghost" href="{{ base }}/gaps">See all gaps</a>
+  </article>
+{% endfor %}
+</div>
+{% endif %}
+
+{% if audit %}
+<h2>Housekeeping <span class="count">{{ audit | length }}</span></h2>
+<ul class="plain">
+{% for s in audit %}
+  <li>
+    <strong>{{ s.title }}</strong>
+    <span class="muted small">{{ s.summary }}</span>
+    <button class="btn ghost small danger" data-action="dismiss" data-id="{{ s.id }}">Dismiss</button>
+  </li>
+{% endfor %}
+</ul>
+{% endif %}
+
+{% endblock %}

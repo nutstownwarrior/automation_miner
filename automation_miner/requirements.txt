@@ -1,0 +1,26 @@
+# --- web / runtime ---
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+jinja2==3.1.5
+httpx==0.28.1
+python-dateutil==2.9.0.post0
+PyYAML==6.0.2
+voluptuous==0.15.2
+croniter==6.0.0
+
+# --- database access (pure-python drivers: musl/Alpine friendly) ---
+SQLAlchemy==2.0.36
+PyMySQL==1.1.1
+pg8000==1.31.2
+
+# --- mining ---
+numpy==2.2.1
+pandas==2.2.3
+scikit-learn==1.6.1
+mlxtend==0.23.3
+
+# Optional extras (installed when a musllinux wheel exists; imported lazily and
+# degraded gracefully when missing):
+#   stumpy  -> matrix-profile motif discovery (needs numba)
+#   river   -> online/incremental learning
+#   torch   -> only if a future ML model needs it; NEVER imported at startup
