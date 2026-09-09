@@ -7,4 +7,3 @@ labels:
   org.opencontainers.image.description: Mines Home Assistant history for explainable automation suggestions
   org.opencontainers.image.source: https://github.com/nutstownwarrior/automation_miner
   org.opencontainers.image.licenses: MIT
-args: {}

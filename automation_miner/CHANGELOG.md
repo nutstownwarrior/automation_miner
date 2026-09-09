@@ -50,3 +50,14 @@ First release.
   `check_config`.
 - Ingress web UI restricted to `172.30.32.2`, with suggestion, gap, audit,
   archive and status views.
+
+**Packaging**
+
+- The image installs only from wheels: every pinned dependency has a musllinux
+  build for amd64 and aarch64, so the Alpine base needs no compiler. A CI job
+  enforces it.
+- mlxtend is installed with `--no-deps`; only `mlxtend.frequent_patterns` is
+  used, which needs nothing beyond numpy/pandas/scipy. This keeps scikit-learn
+  (no musl wheels, never imported here) and matplotlib out of the image.
+- A miner that raises no longer aborts the analysis; the run completes, is
+  marked `partial`, and reports which miner failed and why.

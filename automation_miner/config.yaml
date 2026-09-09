@@ -11,16 +11,11 @@ arch:
   - amd64
   - aarch64
 init: false
-startup: application
-boot: auto
 stage: experimental
 ingress: true
-ingress_port: 8099
 panel_icon: mdi:pickaxe
 panel_title: Automation Miner
-panel_admin: true
 hassio_api: true
-hassio_role: default
 homeassistant_api: true
 map:
   - homeassistant_config:ro

@@ -61,11 +61,61 @@ def test_non_ingress_requests_are_refused(ha_config_dir, store, fake_client):
     assert "ingress only" in response.text
 
 
+def asgi_get(app, path: str, client_host: str) -> tuple[int, str]:
+    """Call the ASGI app directly with a chosen client address.
+
+    Starlette's ``TestClient`` only grew a ``client=`` argument in recent
+    versions, so building the scope ourselves keeps this test working across
+    the whole supported range while still exercising the real middleware stack.
+    """
+    import asyncio
+
+    messages: list[dict] = []
+
+    async def run_request():
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": path,
+            "raw_path": path.encode(),
+            "query_string": b"",
+            "root_path": "",
+            "headers": [(b"host", b"testserver")],
+            "client": (client_host, 5000),
+            "server": ("testserver", 80),
+        }
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            messages.append(message)
+
+        await app(scope, receive, send)
+
+    asyncio.run(run_request())
+    status = next(m["status"] for m in messages if m["type"] == "http.response.start")
+    body = b"".join(m.get("body", b"") for m in messages if m["type"] == "http.response.body")
+    return status, body.decode()
+
+
 def test_ingress_source_is_allowed(ha_config_dir, store, fake_client):
     options = Options(ha_config_dir=str(ha_config_dir), state_dir=str(ha_config_dir))
     app = create_app(options, store, runner=None, client=fake_client, ingress_only=True)
-    client = TestClient(app, client=("172.30.32.2", 5000))
-    assert client.get("/api/health").status_code == 200
+    status, body = asgi_get(app, "/api/health", "172.30.32.2")
+    assert status == 200
+    assert '"status":"ok"' in body.replace(" ", "")
+
+
+def test_any_other_source_is_refused(ha_config_dir, store, fake_client):
+    options = Options(ha_config_dir=str(ha_config_dir), state_dir=str(ha_config_dir))
+    app = create_app(options, store, runner=None, client=fake_client, ingress_only=True)
+    for host in ("127.0.0.1", "192.168.1.50", "172.30.32.3"):
+        status, _body = asgi_get(app, "/api/health", host)
+        assert status == 403, f"{host} must not reach the ingress port"
 
 
 def test_health_endpoint(wired):

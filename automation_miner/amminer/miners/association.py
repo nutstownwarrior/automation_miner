@@ -11,6 +11,7 @@ become a real "when A, then B" automation.
 
 from __future__ import annotations
 
+import inspect
 import logging
 from collections import defaultdict
 from collections.abc import Sequence
@@ -102,6 +103,49 @@ def build_transactions(
     return transactions, dict(item_counts)
 
 
+def one_hot_encode(transactions: Sequence[Sequence[str]], pd) -> Any:
+    """One-hot encode baskets into the boolean frame FP-Growth expects.
+
+    This replaces ``mlxtend.preprocessing.TransactionEncoder``, whose module
+    imports scikit-learn.  scikit-learn publishes no musllinux wheels, so
+    depending on it would force a from-source build of scikit-learn (and pull in
+    matplotlib) inside the Alpine add-on image.  ``mlxtend.frequent_patterns``
+    itself needs only numpy/pandas/scipy, so encoding here keeps the image
+    wheel-only.  Columns are sorted so the frame is deterministic.
+    """
+    items = sorted({item for transaction in transactions for item in transaction})
+    index = {item: position for position, item in enumerate(items)}
+    rows = []
+    for transaction in transactions:
+        row = [False] * len(items)
+        for item in transaction:
+            row[index[item]] = True
+        rows.append(row)
+    return pd.DataFrame(rows, columns=items, dtype=bool)
+
+
+def _rules_kwargs(options: Options, transaction_count: int) -> dict[str, Any]:
+    """Arguments for ``association_rules``, adapted to the installed mlxtend.
+
+    mlxtend 0.23.x made ``num_itemsets`` a *required* argument and 0.24+ made it
+    optional again with a misleading default of 1.  Passing the real transaction
+    count whenever the parameter exists is correct on every version, and keeps a
+    dependency resolving to a different release from breaking the miner.
+    """
+    kwargs: dict[str, Any] = {
+        "metric": "confidence",
+        "min_threshold": options.min_confidence,
+    }
+    try:
+        from mlxtend.frequent_patterns import association_rules
+
+        if "num_itemsets" in inspect.signature(association_rules).parameters:
+            kwargs["num_itemsets"] = transaction_count
+    except (ImportError, TypeError, ValueError):  # pragma: no cover - defensive
+        pass
+    return kwargs
+
+
 def _rules_from_transactions(
     transactions: list[list[str]], options: Options
 ) -> list[dict[str, Any]]:
@@ -111,22 +155,17 @@ def _rules_from_transactions(
     try:
         import pandas as pd
         from mlxtend.frequent_patterns import association_rules, fpgrowth
-        from mlxtend.preprocessing import TransactionEncoder
     except ImportError:  # pragma: no cover - mlxtend is a hard requirement in the image
         _LOGGER.warning("mlxtend/pandas unavailable; skipping association mining")
         return []
 
-    encoder = TransactionEncoder()
-    matrix = encoder.fit(transactions).transform(transactions)
-    frame = pd.DataFrame(matrix, columns=encoder.columns_)
+    frame = one_hot_encode(transactions, pd)
     frequent = fpgrowth(frame, min_support=options.min_support, use_colnames=True, max_len=2)
     if frequent.empty:
         return []
     try:
-        rules = association_rules(
-            frequent, metric="confidence", min_threshold=options.min_confidence
-        )
-    except (ValueError, KeyError):
+        rules = association_rules(frequent, **_rules_kwargs(options, len(transactions)))
+    except (ValueError, KeyError, TypeError):
         return []
     if rules.empty:
         return []

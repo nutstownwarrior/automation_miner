@@ -100,12 +100,40 @@ def addon_config() -> dict:
     return yaml.safe_load((ADDON_DIR / "config.yaml").read_text())
 
 
+#: Keys the Supervisor already defaults; the add-on linter rejects restating them.
+SUPERVISOR_DEFAULTS = {
+    "boot": "auto",
+    "startup": "application",
+    "hassio_role": "default",
+    "panel_admin": True,
+    "ingress_port": 8099,
+}
+
+
 def test_config_yaml_declares_ingress_correctly(addon_config):
     assert addon_config["ingress"] is True
-    assert addon_config["ingress_port"] == 8099
     assert addon_config["slug"] == "automation_miner"
     # S6-overlay v3 requires init: false.
     assert addon_config["init"] is False
+
+
+def test_no_option_merely_restates_a_supervisor_default(addon_config):
+    """The add-on linter fails the build on redundant keys, so assert it here."""
+    restated = [key for key in SUPERVISOR_DEFAULTS if key in addon_config]
+    assert restated == [], f"remove keys that only restate defaults: {restated}"
+
+
+def test_the_served_port_matches_the_ingress_default(addon_config):
+    """ingress_port is omitted, so the code must bind the Supervisor's default."""
+    from amminer.__main__ import DEFAULT_PORT
+
+    expected = addon_config.get("ingress_port", SUPERVISOR_DEFAULTS["ingress_port"])
+    assert DEFAULT_PORT == expected
+
+
+def test_build_yaml_has_no_redundant_args():
+    build = yaml.safe_load((ADDON_DIR / "build.yaml").read_text())
+    assert "args" not in build, "an empty args block is rejected by the add-on linter"
 
 
 def test_config_yaml_maps_the_right_directories(addon_config):
@@ -165,14 +193,65 @@ def test_s6_service_is_wired_up():
     assert contents.is_file(), "the service must be registered in the user bundle"
 
 
+def _pinned(text: str) -> set[str]:
+    """Package names actually pinned in a requirements file (comments ignored)."""
+    names = set()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "==" not in line:
+            continue
+        names.add(line.split("==")[0].split("[")[0].strip().lower())
+    return names
+
+
 def test_requirements_pin_every_core_dependency():
-    text = (ADDON_DIR / "requirements.txt").read_text()
-    for package in ("fastapi", "SQLAlchemy", "pandas", "numpy", "scikit-learn", "mlxtend",
-                    "PyMySQL", "pg8000", "voluptuous"):
-        assert package.lower() in text.lower(), f"{package} is not pinned"
-    # Heavy optional extras must NOT be hard requirements.
-    for banned in ("torch", "stumpy==", "numba"):
-        assert f"\n{banned}" not in text
+    pinned = _pinned((ADDON_DIR / "requirements.txt").read_text())
+    pinned |= _pinned((ADDON_DIR / "requirements-nodeps.txt").read_text())
+    for package in ("fastapi", "sqlalchemy", "pandas", "numpy", "scipy", "mlxtend",
+                    "pymysql", "pg8000", "voluptuous", "pydantic"):
+        assert package in pinned, f"{package} is not pinned"
+
+
+def test_heavy_optional_extras_are_not_hard_requirements():
+    pinned = _pinned((ADDON_DIR / "requirements.txt").read_text())
+    pinned |= _pinned((ADDON_DIR / "requirements-nodeps.txt").read_text())
+    for banned in ("torch", "stumpy", "numba", "river"):
+        assert banned not in pinned, f"{banned} must stay optional and lazily imported"
+
+
+def test_scikit_learn_is_deliberately_excluded():
+    """scikit-learn has no musllinux wheels, so it must not reach the image.
+
+    Nothing imports it; it was only ever an mlxtend dependency, which is why
+    mlxtend is installed with --no-deps. If this ever needs to change, the base
+    image has to move to the Debian variant at the same time.
+    """
+    pinned = _pinned((ADDON_DIR / "requirements.txt").read_text())
+    pinned |= _pinned((ADDON_DIR / "requirements-nodeps.txt").read_text())
+    assert "scikit-learn" not in pinned
+    assert "matplotlib" not in pinned
+
+    sources = list((ADDON_DIR / "amminer").rglob("*.py"))
+    offenders = [
+        path.name
+        for path in sources
+        if "import sklearn" in path.read_text() or "from sklearn" in path.read_text()
+    ]
+    assert offenders == [], f"these modules import scikit-learn: {offenders}"
+
+
+def test_mlxtend_is_installed_without_its_dependency_closure():
+    nodeps = (ADDON_DIR / "requirements-nodeps.txt").read_text()
+    assert "mlxtend" in _pinned(nodeps)
+    dockerfile = (ADDON_DIR / "Dockerfile").read_text()
+    assert "--no-deps -r requirements-nodeps.txt" in dockerfile
+
+
+def test_dockerfile_installs_wheels_only():
+    """No compiler is installed, so a source build would fail the image build."""
+    dockerfile = (ADDON_DIR / "Dockerfile").read_text()
+    assert "--only-binary=:all:" in dockerfile
+    assert "build-base" not in dockerfile
 
 
 def test_repository_yaml_is_valid():

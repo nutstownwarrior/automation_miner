@@ -150,6 +150,47 @@ def test_no_external_signals_is_reported(ha_config_dir, store):
     assert report.miner_counts["energy_shift"] == 0
 
 
+def test_one_failing_miner_does_not_kill_the_run(ha_config_dir, store, fake_client, monkeypatch):
+    """A miner raising must cost only its own findings.
+
+    This is the shape of a real failure: a dependency changed signature under a
+    loose pin and one miner started raising. Every other miner still has useful
+    output, so the run must complete and say what was lost.
+    """
+    import amminer.miners.association as association_module
+
+    def explode(*args, **kwargs):
+        raise TypeError("association_rules() missing 1 required positional argument")
+
+    monkeypatch.setattr(association_module, "mine", explode)
+    report, candidates = run(ha_config_dir, store, fake_client)
+
+    assert report.status == "partial"
+    assert report.error is None
+    assert "association" in report.miner_errors
+    assert "TypeError" in report.miner_errors["association"]
+    assert any("association miner failed" in d for d in report.degradations)
+    # The rest of the pipeline still ran and produced results.
+    assert report.miner_counts["time_of_day"] > 0
+    assert report.surfaced > 0
+    assert store.list_suggestions(status="new")
+
+
+def test_every_miner_failing_still_completes(ha_config_dir, store, fake_client, monkeypatch):
+    import amminer.pipeline as pipeline_module
+
+    for name in ("time_of_day", "conditional", "motif", "energy", "association",
+                 "sequence", "stale"):
+        module = getattr(pipeline_module, name)
+        monkeypatch.setattr(module, "mine", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("nope")))
+
+    report, _candidates = run(ha_config_dir, store, fake_client)
+    assert report.status == "partial"
+    assert report.error is None
+    assert len(report.miner_errors) >= 5
+    assert report.surfaced == 0
+
+
 def test_pipeline_error_is_captured_not_raised(ha_config_dir, store, monkeypatch):
     import amminer.pipeline as pipeline_module
 

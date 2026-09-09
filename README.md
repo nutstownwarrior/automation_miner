@@ -223,6 +223,7 @@ not do is listed on the Status page and at the top of the suggestions list.
 | No external signals | intrinsic patterns only |
 | No LLM | deterministic blueprint YAML you can paste |
 | No recorder at all | the run is marked *degraded* and says why |
+| A miner raising | only that miner's findings are lost; the run is marked *partial* and names the failure |
 
 ---
 
@@ -244,9 +245,31 @@ not do is listed on the Status page and at the top of the suggestions list.
 
 ```bash
 python -m venv .venv && . .venv/bin/activate
-pip install -r automation_miner/requirements.txt pytest
+pip install -r automation_miner/requirements.txt
+pip install --no-deps -r automation_miner/requirements-nodeps.txt
+pip install pytest
 pytest
 ```
+
+Install both files, exactly as the image does — developing against a different
+resolution than the pinned one is how a dependency breaks in CI but not locally.
+
+### Dependency footprint
+
+The add-on image installs **only from wheels**: every pinned dependency has a
+musllinux wheel for amd64 and aarch64, so the Alpine base needs no compiler and
+the build is fast. CI enforces this in a dedicated job.
+
+`mlxtend` is installed with `--no-deps`. It declares scikit-learn, matplotlib
+and joblib, but the only part used here — `mlxtend.frequent_patterns`
+(FP-Growth and association rules) — needs nothing beyond numpy, pandas and
+scipy. scikit-learn publishes no musllinux wheels for any version, so depending
+on it would force a from-source build inside the image; nothing in this package
+imports it. `amminer.miners.association` therefore provides its own one-hot
+encoder rather than using `mlxtend.preprocessing.TransactionEncoder`, which is
+the module that pulls scikit-learn in. If a future miner genuinely needs
+scikit-learn, add it to `requirements.txt` and move `build.yaml` to the Debian
+base images at the same time.
 
 Run it outside a container against a copy of your config:
 

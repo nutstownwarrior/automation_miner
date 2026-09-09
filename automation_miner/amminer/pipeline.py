@@ -53,6 +53,8 @@ class RunReport:
     causality: dict[str, int] = field(default_factory=dict)
     overrides: int = 0
     miner_counts: dict[str, int] = field(default_factory=dict)
+    #: miner name -> the error that stopped it, for miners that failed
+    miner_errors: dict[str, str] = field(default_factory=dict)
     surfaced: int = 0
     rejected: int = 0
     conflicted: int = 0
@@ -75,6 +77,7 @@ class RunReport:
             "causality": self.causality,
             "overrides": self.overrides,
             "miner_counts": self.miner_counts,
+            "miner_errors": self.miner_errors,
             "surfaced": self.surfaced,
             "rejected": self.rejected,
             "conflicted": self.conflicted,
@@ -213,18 +216,45 @@ def run_analysis(
         window = (start_ts, end_ts)
         produced: dict[str, list[Candidate]] = {}
 
-        produced["time_of_day"] = time_of_day.mine(changes, options, window, resolver)
-        produced["conditional"] = conditional.mine(
-            changes, options, signals, signal_store, window, resolver
+        def run_miner(name, func, *args):
+            """Run one miner in isolation.
+
+            A miner that raises must cost only its own findings - a dependency
+            with a changed signature, or one pathological entity, must never
+            take down a run that every other miner could have contributed to.
+            """
+            try:
+                return func(*args)
+            except Exception as err:  # noqa: BLE001 - one miner must not end the run
+                _LOGGER.exception("Miner %s failed: %s", name, err)
+                report.miner_errors[name] = f"{type(err).__name__}: {err}"
+                report.degradations.append(
+                    f"The {name.replace('_', ' ')} miner failed and was skipped "
+                    f"({type(err).__name__}: {err}). Other miners still ran."
+                )
+                return []
+
+        produced["time_of_day"] = run_miner(
+            "time_of_day", time_of_day.mine, changes, options, window, resolver
         )
-        produced["motif"] = motif.mine(changes, options, full_store, window, resolver)
-        produced["energy_shift"] = energy.mine(
-            changes, options, signals, signal_store, window, resolver
+        produced["conditional"] = run_miner(
+            "conditional", conditional.mine, changes, options, signals, signal_store, window,
+            resolver,
+        )
+        produced["motif"] = run_miner(
+            "motif", motif.mine, changes, options, full_store, window, resolver
+        )
+        produced["energy_shift"] = run_miner(
+            "energy_shift", energy.mine, changes, options, signals, signal_store, window, resolver
         )
 
         if report.window_days >= MIN_DAYS_FOR_SEQUENCE_MINING:
-            produced["association"] = association.mine(changes, options, window, resolver)
-            produced["sequence"] = sequence.mine(changes, options, window, resolver)
+            produced["association"] = run_miner(
+                "association", association.mine, changes, options, window, resolver
+            )
+            produced["sequence"] = run_miner(
+                "sequence", sequence.mine, changes, options, window, resolver
+            )
         else:
             produced["association"] = []
             produced["sequence"] = []
@@ -234,7 +264,9 @@ def run_analysis(
                 "Switch the recorder to MariaDB and raise purge_keep_days to enable them."
             )
 
-        audit_findings = stale.mine(changes, resolver, options, window, override_counts)
+        audit_findings = run_miner(
+            "audit", stale.mine, changes, resolver, options, window, override_counts
+        )
         report.miner_counts = {name: len(items) for name, items in produced.items()}
         report.miner_counts["audit"] = len(audit_findings)
 
@@ -302,7 +334,9 @@ def run_analysis(
             __import__("json").dumps(conflict_checks.audit_existing(existing, resolver)),
         )
 
-        report.status = "ok"
+        # A run where some miners failed still produced results, but saying it
+        # was plain "ok" would hide that from the user.
+        report.status = "partial" if report.miner_errors else "ok"
         candidates = passed + audit_findings
         recorder.close()
 
