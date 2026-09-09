@@ -117,8 +117,14 @@ jobs:
       - name: Build the add-on image
         uses: home-assistant/builder@master
         with:
+          # config.yaml deliberately has no `image:` key, so the Supervisor
+          # builds the add-on locally on the user's device instead of pulling a
+          # published image. The builder takes the image name from that key, so
+          # a test build has to be given one explicitly or it produces an empty
+          # tag. --test builds without pushing anywhere.
           args: |
             --test \
             --${{ matrix.arch }} \
             --target /data/automation_miner \
+            --image {arch}-addon-automation-miner \
             --docker-hub ghcr.io/${{ github.repository_owner }}
