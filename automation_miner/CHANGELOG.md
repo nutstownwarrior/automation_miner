@@ -54,8 +54,10 @@ First release.
 **Packaging**
 
 - The image installs only from wheels: every pinned dependency has a musllinux
-  build for amd64 and aarch64, so the Alpine base needs no compiler. A CI job
-  enforces it.
+  build for amd64 and aarch64, so the base needs no compiler. A CI job enforces
+  it against the interpreter the image actually runs.
+- build.yaml pins a base-python image, so the Python version is explicit instead
+  of tracking whatever the current Alpine release ships.
 - mlxtend is installed with `--no-deps`; only `mlxtend.frequent_patterns` is
   used, which needs nothing beyond numpy/pandas/scipy. This keeps scikit-learn
   (no musl wheels, never imported here) and matplotlib out of the image.

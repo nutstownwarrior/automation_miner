@@ -257,8 +257,14 @@ resolution than the pinned one is how a dependency breaks in CI but not locally.
 ### Dependency footprint
 
 The add-on image installs **only from wheels**: every pinned dependency has a
-musllinux wheel for amd64 and aarch64, so the Alpine base needs no compiler and
-the build is fast. CI enforces this in a dedicated job.
+musllinux wheel for amd64 and aarch64, so the base needs no compiler and the
+build is fast. CI enforces this in a dedicated job.
+
+`build.yaml` pins a Home Assistant **base-python** image, so the interpreter
+version is explicit rather than whatever Python the current Alpine release
+happens to ship — that floats, and a base bump would invalidate every pinned
+wheel without a line of this repository changing. The CI wheel check targets the
+same interpreter, and a test asserts the two agree.
 
 `mlxtend` is installed with `--no-deps`. It declares scikit-learn, matplotlib
 and joblib, but the only part used here — `mlxtend.frequent_patterns`

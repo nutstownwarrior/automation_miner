@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -11,7 +12,8 @@ from amminer.config import Options
 from amminer.scheduler import next_run_at
 from amminer.version import __version__
 
-ADDON_DIR = Path(__file__).resolve().parents[1] / "automation_miner"
+ROOT = Path(__file__).resolve().parents[1]
+ADDON_DIR = ROOT / "automation_miner"
 
 
 # --- options ------------------------------------------------------------
@@ -171,6 +173,56 @@ def test_option_defaults_match_the_python_defaults(addon_config):
 
 def test_api_key_option_is_a_password_field(addon_config):
     assert addon_config["schema"]["llm_api_key"] == "password?"
+
+
+def _pinned_python_version() -> str:
+    """The Python version build.yaml pins, e.g. "3.13" from a base-python tag."""
+    build = yaml.safe_load((ADDON_DIR / "build.yaml").read_text())
+    tags = list(build["build_from"].values())
+    versions = set()
+    for tag in tags:
+        match = re.search(r":(\d+\.\d+)-alpine", tag)
+        assert match, f"cannot read a Python version from {tag!r}"
+        versions.add(match.group(1))
+    assert len(versions) == 1, f"architectures disagree on the Python version: {versions}"
+    return versions.pop()
+
+
+def test_base_images_pin_an_explicit_python_version():
+    """The plain Alpine base tracks whatever Python Alpine ships today.
+
+    That silently moved the interpreter to 3.14 once already and invalidated
+    every pinned wheel, so the base must name its Python version.
+    """
+    build = yaml.safe_load((ADDON_DIR / "build.yaml").read_text())
+    for arch, image in build["build_from"].items():
+        assert "base-python" in image, f"{arch} must use a base-python image"
+        assert re.search(r":\d+\.\d+-alpine\d+\.\d+", image), (
+            f"{arch} image tag must pin both Python and Alpine: {image}"
+        )
+    assert _pinned_python_version()
+
+
+def test_wheel_check_targets_the_python_the_image_actually_runs():
+    """The CI wheel job must verify the interpreter build.yaml pins.
+
+    Verifying a different Python is worse than not verifying at all: it reports
+    success while the image build fails on a missing wheel.
+    """
+    workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yaml").read_text())
+    checked = str(workflow["jobs"]["wheels"]["steps"][-1]["env"]["PYTHON_VERSION"])
+    assert checked == _pinned_python_version(), (
+        f"CI checks wheels for Python {checked} but the image runs "
+        f"{_pinned_python_version()}"
+    )
+
+
+def test_dockerfile_does_not_add_a_second_interpreter():
+    """base-python images already ship Python; apk add python3 would duplicate it."""
+    dockerfile = (ADDON_DIR / "Dockerfile").read_text()
+    assert "command -v python3" in dockerfile, (
+        "Python must only be installed when the base image lacks it"
+    )
 
 
 def test_build_yaml_covers_every_declared_arch(addon_config):

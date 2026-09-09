@@ -9,12 +9,21 @@ ENV LANG=C.UTF-8 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     AMMINER_STATE_DIR=/config
 
-# Every pinned dependency ships a musllinux wheel for both architectures (see
-# requirements.txt), so no compiler is needed here at all - that is what keeps
-# the image small and the build fast. libstdc++ is the one shared library the
+# Every pinned dependency ships a musllinux wheel for the interpreter pinned in
+# build.yaml, so no compiler is needed here at all - that is what keeps the
+# image small and the build fast. libstdc++ is the one shared library the
 # numpy/scipy/pandas wheels link against.
+#
+# build.yaml supplies a base-python image, which already provides Python. The
+# BUILD_FROM default above is the plain base image, which does not, so install
+# Python only when it is genuinely missing - adding it unconditionally would put
+# a second, different interpreter alongside the one base-python ships.
 # hadolint ignore=DL3018
-RUN apk add --no-cache python3 py3-pip tzdata libstdc++
+RUN apk add --no-cache tzdata libstdc++ \
+    && if ! command -v python3 > /dev/null 2>&1; then \
+         apk add --no-cache python3 py3-pip; \
+       fi \
+    && python3 --version
 
 WORKDIR /opt/automation_miner
 

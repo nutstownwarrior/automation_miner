@@ -84,13 +84,20 @@ jobs:
         with:
           python-version: "3.12"
       - name: Every pinned dependency must have a musllinux wheel
-        # The Alpine base has no compiler, so a dependency without a musl wheel
-        # breaks the image build. Catch that here rather than in the build job.
+        # The image has no compiler, so a dependency without a musl wheel for
+        # the interpreter build.yaml pins breaks the image build. Catch it here
+        # rather than in the much slower build job.
+        #
+        # PYTHON_VERSION must match build.yaml's base-python tag;
+        # test_config_and_addon.py asserts that they agree.
+        env:
+          PYTHON_VERSION: "3.13"
         run: |
+          abi="cp${PYTHON_VERSION/./}"
           pip download --only-binary=:all: \
             --platform musllinux_1_1_${{ matrix.arch }} \
             --platform musllinux_1_2_${{ matrix.arch }} \
-            --python-version 3.12 --implementation cp --abi cp312 \
+            --python-version "${PYTHON_VERSION}" --implementation cp --abi "${abi}" \
             -d /tmp/wheels -r automation_miner/requirements.txt
           pip download --only-binary=:all: --no-deps \
             -d /tmp/wheels -r automation_miner/requirements-nodeps.txt
