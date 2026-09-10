@@ -122,6 +122,27 @@ class Options:
     llm_api_key: str = ""
     llm_timeout_seconds: int = 180
 
+    # --- optional AI assistance (all OFF by default) ---
+    # Each of these needs llm_provider to be set to something other than
+    # "none".  With the provider disabled they no-op and say so in the run
+    # report; nothing below can make the add-on produce a suggestion that has
+    # not passed the same deterministic gates as every other suggestion.
+    #
+    # Let the model read the entity inventory and label signal roles the
+    # regex detector missed.  Additive only: it can add roles, never remove one
+    # the deterministic detector found.
+    llm_entity_classification: bool = False
+    llm_classification_batch: int = 60
+    # Let the model propose extra conditions for rules the backtest rejected.
+    # Every proposal is re-backtested; only proposals that pass are surfaced.
+    llm_hypotheses: bool = False
+    llm_hypothesis_candidates: int = 10
+    llm_hypotheses_per_candidate: int = 3
+    # Let the model flag statistically real but semantically absurd rules.
+    # Advisory only: it can demote and annotate, never promote or remove.
+    llm_triage: bool = False
+    llm_triage_penalty: float = 0.5
+
     # --- paths (overridable for tests) ---
     ha_config_dir: str = "/homeassistant"
     state_dir: str = "/config"
@@ -141,6 +162,8 @@ class Options:
         self.min_support = min(max(float(self.min_support), 0.0), 1.0)
         self.backtest_min_precision = min(max(float(self.backtest_min_precision), 0.0), 1.0)
         self.min_occurrences = max(int(self.min_occurrences), 2)
+        self.llm_triage_penalty = min(max(float(self.llm_triage_penalty), 0.0), 1.0)
+        self.llm_classification_batch = max(int(self.llm_classification_batch), 5)
         self.override_window_seconds = max(int(self.override_window_seconds), 1)
 
     # ------------------------------------------------------------------
@@ -160,6 +183,24 @@ class Options:
             if pattern == entity_id or fnmatch(entity_id, pattern):
                 return True
         return False
+
+    @property
+    def llm_enabled(self) -> bool:
+        """True when a provider is configured at all."""
+        return (self.llm_provider or "none").lower() not in ("", "none", "off", "disabled")
+
+    @property
+    def ai_features_requested(self) -> dict[str, bool]:
+        """The optional AI features the user asked for, on or off."""
+        return {
+            "entity_classification": bool(self.llm_entity_classification),
+            "hypotheses": bool(self.llm_hypotheses),
+            "triage": bool(self.llm_triage),
+        }
+
+    @property
+    def any_ai_feature(self) -> bool:
+        return any(self.ai_features_requested.values())
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)

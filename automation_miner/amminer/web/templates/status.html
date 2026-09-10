@@ -59,6 +59,45 @@
     {% if llm.model %}<div><dt>Model</dt><dd>{{ llm.model }}</dd></div>{% endif %}
   </dl>
   {% if llm.error %}<p class="muted small">{{ llm.error }}</p>{% endif %}
+
+  <h4>AI assistance</h4>
+  {% if report and report.ai %}
+  <ul class="plain small">
+    {% for name, info in report.ai.items() %}
+    <li>
+      <span class="tag {{ 'ok' if info.ran else 'warning' }}">{{ name.replace('_', ' ') }}</span>
+      {% if not info.ran %}
+        did not run &mdash; {{ info.reason }}
+      {% elif name == 'entity_classification' %}
+        added {{ info.added_count or 0 }} signal role(s) the pattern matcher missed
+        {%- if info.from_cache %} (cached){% endif %}
+        {%- if info.unknown_entities %}; discarded
+        {{ info.unknown_entities | length }} invented entity id(s){% endif %}
+      {% elif name == 'hypotheses' %}
+        proposed {{ info.proposed or 0 }} explanation(s) for
+        {{ info.considered or 0 }} rejected rule(s);
+        <strong>{{ info.accepted or 0 }}</strong> passed the backtest and were surfaced
+        {%- if info.rejected_invalid %}; {{ info.rejected_invalid }} were unusable{% endif %}
+      {% elif name == 'triage' %}
+        reviewed {{ info.reviewed or 0 }}; demoted {{ info.demoted or 0 }} as implausible
+        {%- if info.invalid_verdicts %}; ignored {{ info.invalid_verdicts }} invalid verdict(s){% endif %}
+      {% endif %}
+      {% if info.error %}<span class="warn">({{ info.error }})</span>{% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+  <p class="muted small">
+    Assistance never bypasses a gate: classification only adds signals, hypotheses
+    are backtested like any other rule, and triage can lower a score but never
+    raise one or hide a suggestion.
+  </p>
+  {% else %}
+  <p class="muted small">
+    All optional AI features are off. Turn on
+    <code>llm_entity_classification</code>, <code>llm_hypotheses</code> or
+    <code>llm_triage</code> in the add-on configuration to use them.
+  </p>
+  {% endif %}
 </section>
 
 <section class="panel">

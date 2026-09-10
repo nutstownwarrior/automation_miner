@@ -55,6 +55,7 @@
     {% if p.conflicts %}
     <p class="small warn">{{ p.conflicts | length }} conflict(s) - review before applying</p>
     {% endif %}
+    {{ m.assist_block(p.extra) }}
 
     <footer class="actions">
       <a class="btn" href="{{ base }}/suggestion/{{ s.id }}">Review</a>

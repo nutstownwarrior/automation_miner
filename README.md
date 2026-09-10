@@ -170,6 +170,29 @@ entity ids it is allowed to use, and nothing else.
 - Cloud providers (OpenAI, Anthropic, Google, OpenRouter) are **strictly opt-in**
   and require an API key.
 
+### Optional AI assistance (all off by default)
+
+Three further features use the model for things statistics cannot do. Each is a
+separate switch, each defaults to **off**, and none of them can put a suggestion
+in front of you that has not passed the same deterministic gates as every other
+suggestion.
+
+| Option | What it does | What it is not allowed to do |
+|---|---|---|
+| `llm_entity_classification` | Labels signal roles the pattern matcher misses — a price sensor called `sensor.stroomprijs`, a dishwasher called `switch.geschirr`. Cached until your entities change. | Remove a role the deterministic detector found. It is additive only. |
+| `llm_hypotheses` | For rules the backtest **rejected**, proposes conditions that might explain when the action really happens — "only when it's cold out", "only on workdays". Each proposal is then re-backtested. | Surface anything. Only proposals that clear the same precision and nuisance thresholds are shown, and they carry a note saying the condition was suggested and then verified. |
+| `llm_triage` | Flags rules that are statistically real but semantically absurd — two things that merely happen at the same time of day. | Promote or hide anything. It can lower a score and attach a visible reason; the evidence and backtest stay exactly as they were. |
+
+`llm_hypotheses` is the one that changes what the tool can *find*: the built-in
+conditional miner only tests one signal at a time against a single threshold, so
+a combination like "dark **and** a workday" is outside its reach. The model
+supplies the guess, your history decides.
+
+Turning these on costs more calls than the YAML step: classification is one call
+per ~60 entities (cached), hypotheses one call per rejected rule, triage one per
+25 suggestions. The Status page reports exactly what each one did, including how
+many invented entity ids were discarded.
+
 ### The validation gate
 
 Nothing reaches your configuration without passing all three checks:
@@ -224,6 +247,7 @@ not do is listed on the Status page and at the top of the suggestions list.
 | No LLM | deterministic blueprint YAML you can paste |
 | No recorder at all | the run is marked *degraded* and says why |
 | A miner raising | only that miner's findings are lost; the run is marked *partial* and names the failure |
+| An AI feature enabled without a provider, or failing | the feature is skipped and says so; the deterministic run is unaffected |
 
 ---
 

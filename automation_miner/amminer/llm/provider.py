@@ -214,14 +214,22 @@ class CloudProvider(BaseProvider):
 
         if self.name == "anthropic":
             headers |= {"x-api-key": self.api_key, "anthropic-version": "2023-06-01"}
+            # Anthropic has no response_format flag, so the JSON shape is
+            # forced with an assistant prefill instead: the reply continues from
+            # an open brace and therefore cannot start with prose.  The brace is
+            # put back before parsing.
             payload: dict[str, Any] = {
                 "model": self.model,
                 "max_tokens": 2048,
                 "temperature": 0.1,
                 "system": system,
-                "messages": [{"role": "user", "content": user}],
+                "messages": [
+                    {"role": "user", "content": user},
+                    {"role": "assistant", "content": "{"},
+                ],
+                "stop_sequences": ["\n\n\n"],
             }
-            extract = lambda data: data["content"][0]["text"]  # noqa: E731
+            extract = lambda data: "{" + data["content"][0]["text"]  # noqa: E731
         elif self.name == "google":
             url = str(self.base_url).format(model=self.model) + f"?key={self.api_key}"
             payload = {

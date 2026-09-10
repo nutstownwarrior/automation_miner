@@ -105,6 +105,31 @@ accounts" in `excluded_users` so their changes are not mistaken for a human's.
 `ollama` auto-detects a local Ollama server. `openai`, `anthropic`, `google`
 and `openrouter` are opt-in and need `llm_api_key`.
 
+### `llm_entity_classification`, `llm_hypotheses`, `llm_triage`
+Three optional AI features, all `false` by default and all requiring
+`llm_provider` to be set to something other than `none`.
+
+- **`llm_entity_classification`** — lets the model read your entity inventory
+  (names, areas, device models, units — never states or history) and label
+  signal roles the built-in pattern matcher missed, such as a price sensor or a
+  dishwasher named in your own language. Additive only: it can add a signal,
+  never remove one. Cached until your entities change.
+- **`llm_hypotheses`** — for rules the backtest rejected, the model proposes
+  conditions that might explain when the action really happens. Every proposal
+  is re-backtested against your history with the same thresholds; only ones that
+  pass are shown, labelled as suggested-then-verified.
+- **`llm_triage`** — the model flags rules that are statistically real but make
+  no sense, and they are ranked lower with the reason shown. It cannot promote a
+  rule, hide one, or change any evidence.
+
+If a feature is switched on while `llm_provider` is `none`, or the provider is
+unreachable, the run says so on the Status page and continues normally.
+
+Tuning: `llm_classification_batch` (entities per call, default 60),
+`llm_hypothesis_candidates` (rejected rules to attempt, default 10),
+`llm_hypotheses_per_candidate` (default 3), `llm_triage_penalty` (score
+multiplier for an implausible verdict, default 0.5).
+
 ### `llm_model`, `llm_base_url`, `llm_api_key`
 Optional overrides. With Ollama, leaving `llm_model` empty picks the best
 installed model (`qwen3:8b` preferred; think-mode models are skipped).

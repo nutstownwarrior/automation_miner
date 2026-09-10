@@ -25,6 +25,10 @@ from .enrich.detect import detect_signals
 from .enrich.signals import build_signal_store
 from .entities import build_resolver
 from .ha_api import HAClient
+from .llm import classify as llm_classify
+from .llm import hypothesis as llm_hypothesis
+from .llm import triage as llm_triage
+from .llm.provider import build_provider
 from .miners import association, conditional, energy, motif, sequence, stale, time_of_day
 from .miners.base import Candidate
 from .recorderdb import causality
@@ -55,6 +59,8 @@ class RunReport:
     miner_counts: dict[str, int] = field(default_factory=dict)
     #: miner name -> the error that stopped it, for miners that failed
     miner_errors: dict[str, str] = field(default_factory=dict)
+    #: Per optional AI feature: whether it ran and what it contributed.
+    ai: dict[str, Any] = field(default_factory=dict)
     surfaced: int = 0
     rejected: int = 0
     conflicted: int = 0
@@ -78,6 +84,7 @@ class RunReport:
             "overrides": self.overrides,
             "miner_counts": self.miner_counts,
             "miner_errors": self.miner_errors,
+            "ai": self.ai,
             "surfaced": self.surfaced,
             "rejected": self.rejected,
             "conflicted": self.conflicted,
@@ -196,8 +203,72 @@ def run_analysis(
         store.record_overrides(overrides)
         override_counts = store.override_counts()
 
+        # --- optional AI assistance ----------------------------------
+        # Every feature here is off by default and additive: with them disabled
+        # the run is bit-for-bit what it was before they existed.
+        provider = None
+        if options.any_ai_feature:
+            if not options.llm_enabled:
+                report.degradations.append(
+                    "AI assistance is switched on but llm_provider is 'none', so the "
+                    "assisted features did nothing. Set a provider to use them."
+                )
+                report.ai = {
+                    name: {"requested": True, "ran": False, "reason": "no llm_provider"}
+                    for name, on in options.ai_features_requested.items()
+                    if on
+                }
+            else:
+                provider = build_provider(options)
+                status = provider.status()
+                if not status.available:
+                    report.degradations.append(
+                        f"AI assistance is switched on but the {status.provider} provider is "
+                        f"not usable ({status.error}); the assisted features were skipped."
+                    )
+                    report.ai = {
+                        name: {"requested": True, "ran": False, "reason": status.error}
+                        for name, on in options.ai_features_requested.items()
+                        if on
+                    }
+                    provider = None
+
+        def run_ai(name: str, func, *args, **kwargs):
+            """Run one AI feature in isolation, like a miner."""
+            try:
+                outcome = func(*args, **kwargs)
+            except Exception as err:  # noqa: BLE001 - assistance is never fatal
+                _LOGGER.exception("AI feature %s failed: %s", name, err)
+                report.ai[name] = {
+                    "requested": True,
+                    "ran": False,
+                    "reason": f"{type(err).__name__}: {err}",
+                }
+                report.degradations.append(
+                    f"The AI {name.replace('_', ' ')} step failed and was skipped "
+                    f"({type(err).__name__}: {err})."
+                )
+                return None
+            report.ai[name] = {"requested": True, "ran": True, **outcome.as_dict()}
+            return outcome
+
         # --- enrichment ----------------------------------------------
         signals = detect_signals(resolver)
+
+        if provider is not None and options.llm_entity_classification:
+            classification = run_ai(
+                "entity_classification",
+                llm_classify.classify,
+                resolver,
+                provider,
+                options,
+                store,
+                options.llm_classification_batch,
+            )
+            if classification is not None:
+                llm_classify.apply_to_signals(signals, classification)
+                report.ai["entity_classification"].update(classification.as_dict())
+
         report.signals = signals.as_dict()
         if not signals.present():
             report.degradations.append(
@@ -283,6 +354,38 @@ def run_analysis(
         passed, rejected = backtest_all(
             mined, changes, full_store, options, window, overrides
         )
+        # --- AI hypotheses: propose, then measure with the same gate ---
+        if provider is not None and options.llm_hypotheses and rejected:
+            hypotheses = run_ai(
+                "hypotheses",
+                llm_hypothesis.propose_and_verify,
+                rejected,
+                changes,
+                full_store,
+                options,
+                window,
+                provider,
+                resolver,
+                overrides,
+            )
+            if hypotheses is not None and hypotheses.accepted:
+                accepted_origins = {
+                    c.extra.get("hypothesis", {}).get("origin_candidate")
+                    for c in hypotheses.accepted
+                }
+                passed.extend(hypotheses.accepted)
+                # A rejected candidate that a verified condition rescued is no
+                # longer a rejection; it was superseded, not discarded.
+                rejected = [c for c in rejected if c.id not in accepted_origins]
+
+        # --- AI triage: advisory demotion only -------------------------
+        if provider is not None and options.llm_triage and passed:
+            verdicts = run_ai("triage", llm_triage.triage, passed, provider, resolver)
+            if verdicts is not None:
+                llm_triage.apply_verdicts(passed, verdicts, options.llm_triage_penalty)
+                report.ai["triage"].update(verdicts.as_dict())
+                passed.sort(key=lambda c: c.score, reverse=True)
+
         report.surfaced = len(passed)
         report.rejected = len(rejected)
 

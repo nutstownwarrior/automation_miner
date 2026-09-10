@@ -42,6 +42,9 @@ options:
   llm_model: ""
   llm_base_url: ""
   llm_api_key: ""
+  llm_entity_classification: false
+  llm_hypotheses: false
+  llm_triage: false
 schema:
   log_level: list(trace|debug|info|notice|warning|error|fatal)?
   schedule: str?
@@ -66,3 +69,10 @@ schema:
   llm_model: str?
   llm_base_url: str?
   llm_api_key: password?
+  llm_entity_classification: bool?
+  llm_hypotheses: bool?
+  llm_triage: bool?
+  llm_classification_batch: int(5,200)?
+  llm_hypothesis_candidates: int(0,100)?
+  llm_hypotheses_per_candidate: int(0,10)?
+  llm_triage_penalty: float(0.0,1.0)?

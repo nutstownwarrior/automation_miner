@@ -17,14 +17,37 @@ def test_state_changes_are_joined_and_ordered(raw_changes):
     assert all("." in c.entity_id for c in raw_changes)
 
 
-def test_old_state_is_resolved_from_old_state_id(raw_changes):
-    kitchen = [c for c in raw_changes if c.entity_id == "light.kitchen"]
+def test_old_state_is_resolved_from_old_state_id(queries):
+    """`old_state_id` must resolve to the previous row's state.
+
+    Queried unbounded on purpose: asking about "the first row" only means
+    anything when the query covers the whole table, and a windowed query can
+    legitimately start mid-history.
+    """
+    kitchen = [
+        c for c in queries.state_changes(0, 1e12) if c.entity_id == "light.kitchen"
+    ]
     assert kitchen
-    # The very first row has no predecessor; later ones must.
+    # The genuinely first row has no predecessor; every later one does.
     assert kitchen[0].old_state is None
-    assert any(c.old_state is not None for c in kitchen[1:])
+    assert all(c.old_state is not None for c in kitchen[1:])
+    # And each old_state really is the state the entity was previously in.
+    for previous, current in zip(kitchen, kitchen[1:], strict=False):
+        assert current.old_state == previous.state
     transitions = [c for c in kitchen if c.is_transition]
     assert transitions and all(c.old_state != c.state for c in transitions)
+
+
+def test_a_windowed_query_may_legitimately_start_mid_history(queries, fixture_db):
+    """The regression this pairs with: a window that starts after the first row."""
+    _path, truth = fixture_db
+    midpoint = (truth.start_ts + truth.end_ts) / 2
+    windowed = [
+        c for c in queries.state_changes(midpoint, truth.end_ts)
+        if c.entity_id == "light.kitchen"
+    ]
+    assert windowed
+    assert windowed[0].old_state is not None  # it has a predecessor, just not here
 
 
 def test_attributes_are_decoded(raw_changes):

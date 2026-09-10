@@ -303,8 +303,15 @@ def build_default_fixture(
     gen = SyntheticRecorder(path, tz=tz, seed=seed)
     user_bytes = uuid.uuid4().bytes
     truth = gen.truth
-    truth.start_ts = start.timestamp()
-    truth.end_ts = end.timestamp()
+    # The day loop below writes rows from midnight of the first day to late
+    # evening of the last, so the declared window has to span whole days. Using
+    # `start`/`end` directly would put the earliest and latest rows OUTSIDE the
+    # window the ground truth advertises, which silently changes what a
+    # window-bounded query returns depending on the day of the week.
+    truth.start_ts = dt.datetime.combine(start.date(), dt.time(0, 0), tzinfo=tz).timestamp()
+    truth.end_ts = dt.datetime.combine(
+        end.date(), dt.time(23, 59, 59), tzinfo=tz
+    ).timestamp()
     truth.user_id = user_bytes.hex()
 
     outdoor_series: list[tuple[float, float]] = []

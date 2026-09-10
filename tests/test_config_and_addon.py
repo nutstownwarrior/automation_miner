@@ -171,6 +171,18 @@ def test_option_defaults_match_the_python_defaults(addon_config):
         assert getattr(defaults, key) == value, f"{key} differs from the Python default"
 
 
+def test_ai_features_are_exposed_in_the_addon_ui(addon_config):
+    """They must be togglable from HA's Configuration tab, not just code."""
+    for option in ("llm_entity_classification", "llm_hypotheses", "llm_triage"):
+        assert addon_config["options"][option] is False, f"{option} must default off"
+        assert addon_config["schema"][option] == "bool?"
+
+
+def test_ai_tuning_knobs_are_range_checked(addon_config):
+    assert addon_config["schema"]["llm_triage_penalty"] == "float(0.0,1.0)?"
+    assert addon_config["schema"]["llm_hypotheses_per_candidate"] == "int(0,10)?"
+
+
 def test_api_key_option_is_a_password_field(addon_config):
     assert addon_config["schema"]["llm_api_key"] == "password?"
 
