@@ -206,6 +206,18 @@ class CloudProvider(BaseProvider):
             return LLMStatus(self.name, False, error=f"unknown provider '{self.name}'")
         return LLMStatus(self.name, True, self.base_url, self.model)
 
+    def _redact(self, value: object) -> str:
+        """Never let the key out in text that gets stored or displayed.
+
+        Belt and braces behind the header change above: a proxy, a redirect or
+        a future provider could put it back into a message, and error strings
+        from here are written to the database and rendered in the UI.
+        """
+        text = str(value)
+        if self.api_key:
+            text = text.replace(self.api_key, "***")
+        return text
+
     def complete_json(self, system: str, user: str) -> dict[str, Any]:
         if not self.api_key or not self.base_url:
             raise LLMError(self.status().error or "cloud provider not configured")
@@ -231,7 +243,11 @@ class CloudProvider(BaseProvider):
             }
             extract = lambda data: "{" + data["content"][0]["text"]  # noqa: E731
         elif self.name == "google":
-            url = str(self.base_url).format(model=self.model) + f"?key={self.api_key}"
+            # Google also accepts ?key=..., and an httpx error message quotes the
+            # URL it failed on - which then travels into the run report, the UI
+            # and the database.  A header does not appear in error text.
+            url = str(self.base_url).format(model=self.model)
+            headers["x-goog-api-key"] = self.api_key
             payload = {
                 "systemInstruction": {"parts": [{"text": system}]},
                 "contents": [{"role": "user", "parts": [{"text": user}]}],
@@ -256,7 +272,7 @@ class CloudProvider(BaseProvider):
             response.raise_for_status()
             content = extract(response.json())
         except (httpx.HTTPError, KeyError, IndexError, json.JSONDecodeError) as err:
-            raise LLMError(f"{self.name} request failed: {err}") from err
+            raise LLMError(f"{self.name} request failed: {self._redact(err)}") from err
         return _parse_json_object(content)
 
 

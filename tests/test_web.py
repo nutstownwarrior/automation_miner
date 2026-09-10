@@ -280,3 +280,23 @@ def test_apply_refuses_a_conflicting_rule_until_it_is_confirmed(wired):
     confirmed = client.post(f"/api/suggestions/{suggestion_id}/apply?confirm=true").json()
     assert confirmed["ok"] is True, confirmed
     assert ha.written
+
+
+def test_restore_is_not_undone_by_the_next_run(wired):
+    client, store, runner, _ha = wired
+    suggestion_id = store.list_suggestions(status="new")[0]["id"]
+    client.post(f"/api/suggestions/{suggestion_id}/dismiss")
+    assert store.get_suggestion(suggestion_id)["status"] == "dismissed"
+
+    assert client.post(f"/api/suggestions/{suggestion_id}/restore").status_code == 200
+    assert store.is_dismissed(suggestion_id) is False
+
+    runner.run_now()
+    still_there = store.get_suggestion(suggestion_id)
+    assert still_there is not None
+    assert still_there["status"] == "new"
+
+
+def test_restoring_an_unknown_suggestion_is_404(wired):
+    client, _store, _runner, _ha = wired
+    assert client.post("/api/suggestions/nope/restore").status_code == 404

@@ -11,9 +11,11 @@ from __future__ import annotations
 import logging
 import time
 import traceback
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from . import backtest as backtest_module
 from . import conflicts as conflict_checks
 from . import gaps as gap_analysis
 from .automations import load_existing_automations
@@ -22,7 +24,7 @@ from .config import Options
 from .discovery.ha_config import HAConfig
 from .discovery.recorder import Recorder, open_recorder
 from .enrich.detect import detect_signals
-from .enrich.signals import build_signal_store
+from .enrich.signals import SignalStore, build_signal_store
 from .entities import build_resolver
 from .ha_api import HAClient
 from .llm import classify as llm_classify
@@ -32,8 +34,9 @@ from .llm.provider import build_provider
 from .miners import association, conditional, energy, motif, sequence, stale, time_of_day
 from .miners.base import Candidate
 from .recorderdb import causality
+from .recorderdb.models import StateChange
 from .recorderdb.queries import ORIGIN_EVENT_TYPES, RecorderQueries
-from .store import Store
+from .store import STATUS_SHADOW, Store
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -65,6 +68,8 @@ class RunReport:
     rejected: int = 0
     conflicted: int = 0
     gaps: int = 0
+    #: Would-be fires recorded for suggestions the user asked to shadow-test.
+    shadow_fires: int = 0
     degradations: list[str] = field(default_factory=list)
     state_rows: int = 0
 
@@ -89,6 +94,7 @@ class RunReport:
             "rejected": self.rejected,
             "conflicted": self.conflicted,
             "gaps": self.gaps,
+            "shadow_fires": self.shadow_fires,
             "degradations": self.degradations,
             "state_rows": self.state_rows,
         }
@@ -120,6 +126,33 @@ def resolve_window(options: Options, recorder: Recorder) -> tuple[float, float, 
         )
     start_ts = max(oldest, newest - days * 86400.0)
     return start_ts, newest, notes
+
+
+def _log_shadow_fires(
+    store: Store,
+    changes: Sequence[StateChange],
+    signal_store: SignalStore,
+    options: Options,
+    window: tuple[float, float],
+) -> int:
+    """Replay every shadowed suggestion over history it has not been scored on."""
+    # Imported here: runner imports this module, so importing it back at module
+    # scope would be a cycle.
+    from .runner import candidate_from_payload
+
+    logged = 0
+    for row in store.list_suggestions(status=STATUS_SHADOW):
+        payload = row.get("payload") or {}
+        if not payload.get("actions"):
+            continue
+        candidate = candidate_from_payload(payload)
+        since = store.last_shadow_ts(row["id"])
+        for ts, matched in backtest_module.shadow_evaluate(
+            candidate, changes, signal_store, options, window, since_ts=since
+        ):
+            store.log_shadow_fire(row["id"], ts, matched=matched)
+            logged += 1
+    return logged
 
 
 def run_analysis(
@@ -397,6 +430,15 @@ def run_analysis(
 
         report.surfaced = len(passed)
         report.rejected = len(rejected)
+
+        # --- shadow mode -----------------------------------------------
+        # "Shadow-test only" set a status and logged nothing, so the detail
+        # page reported 0 would-be fires forever.  Every run now replays the
+        # rules the user asked to watch against the history since it last
+        # looked, and records each fire.
+        report.shadow_fires = run_miner(
+            "shadow", _log_shadow_fires, store, changes, full_store, options, window
+        ) or 0
 
         # --- conflicts -------------------------------------------------
         existing = load_existing_automations(ha_config, resolver)

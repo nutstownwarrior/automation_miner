@@ -341,6 +341,30 @@ class Store:
         self.set_status(suggestion_id, STATUS_DISMISSED)
         self.add_feedback(suggestion_id, "dismissed", {"reason": reason})
 
+    def restore(self, suggestion_id: str) -> bool:
+        """Undo a dismissal, including the record the next run consults.
+
+        Setting the status back to ``new`` on its own is not a restore: the
+        dismissals table is what mining filters against, so the suggestion is
+        dropped again on the next run and then pruned.  The user sees it
+        reappear and then quietly disappear.
+        """
+        row = self._query("SELECT 1 FROM suggestions WHERE id = ?", (suggestion_id,))
+        if not row:
+            return False
+        signatures = self._query(
+            "SELECT signature FROM dismissals WHERE suggestion_id = ?", (suggestion_id,)
+        )
+        self._execute("DELETE FROM dismissals WHERE suggestion_id = ?", (suggestion_id,))
+        for entry in signatures:
+            if entry["signature"]:
+                self._execute(
+                    "DELETE FROM dismissals WHERE signature = ?", (entry["signature"],)
+                )
+        self.set_status(suggestion_id, STATUS_NEW)
+        self.add_feedback(suggestion_id, "restored")
+        return True
+
     def is_dismissed(self, suggestion_id: str, signature: str | None = None) -> bool:
         rows = self._query("SELECT 1 FROM dismissals WHERE suggestion_id = ?", (suggestion_id,))
         if rows:
@@ -471,6 +495,15 @@ class Store:
             " VALUES(?,?,1,?,?)",
             (suggestion_id, ts, None if matched is None else int(matched), _json(payload or {})),
         )
+
+    def last_shadow_ts(self, suggestion_id: str) -> float:
+        """Newest fire already recorded, so a re-run does not double-count."""
+        rows = self._query(
+            "SELECT MAX(ts) AS newest FROM shadow_events WHERE suggestion_id = ?",
+            (suggestion_id,),
+        )
+        newest = rows[0]["newest"] if rows else None
+        return float(newest) if newest is not None else 0.0
 
     def shadow_report(self, suggestion_id: str) -> dict[str, Any]:
         rows = self._query(

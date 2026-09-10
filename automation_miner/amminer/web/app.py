@@ -100,8 +100,14 @@ def create_app(
         return base
 
     # --- pages --------------------------------------------------------
+    # These are deliberately plain `def`, not `async def`.  Every one of them
+    # talks to SQLite, and some talk to Home Assistant or to a language model
+    # with a timeout measured in minutes.  An `async def` handler doing that
+    # holds the single event loop for the whole call, so one detail page waiting
+    # on a model freezes every other request - including /health, which is what
+    # the Supervisor watches.  Starlette runs sync handlers in a threadpool.
     @app.get("/", response_class=HTMLResponse)
-    async def index(request: Request):
+    def index(request: Request):
         suggestions = store.list_suggestions(status=[STATUS_NEW, STATUS_SHADOW])
         actionable = [s for s in suggestions if s["miner"] not in ("stale_automation", "unused_entity")]
         audit = [s for s in suggestions if s["miner"] in ("stale_automation", "unused_entity")]
@@ -119,7 +125,7 @@ def create_app(
         )
 
     @app.get("/suggestion/{suggestion_id}", response_class=HTMLResponse)
-    async def suggestion_detail(request: Request, suggestion_id: str):
+    def suggestion_detail(request: Request, suggestion_id: str):
         suggestion = store.get_suggestion(suggestion_id)
         if suggestion is None:
             raise HTTPException(status_code=404, detail="unknown suggestion")
@@ -139,7 +145,7 @@ def create_app(
         )
 
     @app.get("/audit", response_class=HTMLResponse)
-    async def audit_view(request: Request):
+    def audit_view(request: Request):
         raw = store.get_meta("existing_automation_audit", "[]")
         try:
             findings = json.loads(raw or "[]")
@@ -157,7 +163,7 @@ def create_app(
         )
 
     @app.get("/gaps", response_class=HTMLResponse)
-    async def gaps_view(request: Request):
+    def gaps_view(request: Request):
         return templates.TemplateResponse(
             request=request,
             name="gaps.html",
@@ -165,7 +171,7 @@ def create_app(
         )
 
     @app.get("/dismissed", response_class=HTMLResponse)
-    async def dismissed_view(request: Request):
+    def dismissed_view(request: Request):
         return templates.TemplateResponse(
             request=request,
             name="dismissed.html",
@@ -173,7 +179,7 @@ def create_app(
         )
 
     @app.get("/status", response_class=HTMLResponse)
-    async def status_view(request: Request):
+    def status_view(request: Request):
         llm = build_provider(options).status().as_dict()
         return templates.TemplateResponse(
             request=request,
@@ -215,13 +221,13 @@ def create_app(
         return {"status": "dismissed", "id": suggestion_id}
 
     @api.post("/suggestions/{suggestion_id}/restore")
-    async def restore(suggestion_id: str):
-        store.set_status(suggestion_id, STATUS_NEW)
-        store.add_feedback(suggestion_id, "restored")
+    def restore(suggestion_id: str):
+        if not store.restore(suggestion_id):
+            raise HTTPException(status_code=404, detail="unknown suggestion")
         return {"status": "restored", "id": suggestion_id}
 
     @api.post("/suggestions/{suggestion_id}/shadow")
-    async def shadow(suggestion_id: str):
+    def shadow(suggestion_id: str):
         if store.get_suggestion(suggestion_id) is None:
             raise HTTPException(status_code=404, detail="unknown suggestion")
         store.set_status(suggestion_id, STATUS_SHADOW)
@@ -229,7 +235,7 @@ def create_app(
         return {"status": "shadow", "id": suggestion_id}
 
     @api.get("/suggestions/{suggestion_id}/yaml", response_class=PlainTextResponse)
-    async def suggestion_yaml(suggestion_id: str):
+    def suggestion_yaml(suggestion_id: str):
         if runner is None:
             raise HTTPException(status_code=503, detail="no runner available")
         preview = runner.preview_yaml(suggestion_id)
@@ -238,7 +244,7 @@ def create_app(
         return PlainTextResponse(preview.get("yaml", ""), media_type="text/yaml")
 
     @api.post("/suggestions/{suggestion_id}/apply")
-    async def apply_suggestion(suggestion_id: str, confirm: bool = False):
+    def apply_suggestion(suggestion_id: str, confirm: bool = False):
         if runner is None:
             raise HTTPException(status_code=503, detail="no runner available")
         result = runner.apply(suggestion_id, confirm_conflicts=confirm)
@@ -255,12 +261,12 @@ def create_app(
         return result
 
     @api.post("/gaps/{gap_id}/dismiss")
-    async def dismiss_gap(gap_id: str):
+    def dismiss_gap(gap_id: str):
         store.set_gap_status(gap_id, "dismissed")
         return {"status": "dismissed", "id": gap_id}
 
     @api.get("/suggestions")
-    async def list_suggestions(status: str | None = None):
+    def list_suggestions(status: str | None = None):
         return store.list_suggestions(status=status.split(",") if status else None)
 
     @api.get("/health")

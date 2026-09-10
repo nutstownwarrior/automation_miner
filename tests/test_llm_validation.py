@@ -394,3 +394,38 @@ def test_every_service_a_miner_can_emit_is_in_the_fallback_set():
             emitted = service_for(f"{domain}.thing", state)
             if emitted is not None:
                 assert emitted[0] in allowed, f"{domain}/{state} -> {emitted[0]}"
+
+
+def test_a_cloud_key_never_reaches_an_error_message():
+    """Error strings from here are stored in the database and rendered in the UI."""
+    from amminer.llm.provider import CloudProvider
+
+    secret = "AIzaSy-NOT-A-REAL-KEY-000000"
+    provider = CloudProvider("google", secret, model="gemini-2.0-flash")
+    with pytest.raises(LLMError) as raised:
+        provider.complete_json("system", "user")
+    assert secret not in str(raised.value)
+
+
+def test_google_authenticates_with_a_header_not_a_query_string():
+    from amminer.llm.provider import CloudProvider
+
+    provider = CloudProvider("google", "k", model="gemini-2.0-flash")
+    captured = {}
+
+    def fake_post(url, json, headers, timeout):  # noqa: A002
+        captured["url"] = url
+        captured["headers"] = headers
+        raise RuntimeError("stop here")
+
+    import httpx
+
+    original = httpx.post
+    httpx.post = fake_post
+    try:
+        with pytest.raises(RuntimeError):
+            provider.complete_json("system", "user")
+    finally:
+        httpx.post = original
+    assert "key=" not in captured["url"]
+    assert captured["headers"]["x-goog-api-key"] == "k"

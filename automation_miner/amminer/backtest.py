@@ -552,6 +552,46 @@ def backtest(
     return result
 
 
+def shadow_evaluate(
+    candidate: Candidate,
+    changes: Sequence[StateChange],
+    store: SignalStore,
+    options: Options,
+    window: tuple[float, float],
+    since_ts: float = 0.0,
+) -> list[tuple[float, bool]]:
+    """Would-be fires after *since_ts*, each marked matched or not.
+
+    Shadow mode is the same replay as :func:`backtest`, asked about a period the
+    rule was not judged on: the user said "watch this one" and is owed the
+    answer, fire by fire, rather than a single verdict.
+    """
+    fires, _burst, error = simulate_fires_detailed(candidate, store, window)
+    if error:
+        return []
+    truth = ground_truth_actions(candidate, changes)
+    unmatched = list(truth)
+    out: list[tuple[float, bool]] = []
+    for fire in sorted(fires, key=lambda f: f.ts):
+        tolerance = (
+            STATE_TRIGGER_TOLERANCE
+            if fire.tolerance_is_tight
+            else float(options.backtest_match_tolerance_seconds)
+        )
+        best_index: int | None = None
+        best_delta = tolerance + 1
+        for index, action_ts in enumerate(unmatched):
+            delta = abs(action_ts - fire.ts)
+            if delta <= tolerance and delta < best_delta:
+                best_index, best_delta = index, delta
+        matched = best_index is not None
+        if matched:
+            unmatched.pop(best_index)  # type: ignore[arg-type]
+        if fire.ts > since_ts:
+            out.append((fire.ts, matched))
+    return out
+
+
 def backtest_all(
     candidates: Sequence[Candidate],
     changes: Sequence[StateChange],
