@@ -393,6 +393,13 @@ python -m amminer.testing.synthetic /tmp/rec.db --days 45
   miners agree, and `tests/test_timezones.py` deliberately runs the mining path
   under several real zones, which is the case a Home Assistant instance is
   actually in.
+- **Messy history** — the same generator, with `messy=True`, adds what a real
+  recorder is full of and the clean fixture never had: restarts leaving
+  `unavailable`/`unknown` and then a restored state with no context at all,
+  flapping contacts, and human changes carrying no `context_user_id`. The whole
+  pipeline runs against it and the same injected patterns must still come out,
+  so the degraded paths are exercised by the flagship test rather than only by
+  small unit tests.
 - **Mutation checks** — the thresholds that decide what a user is shown
   (`min_consistency`, the conditional miner's lift/purity/staleness bounds, the
   association lift and human-consequent filters, the stale-automation cutoff)
