@@ -116,6 +116,19 @@ Unwanted fires allowed at moments where you have previously reached over and
 undone an automation on the same entity. These are not merely unnecessary - they
 land exactly where you have already said no - so the default is `0`.
 
+### `allow_security_actions`
+Off by default. While it is off, no suggestion whose action would unlock a door,
+open a cover or valve, or disarm an alarm is ever surfaced, no matter how strong
+the pattern behind it. Turning it on lets those suggestions through; they are
+still held to the stricter thresholds below.
+
+Actions in the `lock`, `cover`, `valve`, `alarm_control_panel`, `water_heater`,
+`siren`, `lawn_mower` and `vacuum` domains always face a higher bar than a lamp:
+95% precision, at least 12 correct fires, and no unwanted fires at all. These
+are deliberately not tied to the options above, so lowering
+`backtest_min_precision` to see more light suggestions does not also lower the
+bar for your front door.
+
 ### `excluded_domains`, `excluded_entities`, `excluded_users`
 Added to sensible built-in exclusions (`sensor.time`, `update.*`, …). Entities
 accept glob patterns such as `sensor.*_battery`. Put long-lived-token "service

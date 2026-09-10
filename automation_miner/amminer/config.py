@@ -64,6 +64,36 @@ ACTIONABLE_DOMAINS: tuple[str, ...] = (
     "script",
 )
 
+#: Domains where being wrong costs more than a light left on: they move
+#: something physical, secure a building, or run unattended.  Every miner in
+#: this project applies the same statistical thresholds regardless of what it is
+#: proposing to control, so the tiering happens once, at the gate.
+RISKY_DOMAINS: tuple[str, ...] = (
+    "lock",
+    "cover",
+    "valve",
+    "alarm_control_panel",
+    "water_heater",
+    "siren",
+    "lawn_mower",
+    "vacuum",
+)
+
+#: Services that leave a home *less* secured than it was.  These are not
+#: conveniences that happen to be risky - unlocking a door because a light came
+#: on is a security decision, and no amount of statistical confidence in a
+#: correlation makes it one this add-on should propose on its own.
+SECURITY_SERVICES: frozenset[str] = frozenset(
+    {
+        "lock.unlock",
+        "lock.open",
+        "cover.open_cover",
+        "cover.open_cover_tilt",
+        "valve.open_valve",
+        "alarm_control_panel.alarm_disarm",
+    }
+)
+
 
 def _as_bool(value: Any, default: bool) -> bool:
     if isinstance(value, bool):
@@ -116,6 +146,10 @@ class Options:
     #: False fires next to a historical override are not merely unnecessary,
     #: they land exactly where the user has already said no.
     backtest_max_nuisance_fires: int = 0
+
+    #: Allow suggestions whose action unlocks, opens or disarms something.  Off
+    #: by default: these are security decisions, not conveniences.
+    allow_security_actions: bool = False
 
     # --- staleness ---
     stale_automation_days: int = 30

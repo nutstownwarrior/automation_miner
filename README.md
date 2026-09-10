@@ -55,6 +55,17 @@ strictly, per trigger: "some time in the next quarter hour" is a fair reading of
 a daily habit and a dishonest one for a rule claiming the door opening caused
 the light.
 
+**Not everything gets the same bar.** A rule that moves a physical barrier or
+secures a building is not the same kind of suggestion as one that turns on a
+lamp, and every miner in this project would otherwise apply identical thresholds
+to both. Actions on `lock`, `cover`, `valve`, `alarm_control_panel`,
+`water_heater`, `siren`, `lawn_mower` and `vacuum` must clear 95% precision, at
+least 12 correct fires, and zero unwanted fires. Actions that leave the home
+*less* secured — unlocking, opening a cover or valve, disarming — are not
+proposed at all unless you turn on `allow_security_actions`: a correlation is
+never a reason to unlock a door, and there is no precision at which it becomes
+one.
+
 **It checks for conflicts.** Before surfacing a rule it looks for value
 inconsistencies, dependency loops, redundancy with an existing automation, and
 races between entities on the same physical device. A conflicting rule is never
@@ -272,6 +283,7 @@ without touching any of it.
 | `backtest_min_true_fires` | `4` | times a rule must have been right before its percentages count |
 | `backtest_max_false_fires_per_week` | `3` | nuisance budget |
 | `backtest_max_nuisance_fires` | `0` | unwanted fires allowed where you previously overrode an automation |
+| `allow_security_actions` | `false` | let suggestions unlock, open or disarm things |
 | `excluded_domains` / `excluded_entities` / `excluded_users` | `[]` | added to sensible built-in exclusions; entities accept globs |
 | `llm_provider` | `none` | `none`, `ollama`, or a cloud provider (opt-in) |
 | `schedule` | `0 3 * * *` | cron for the nightly analysis |

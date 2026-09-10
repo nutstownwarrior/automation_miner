@@ -607,3 +607,77 @@ def test_an_ordinary_rule_reports_no_bursts():
     result = backtest(candidate, changes, store, Options(), WINDOW)
     assert result.burst_fires == 0
     assert result.passed is True, result.reason
+
+
+# --- risk tiering --------------------------------------------------------
+def _repeating(service: str, entity_id: str, days: int = 10):
+    """A clean, high-precision habit - the kind a light suggestion is made of."""
+    candidate = Candidate(
+        miner="test",
+        title=f"{service} {entity_id}",
+        triggers=[Trigger(kind="state", entity_id="binary_sensor.motion", to_state="on")],
+        actions=[Action(service=service, entity_id=entity_id)],
+    )
+    store = SignalStore()
+    series = SignalSeries("binary_sensor.motion")
+    changes = []
+    target = {"lock.lock": "locked", "lock.unlock": "unlocked",
+              "cover.close_cover": "closed", "cover.open_cover": "open"}.get(service, "on")
+    for day in range(days):
+        ts = _minute(day, 18)
+        series.add(ts - 30, "on")
+        series.add(ts - 20, "off")
+        changes.append(human(entity_id, target, ts))
+    store.add(series)
+    return candidate, changes, store
+
+
+def test_a_lamp_habit_passes_on_the_ordinary_bar():
+    candidate, changes, store = _repeating("light.turn_on", "light.hallway")
+    result = backtest(candidate, changes, store, Options(), WINDOW)
+    assert result.passed is True, result.reason
+    assert result.risky_domains == []
+
+
+def test_the_same_evidence_is_not_enough_for_a_lock():
+    """Identical statistics, a different thing being controlled."""
+    candidate, changes, store = _repeating("lock.lock", "lock.front_door")
+    result = backtest(candidate, changes, store, Options(), WINDOW)
+    assert result.precision == 1.0
+    assert result.true_fires == 10
+    assert result.risky_domains == ["lock"]
+    assert result.passed is False
+    assert "at least 12 needed for a lock" in result.reason
+
+
+def test_a_lock_passes_once_the_evidence_is_there():
+    candidate, changes, store = _repeating("lock.lock", "lock.front_door", days=20)
+    result = backtest(candidate, changes, store, Options(), WINDOW)
+    assert result.risky_domains == ["lock"]
+    assert result.passed is True, result.reason
+
+
+@pytest.mark.parametrize(
+    "service, entity_id",
+    [
+        ("lock.unlock", "lock.front_door"),
+        ("cover.open_cover", "cover.garage"),
+        ("valve.open_valve", "valve.mains"),
+    ],
+)
+def test_unlocking_and_opening_are_never_proposed_from_a_correlation(service, entity_id):
+    """No precision makes a correlation a reason to unsecure a house."""
+    candidate, changes, store = _repeating(service, entity_id, days=60)
+    result = backtest(candidate, changes, store, Options(), WINDOW)
+    assert result.passed is False
+    assert result.simulated is False  # refused before the statistics are consulted
+    assert "less secured" in result.reason
+
+
+def test_the_refusal_can_be_lifted_deliberately():
+    candidate, changes, store = _repeating("lock.unlock", "lock.front_door", days=20)
+    options = Options(allow_security_actions=True)
+    result = backtest(candidate, changes, store, options, WINDOW)
+    assert result.simulated is True
+    assert result.risky_domains == ["lock"]  # still on the stricter thresholds
+    assert result.passed is True, result.reason

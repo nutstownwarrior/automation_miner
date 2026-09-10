@@ -282,3 +282,73 @@ def test_energy_miner_suggests_shifting_expensive_runs(options):
     assert candidates[0].evidence.confidence >= 0.35
     cheapest_hour = candidates[0].evidence.extra["cheapest_block"][0]
     assert not (17 <= cheapest_hour <= 21)
+
+
+# --- association direction ----------------------------------------------
+def _ordered_pair_history(days: int = 80) -> list:
+    """The pump always comes on 60s before the light, and off 60s before it."""
+    from amminer.recorderdb.models import Cause, StateChange
+
+    def change(entity_id: str, state: str, ts: float, old: str) -> StateChange:
+        item = StateChange(entity_id=entity_id, state=state, ts=ts,
+                           old_state=old, last_changed_ts=ts)
+        item.cause = Cause.HUMAN
+        return item
+
+    base = 1_700_000_000.0
+    history = []
+    for day in range(days):
+        ts = base + day * 86400
+        history.append(change("switch.pump", "on", ts, "off"))
+        history.append(change("light.kitchen", "on", ts + 60, "off"))
+        history.append(change("switch.pump", "off", ts + 3600, "on"))
+        history.append(change("light.kitchen", "off", ts + 3660, "on"))
+    return history
+
+
+def test_association_does_not_propose_the_rule_backwards():
+    """A basket is a set, so FP-Growth yields both arrows with equal evidence."""
+    from amminer.config import Options as MinerOptions
+    from amminer.miners import association
+
+    history = _ordered_pair_history()
+    candidates = association.mine(
+        history, MinerOptions(), (history[0].ts, history[-1].ts)
+    )
+    arrows = {(c.triggers[0].entity_id, c.actions[0].entity_id) for c in candidates}
+
+    assert ("switch.pump", "light.kitchen") in arrows
+    # Same support, same confidence, same lift - and the pump does not come on
+    # because the light did.  Two cards with identical numbers is how a user
+    # accepts both and builds a loop.
+    assert ("light.kitchen", "switch.pump") not in arrows
+
+
+def test_a_sensor_that_merely_follows_is_not_offered_as_a_trigger():
+    """The power draw rises *because* the heater came on."""
+    from amminer.config import Options as MinerOptions
+    from amminer.miners import association
+    from amminer.recorderdb.models import Cause, StateChange
+
+    def change(entity_id, state, ts, old, cause=Cause.HUMAN):
+        item = StateChange(entity_id=entity_id, state=state, ts=ts,
+                           old_state=old, last_changed_ts=ts)
+        item.cause = cause
+        return item
+
+    base = 1_700_000_000.0
+    history = []
+    for day in range(80):
+        ts = base + day * 86400
+        history.append(change("switch.heater", "on", ts, "off"))
+        history.append(
+            change("binary_sensor.high_draw", "on", ts + 30, "off", Cause.DEVICE)
+        )
+        history.append(change("switch.heater", "off", ts + 7200, "on"))
+        history.append(
+            change("binary_sensor.high_draw", "off", ts + 7230, "on", Cause.DEVICE)
+        )
+
+    candidates = association.mine(history, MinerOptions(), (base, history[-1].ts))
+    arrows = {(c.triggers[0].entity_id, c.actions[0].entity_id) for c in candidates}
+    assert ("binary_sensor.high_draw", "switch.heater") not in arrows

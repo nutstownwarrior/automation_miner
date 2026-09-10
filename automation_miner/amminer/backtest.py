@@ -36,7 +36,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from .config import Options
+from .config import RISKY_DOMAINS, SECURITY_SERVICES, Options
 from .enrich.signals import SignalStore
 from .miners.base import Candidate, Condition, Trigger
 from .recorderdb.models import Cause, OverrideEvent, StateChange
@@ -80,6 +80,31 @@ class Fire:
         return self.trigger_kind in EVENT_TRIGGER_KINDS
 
 
+#: What a risky-domain candidate has to clear instead of the ordinary numbers.
+#: Deliberately not user-tunable through the same knobs as everything else: a
+#: user lowering min_precision to see more light suggestions should not thereby
+#: lower the bar for their front door.
+RISKY_MIN_PRECISION = 0.95
+RISKY_MIN_TRUE_FIRES = 12
+RISKY_MAX_FALSE_FIRES_PER_WEEK = 0.0
+
+
+def security_services(candidate: Candidate) -> list[str]:
+    """Actions in *candidate* that would leave the home less secured."""
+    return sorted({a.service for a in candidate.actions if a.service in SECURITY_SERVICES})
+
+
+def risky_domains(candidate: Candidate) -> list[str]:
+    """Domains in *candidate*'s actions that move something that matters."""
+    return sorted(
+        {
+            (a.entity_id or "").split(".", 1)[0]
+            for a in candidate.actions
+            if (a.entity_id or "").split(".", 1)[0] in RISKY_DOMAINS
+        }
+    )
+
+
 @dataclass
 class BacktestResult:
     """Outcome of replaying one candidate."""
@@ -99,6 +124,8 @@ class BacktestResult:
     #: run the action for each of these, so they are what the nuisance figures
     #: leave out.
     burst_fires: int = 0
+    #: Action domains that put this candidate on the stricter thresholds.
+    risky_domains: list[str] = field(default_factory=list)
 
     @property
     def precision(self) -> float | None:
@@ -133,6 +160,7 @@ class BacktestResult:
             "fire_samples": self.fire_samples[:20],
             "false_fire_samples": self.false_fire_samples[:20],
             "burst_fires": self.burst_fires,
+            "risky_domains": self.risky_domains,
             "summary": self.summary(),
         }
 
@@ -384,6 +412,21 @@ def backtest(
         result.passed = True  # audit-only findings (stale/unused) are not gated
         return result
 
+    # Some actions are not conveniences that happen to be risky.  A correlation,
+    # however strong, is not a reason to unlock a door, open a garage or disarm
+    # an alarm, and there is no precision at which it becomes one - so this is
+    # decided before any statistics are consulted, not by them.
+    unsafe = security_services(candidate)
+    if unsafe and not options.allow_security_actions:
+        result.simulated = False
+        result.passed = False
+        result.reason = (
+            f"{', '.join(unsafe)} would leave your home less secured than it was; "
+            "this add-on does not propose that from a pattern in your history "
+            "(enable allow_security_actions if you want these suggestions)"
+        )
+        return result
+
     fires, result.burst_fires, error = simulate_fires_detailed(candidate, store, window, tz)
     if error:
         result.simulated = False
@@ -437,23 +480,37 @@ def backtest(
     recall = result.recall
     reasons: list[str] = []
 
+    # A rule that moves a physical barrier or secures a building is held to a
+    # higher bar than one that turns on a lamp.  Every miner applies the same
+    # thresholds to every domain, so the tiering has to happen here or nowhere.
+    risky = risky_domains(candidate)
+    min_precision = options.backtest_min_precision
+    min_true_fires = options.backtest_min_true_fires
+    max_false_per_week = options.backtest_max_false_fires_per_week
+    if risky:
+        min_precision = max(min_precision, RISKY_MIN_PRECISION)
+        min_true_fires = max(min_true_fires, RISKY_MIN_TRUE_FIRES)
+        max_false_per_week = min(max_false_per_week, RISKY_MAX_FALSE_FIRES_PER_WEEK)
+        result.risky_domains = risky
+
     # The floor comes before the ratios.  One correct fire and no wrong ones is
     # 100% precision, 0 nuisance fires per week, and one observation - it clears
     # every threshold below without having shown anything.
     if precision is None:
         reasons.append("the rule never fired in the analysed window")
     else:
-        if result.true_fires < options.backtest_min_true_fires:
+        if result.true_fires < min_true_fires:
             reasons.append(
                 f"the rule was only right {result.true_fires} "
                 f"time{'' if result.true_fires == 1 else 's'} in "
                 f"{result.window_days:.0f} days, which is too little to judge it on "
-                f"(at least {options.backtest_min_true_fires} needed)"
+                f"(at least {min_true_fires} needed"
+                f"{' for a ' + '/'.join(risky) if risky else ''})"
             )
-        if precision < options.backtest_min_precision:
+        if precision < min_precision:
             reasons.append(
-                f"precision {precision:.0%} is below the "
-                f"{options.backtest_min_precision:.0%} threshold"
+                f"precision {precision:.0%} is below the {min_precision:.0%} threshold"
+                + (f" required for a {'/'.join(risky)}" if risky else "")
             )
         if recall is not None and recall < options.backtest_min_recall:
             reasons.append(
@@ -462,10 +519,11 @@ def backtest(
                 f"below the {options.backtest_min_recall:.0%} threshold"
             )
 
-    if result.false_fires_per_week > options.backtest_max_false_fires_per_week:
+    if result.false_fires_per_week > max_false_per_week:
         reasons.append(
             f"{result.false_fires_per_week:.1f} unwanted fires per week exceeds the "
-            f"limit of {options.backtest_max_false_fires_per_week:g}"
+            f"limit of {max_false_per_week:g}"
+            + (f" for a {'/'.join(risky)}" if risky else "")
         )
     # Computing this and then not acting on it was the worst of both: a rule
     # that fires exactly where the user has already reached over and undone an

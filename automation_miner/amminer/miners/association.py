@@ -7,6 +7,15 @@ then yields ``{A} -> {B}`` rules with support/confidence/lift.
 Rules are kept only when the consequent is an *actionable* entity the user
 touched by hand, and the antecedent is a different entity - i.e. rules that can
 become a real "when A, then B" automation.
+
+A basket is a set, so it says nothing about order.  FP-Growth on a co-occurring
+pair yields ``{A} -> {B}`` and ``{B} -> {A}`` with *identical* support,
+confidence and lift, by construction, for every strong pair - so the miner would
+otherwise propose "turn the pump on because the light came on" with exactly the
+evidence of the rule that is actually true, and a user reading two cards with
+the same numbers could accept both and build a loop.  Order is therefore
+recorded separately, while the baskets are being built, and a rule has to show
+that its antecedent really did come first.
 """
 
 from __future__ import annotations
@@ -44,6 +53,11 @@ TRIGGER_DOMAINS = (
 )
 
 
+#: How much more often the antecedent must precede the consequent than follow it
+#: before the rule is allowed to claim a direction.
+MIN_DIRECTION_RATIO = 2.0
+
+
 def _item(change: StateChange) -> str:
     return f"{change.entity_id}={change.state.lower()}"
 
@@ -62,12 +76,18 @@ def build_transactions(
     changes: Sequence[StateChange],
     window_seconds: float,
     options: Options,
-) -> tuple[list[list[str]], dict[str, int]]:
+) -> tuple[list[list[str]], dict[str, int], dict[tuple[str, str], int]]:
     """Group changes into overlapping baskets, one per "interesting" change.
 
     Anchoring a basket on each *human* change (rather than on fixed clock
     windows) keeps the transaction count proportional to user activity and
     avoids thousands of empty midnight baskets.
+
+    Returns ``(baskets, item counts, ordered-pair counts)``.  The last one is
+    what the baskets themselves cannot express: for each ordered pair of items
+    in a basket, how many baskets had the first strictly before the second.
+    Collect it here or not at all - once a basket is a set, the timestamps are
+    gone.
     """
     usable = [
         change
@@ -85,22 +105,32 @@ def build_transactions(
     transactions: list[list[str]] = []
     item_counts: dict[str, int] = defaultdict(int)
 
+    order_counts: dict[tuple[str, str], int] = defaultdict(int)
+
     for anchor in anchors:
         centre = usable[anchor].ts
-        basket: set[str] = set()
+        # First time each item appears in this basket; a repeated item is one
+        # symbol, and its earliest occurrence is what ordering means.
+        first_seen: dict[str, float] = {}
         i = anchor
         while i >= 0 and centre - usable[i].ts <= window_seconds:
-            basket.add(_item(usable[i]))
+            first_seen[_item(usable[i])] = usable[i].ts
             i -= 1
         i = anchor + 1
         while i < len(usable) and usable[i].ts - centre <= window_seconds:
-            basket.add(_item(usable[i]))
+            first_seen.setdefault(_item(usable[i]), usable[i].ts)
             i += 1
+        basket = set(first_seen)
         if len(basket) >= 2:
             transactions.append(sorted(basket))
             for item in basket:
                 item_counts[item] += 1
-    return transactions, dict(item_counts)
+            ordered = sorted(first_seen.items(), key=lambda kv: kv[1])
+            for position, (earlier, earlier_ts) in enumerate(ordered):
+                for later, later_ts in ordered[position + 1:]:
+                    if later_ts > earlier_ts:
+                        order_counts[(earlier, later)] += 1
+    return transactions, dict(item_counts), dict(order_counts)
 
 
 def one_hot_encode(transactions: Sequence[Sequence[str]], pd) -> Any:
@@ -196,7 +226,7 @@ def mine(
     resolver=None,
 ) -> list[Candidate]:
     """Mine "when A happens, B usually follows" candidates."""
-    transactions, _counts = build_transactions(
+    transactions, _counts, order_counts = build_transactions(
         changes, options.association_window_seconds, options
     )
     rules = _rules_from_transactions(transactions, options)
@@ -227,6 +257,25 @@ def mine(
             continue
         if human_items.get(consequent, 0) < max(options.min_occurrences // 2, 2):
             # The consequent is not something the user actually does by hand.
+            continue
+        forward = order_counts.get((antecedent, consequent), 0)
+        backward = order_counts.get((consequent, antecedent), 0)
+        if forward < backward:
+            # The antecedent consistently arrives *after* the consequent, so it
+            # is the effect being offered as the cause - "when the power draw
+            # rises, switch the heater on".
+            continue
+        # If the mirror rule could also be emitted, both cards would carry the
+        # same support, confidence and lift, and a user could accept both and
+        # build a loop.  That case needs a clear arrow, not merely a tie.  When
+        # the mirror rule is impossible anyway - the antecedent is a sensor or a
+        # person, which nothing can act on - simultaneity carries no
+        # information and is not held against the rule.
+        mirror_possible = (
+            a_entity.split(".", 1)[0] in ACTIONABLE_DOMAINS
+            and human_items.get(antecedent, 0) >= max(options.min_occurrences // 2, 2)
+        )
+        if mirror_possible and forward < backward * MIN_DIRECTION_RATIO:
             continue
         if (a_entity, a_state, c_entity) in seen:
             continue

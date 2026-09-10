@@ -38,6 +38,7 @@ options:
   backtest_min_true_fires: 4
   backtest_max_false_fires_per_week: 3
   backtest_max_nuisance_fires: 0
+  allow_security_actions: false
   excluded_domains: []
   excluded_entities: []
   excluded_users: []
@@ -65,6 +66,7 @@ schema:
   backtest_min_true_fires: int(1,1000)?
   backtest_max_false_fires_per_week: float(0.0,1000.0)?
   backtest_max_nuisance_fires: int(0,1000)?
+  allow_security_actions: bool?
   excluded_domains:
     - str?
   excluded_entities:
