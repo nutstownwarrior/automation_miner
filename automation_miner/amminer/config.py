@@ -266,7 +266,16 @@ class Options:
         kwargs: dict[str, Any] = {}
         for key, value in data.items():
             spec = known.get(key)
-            if spec is None or value is None:
+            if spec is None:
+                # A typo in options.json got no diagnostic at all, while a
+                # merely mistyped value got a warning - so the more confusing
+                # mistake was the quieter one.  min_occurences: 50 silently did
+                # nothing and the user had no way to see why.
+                _LOGGER.warning(
+                    "Ignoring unknown option %r; it is not one this add-on has", key
+                )
+                continue
+            if value is None:
                 continue
             if spec.type in ("bool", bool):
                 kwargs[key] = _as_bool(value, bool(spec.default))
@@ -285,6 +294,19 @@ class Options:
                     kwargs[key] = [v.strip() for v in value.split(",") if v.strip()]
                 elif isinstance(value, (list, tuple)):
                     kwargs[key] = [str(v) for v in value]
+            elif spec.type in ("str", str):
+                # Uncoerced, a non-string here reaches Path() during startup and
+                # raises TypeError before logging is even configured, killing
+                # the add-on rather than degrading.
+                if not isinstance(value, str):
+                    _LOGGER.warning(
+                        "Option %s should be text; using %r instead of %r",
+                        key,
+                        spec.default,
+                        value,
+                    )
+                    continue
+                kwargs[key] = value
             else:
                 kwargs[key] = value
         return cls(**kwargs)

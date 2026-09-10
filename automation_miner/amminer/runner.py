@@ -86,6 +86,9 @@ class Runner:
         self._services: list[str] | None = None
         self._lock = threading.Lock()
         self._running = False
+        #: Set whenever no analysis is in flight, so shutdown can wait for one.
+        self._idle = threading.Event()
+        self._idle.set()
 
     # ------------------------------------------------------------------
     @property
@@ -113,13 +116,14 @@ class Runner:
                 _LOGGER.info("Analysis already running; ignoring request")
                 return self.last_report
             self._running = True
+            self._idle.clear()
         started = time.time()
         try:
             # A fresh resolver each run picks up newly added entities.
             self.resolver = build_resolver(self.options.ha_config_dir, self.client)
             self._services = None
             report, _candidates = run_analysis(
-                self.options, self.store, self.client, self.ha_config
+                self.options, self.store, self.client, self.ha_config, resolver=self.resolver
             )
             self.last_report = report
             return report
@@ -128,7 +132,18 @@ class Runner:
             return self.last_report
         finally:
             self._running = False
+            self._idle.set()
             _LOGGER.info("Analysis finished in %.1fs", time.time() - started)
+
+    def wait_until_idle(self, timeout: float) -> bool:
+        """Block until no analysis is in flight.  False if it is still going.
+
+        Shutdown closes the database.  Doing that under a run that is still
+        writing raises "Cannot operate on a closed database" mid-write, loses
+        every candidate not yet persisted, and leaves the run row saying
+        "running" forever.
+        """
+        return self._idle.wait(timeout)
 
     # ------------------------------------------------------------------
     def preview_yaml(self, suggestion_id: str) -> dict[str, Any] | None:

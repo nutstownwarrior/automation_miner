@@ -47,11 +47,27 @@ class Scheduler:
         self._thread = threading.Thread(target=self._loop, name="amminer-scheduler", daemon=True)
         self._thread.start()
 
-    def stop(self) -> None:
+    def stop(self, timeout: float = 5.0) -> bool:
+        """Stop scheduling and wait for a callback in flight.
+
+        Returns False when the callback is still running, so the caller can
+        decide what to do rather than assuming it finished.  The old version
+        joined for five seconds and then set ``_thread = None`` regardless -
+        which reads as "stopped" for a run that is still writing to the
+        database the caller is about to close.
+        """
         self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=5)
-            self._thread = None
+        thread = self._thread
+        if thread is None:
+            return True
+        thread.join(timeout=timeout)
+        if thread.is_alive():
+            _LOGGER.warning(
+                "Scheduled analysis is still running after %.0fs; not abandoning it", timeout
+            )
+            return False
+        self._thread = None
+        return True
 
     def _loop(self) -> None:
         while not self._stop.is_set():

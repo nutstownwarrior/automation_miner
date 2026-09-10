@@ -8,6 +8,7 @@ UI, so the user always knows *why* they are seeing fewer suggestions.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 import traceback
@@ -62,6 +63,8 @@ class RunReport:
     miner_counts: dict[str, int] = field(default_factory=dict)
     #: miner name -> the error that stopped it, for miners that failed
     miner_errors: dict[str, str] = field(default_factory=dict)
+    #: AI feature name -> the error that stopped it
+    ai_errors: dict[str, str] = field(default_factory=dict)
     #: Per optional AI feature: whether it ran and what it contributed.
     ai: dict[str, Any] = field(default_factory=dict)
     surfaced: int = 0
@@ -89,6 +92,7 @@ class RunReport:
             "overrides": self.overrides,
             "miner_counts": self.miner_counts,
             "miner_errors": self.miner_errors,
+            "ai_errors": self.ai_errors,
             "ai": self.ai,
             "surfaced": self.surfaced,
             "rejected": self.rejected,
@@ -160,6 +164,7 @@ def run_analysis(
     store: Store,
     client: HAClient | None = None,
     ha_config: HAConfig | None = None,
+    resolver=None,
 ) -> tuple[RunReport, list[Candidate]]:
     """Run one complete analysis and persist the results."""
     report = RunReport()
@@ -176,7 +181,13 @@ def run_analysis(
             )
 
         # --- entity resolution ---------------------------------------
-        resolver = build_resolver(options.ha_config_dir, client)
+        # The caller may already have built one; reading the registry files and
+        # calling /api/states a second time doubles this run's load on Core for
+        # an object we then discard - and left Runner.resolver, which the UI and
+        # every preview use, as a different object from the one that was mined
+        # and backtested against.
+        if resolver is None:
+            resolver = build_resolver(options.ha_config_dir, client)
         report.entities = resolver.stats()
         if not resolver.entities:
             report.degradations.append(
@@ -290,6 +301,10 @@ def run_analysis(
                     f"The AI {name.replace('_', ' ')} step failed and was skipped "
                     f"({type(err).__name__}: {err})."
                 )
+                # "partial" means something the user asked for did not happen.
+                # A failed AI feature is exactly that, and reporting it as a
+                # plain "ok" run made the word mean only "a miner failed".
+                report.ai_errors[name] = f"{type(err).__name__}: {err}"
                 return None
             report.ai[name] = {"requested": True, "ran": True, **outcome.as_dict()}
             return outcome
@@ -317,13 +332,16 @@ def run_analysis(
                 "No external signals (sun, weather, presence, price) detected; only intrinsic "
                 "patterns are mined."
             )
-        signal_store = build_signal_store(
-            changes, signals.all_entities, queries, (start_ts, end_ts)
-        )
-        # Every entity a candidate might reference must be simulatable, so the
-        # backtester gets a store covering the whole mined entity set.
+        # One store, not two.  Every entity a candidate might reference has to
+        # be simulatable, so this covers the whole mined entity set - which is
+        # a superset of the detected signals.  Building a signals-only store as
+        # well meant a second full pass over the same state history for a
+        # strict subset of the same data, and both kept alive for the rest of
+        # the run.  The miners that used to take the smaller one look entities
+        # up by id and never enumerate it, so they see exactly what they did.
         all_entities = sorted({c.entity_id for c in changes} | set(signals.all_entities))
         full_store = build_signal_store(changes, all_entities, queries, (start_ts, end_ts))
+        signal_store = full_store
 
         # --- mining ---------------------------------------------------
         window = (start_ts, end_ts)
@@ -346,6 +364,23 @@ def run_analysis(
                     f"({type(err).__name__}: {err}). Other miners still ran."
                 )
                 return []
+
+        def run_stage(name, func, *args):
+            """Run one post-mining stage in isolation.
+
+            Same contract as run_miner, for the parts of the run that come
+            after it: a failure costs that stage and is reported, rather than
+            discarding work that already succeeded.  ``None`` means it failed.
+            """
+            try:
+                return func(*args)
+            except Exception as err:  # noqa: BLE001 - one stage must not end the run
+                _LOGGER.exception("Stage %s failed: %s", name, err)
+                report.miner_errors[name] = f"{type(err).__name__}: {err}"
+                report.degradations.append(
+                    f"The {name} step failed ({type(err).__name__}: {err})."
+                )
+                return None
 
         produced["time_of_day"] = run_miner(
             "time_of_day", time_of_day.mine, changes, options, window, resolver
@@ -393,9 +428,20 @@ def run_analysis(
             _LOGGER.info("Filtered %d previously dismissed candidates", before - len(mined))
 
         # --- backtest --------------------------------------------------
-        passed, rejected = backtest_all(
-            mined, changes, full_store, options, window, overrides
+        # Everything from here on is isolated the same way the miners are.  It
+        # used to fall through to the outer handler, which sets status=error
+        # and returns nothing - so an exception in any one of backtesting,
+        # conflict checking or gap analysis threw away every candidate every
+        # miner had already produced, and persisted none of them.
+        backtested = run_stage(
+            "backtest", backtest_all, mined, changes, full_store, options, window, overrides
         )
+        if backtested is None:
+            # Without a backtest nothing may be surfaced: an unmeasured rule is
+            # exactly what this project exists not to suggest.
+            passed, rejected = [], list(mined)
+        else:
+            passed, rejected = backtested
         # --- AI hypotheses: propose, then measure with the same gate ---
         if provider is not None and options.llm_hypotheses and rejected:
             hypotheses = run_ai(
@@ -441,56 +487,84 @@ def run_analysis(
         ) or 0
 
         # --- conflicts -------------------------------------------------
-        existing = load_existing_automations(ha_config, resolver)
-        conflict_checks.annotate_candidates(passed, existing, resolver)
-        report.conflicted = sum(
-            1 for c in passed if conflict_checks.has_blocking_conflict(c)
-        )
+        existing = run_stage("existing automations", load_existing_automations,
+                             ha_config, resolver) or []
+
+        def _annotate_conflicts() -> int:
+            conflict_checks.annotate_candidates(passed, existing, resolver)
+            return sum(1 for c in passed if conflict_checks.has_blocking_conflict(c))
+
+        conflicted = run_stage("conflicts", _annotate_conflicts)
+        if conflicted is None:
+            # Unchecked is not the same as clean, and the user is told so.
+            report.degradations.append(
+                "Conflict checking failed, so these suggestions have not been compared "
+                "against the automations you already have."
+            )
+        report.conflicted = conflicted or 0
 
         # --- persist ---------------------------------------------------
+        # Per candidate, not per loop: one candidate whose payload will not
+        # serialise must not take the other forty with it.
         for candidate in passed:
-            store.upsert_suggestion(
-                candidate.id,
-                candidate.miner,
-                candidate.title,
-                candidate.describe(resolver),
-                candidate.score,
-                candidate.as_dict(resolver),
-                run_id,
-            )
-            if candidate.backtest:
-                store.save_backtest(candidate.id, candidate.backtest)
+            def _save(candidate=candidate) -> bool:
+                store.upsert_suggestion(
+                    candidate.id,
+                    candidate.miner,
+                    candidate.title,
+                    candidate.describe(resolver),
+                    candidate.score,
+                    candidate.as_dict(resolver),
+                    run_id,
+                )
+                if candidate.backtest:
+                    store.save_backtest(candidate.id, candidate.backtest)
+                return True
+
+            run_stage(f"saving {candidate.id}", _save)
         for candidate in audit_findings:
             if candidate.id in dismissed:
                 continue
-            store.upsert_suggestion(
-                candidate.id,
-                candidate.miner,
-                candidate.title,
-                candidate.description,
-                candidate.score,
-                candidate.as_dict(resolver),
-                run_id,
-            )
-        store.prune_suggestions(run_id)
+
+            def _save_audit(candidate=candidate) -> bool:
+                store.upsert_suggestion(
+                    candidate.id,
+                    candidate.miner,
+                    candidate.title,
+                    candidate.description,
+                    candidate.score,
+                    candidate.as_dict(resolver),
+                    run_id,
+                )
+                return True
+
+            run_stage(f"saving {candidate.id}", _save_audit)
+        run_stage("pruning", store.prune_suggestions, run_id)
 
         # --- gaps ------------------------------------------------------
-        gap_suggestions = gap_analysis.suggest(
-            resolver, signals, changes, passed, recorder.info
-        )
-        report.gaps = len(gap_suggestions)
-        for gap in gap_suggestions:
-            store.upsert_gap(gap.id, gap.kind, gap.title, gap.as_dict())
+        def _suggest_gaps() -> int:
+            gap_suggestions = gap_analysis.suggest(
+                resolver, signals, changes, passed, recorder.info
+            )
+            for gap in gap_suggestions:
+                store.upsert_gap(gap.id, gap.kind, gap.title, gap.as_dict())
+            return len(gap_suggestions)
 
-        store.set_meta("last_audit", str(int(time.time())))
-        store.set_meta(
-            "existing_automation_audit",
-            __import__("json").dumps(conflict_checks.audit_existing(existing, resolver)),
-        )
+        report.gaps = run_stage("gap analysis", _suggest_gaps) or 0
+
+        def _write_audit() -> bool:
+            store.set_meta("last_audit", str(int(time.time())))
+            store.set_meta(
+                "existing_automation_audit",
+                json.dumps(conflict_checks.audit_existing(existing, resolver)),
+            )
+            return True
+
+        run_stage("automation audit", _write_audit)
 
         # A run where some miners failed still produced results, but saying it
         # was plain "ok" would hide that from the user.
-        report.status = "partial" if report.miner_errors else "ok"
+        report.status = "partial" if (report.miner_errors or report.ai_errors) else "ok"
         candidates = passed + audit_findings
         recorder.close()
 

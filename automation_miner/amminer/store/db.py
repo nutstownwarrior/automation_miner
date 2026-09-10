@@ -203,6 +203,21 @@ class Store:
             (time.time(), status, _json(stats or {}), error, run_id),
         )
 
+    def close_interrupted_runs(self) -> int:
+        """Mark runs that never finished, so nothing sits at "running" forever.
+
+        A run row is opened before mining and closed after persisting.  If the
+        add-on is stopped in between - a Supervisor restart during the nightly
+        analysis - the row is left open and the status page shows a run that has
+        been in progress since whenever that was.
+        """
+        cursor = self._execute(
+            "UPDATE runs SET status = ?, finished_ts = ?, error = ?"
+            " WHERE finished_ts IS NULL AND status = 'running'",
+            ("interrupted", time.time(), "the add-on stopped while this run was in progress"),
+        )
+        return cursor.rowcount or 0
+
     def last_run(self) -> dict[str, Any] | None:
         rows = self._query("SELECT * FROM runs ORDER BY id DESC LIMIT 1")
         if not rows:

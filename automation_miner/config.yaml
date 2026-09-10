@@ -26,6 +26,7 @@ options:
   schedule: "0 3 * * *"
   run_on_start: true
   analysis_window_days: 0
+  max_auto_window_days: 60
   min_consistency: 0.6
   min_occurrences: 5
   time_cluster_minutes: 30
@@ -54,6 +55,7 @@ schema:
   schedule: str?
   run_on_start: bool?
   analysis_window_days: int(0,3650)?
+  max_auto_window_days: int(1,3650)?
   min_consistency: float(0.0,1.0)?
   min_occurrences: int(2,1000)?
   time_cluster_minutes: int(1,240)?

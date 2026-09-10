@@ -341,3 +341,46 @@ def test_dockerfile_installs_wheels_only():
 def test_repository_yaml_is_valid():
     repository = yaml.safe_load((ADDON_DIR.parent / "repository.yaml").read_text())
     assert repository["name"] and repository["url"]
+
+
+def test_a_typo_in_the_options_file_is_reported(caplog):
+    """The more confusing mistake had the quieter diagnostic: none at all."""
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        options = Options.from_mapping({"min_occurences": 50, "min_occurrences": 7})
+    assert options.min_occurrences == 7
+    assert any("min_occurences" in record.message for record in caplog.records)
+
+
+def test_a_non_text_path_option_does_not_kill_startup(caplog):
+    """Uncoerced, this reaches Path() and raises before logging is configured."""
+    import logging
+    from pathlib import Path
+
+    with caplog.at_level(logging.WARNING):
+        options = Options.from_mapping({"state_dir": 5})
+    assert isinstance(options.state_dir, str)
+    Path(options.state_dir)  # must not raise
+    assert any("state_dir" in record.message for record in caplog.records)
+
+
+def test_every_runtime_option_is_clamped_to_something_usable():
+    options = Options(
+        backtest_min_recall=5.0,
+        backtest_min_true_fires=0,
+        backtest_max_nuisance_fires=-3,
+        backtest_match_tolerance_seconds=0,
+        sequence_min_occurrences=0,
+        association_window_seconds=0,
+        stale_automation_days=0,
+        llm_timeout_seconds=0,
+    )
+    assert options.backtest_min_recall == 1.0
+    assert options.backtest_min_true_fires == 1
+    assert options.backtest_max_nuisance_fires == 0
+    assert options.backtest_match_tolerance_seconds == 1
+    assert options.sequence_min_occurrences == 2
+    assert options.association_window_seconds == 1
+    assert options.stale_automation_days == 1
+    assert options.llm_timeout_seconds == 1

@@ -369,9 +369,33 @@ def test_a_failing_ai_feature_does_not_break_the_run(
         ha_config_dir, store, fake_client, llm_provider="ollama",
         llm_entity_classification=True, llm_hypotheses=True, llm_triage=True,
     )
+    # A provider that is simply down is handled inside each feature and shows
+    # up as a degradation, not as a broken run.
     assert report.status == "ok"
     assert report.error is None
+    assert report.ai_errors == {}
     assert report.surfaced > 0, "the deterministic miners must still deliver"
+    assert store.list_suggestions(status="new")
+
+
+def test_an_ai_feature_that_crashes_makes_the_run_partial(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    """A feature raising is not the same as a provider being down."""
+    import amminer.llm.triage as llm_triage
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("a bug in the triage feature itself")
+
+    monkeypatch.setattr(llm_triage, "triage", explode)
+    _use_stub(monkeypatch, _Stub())
+    report, _candidates = run(
+        ha_config_dir, store, fake_client, llm_provider="ollama", llm_triage=True,
+    )
+    assert report.status == "partial"
+    assert "triage" in report.ai_errors
+    # "partial" must still mean the rest of the run delivered.
+    assert report.surfaced > 0
     assert store.list_suggestions(status="new")
 
 
@@ -433,3 +457,53 @@ def test_explicit_window_is_clamped_to_available_history():
     start, end, notes = resolve_window(Options(analysis_window_days=90), recorder)
     assert (end - start) / 86400 == pytest.approx(9, abs=0.1)
     assert any("only" in n for n in notes)
+
+
+def test_a_failing_stage_does_not_discard_what_the_miners_produced(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    """Only the miners were isolated; everything after them was all-or-nothing."""
+    import amminer.pipeline as pipeline_module
+
+    def explode(*args, **kwargs):
+        raise MemoryError("simulated OOM inside gap analysis")
+
+    monkeypatch.setattr(pipeline_module.gap_analysis, "suggest", explode)
+    report, _candidates = run(ha_config_dir, store, fake_client)
+
+    assert report.status == "partial"
+    assert report.error is None
+    assert "gap analysis" in report.miner_errors
+    # The candidates that were already mined and backtested are still here.
+    assert report.surfaced > 0
+    assert store.list_suggestions(status="new")
+
+
+def test_a_failing_conflict_check_says_so_rather_than_implying_clean(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    import amminer.pipeline as pipeline_module
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("conflict checking blew up")
+
+    monkeypatch.setattr(pipeline_module.conflict_checks, "annotate_candidates", explode)
+    report, _candidates = run(ha_config_dir, store, fake_client)
+
+    assert report.status == "partial"
+    assert report.surfaced > 0
+    assert any("not been compared" in d for d in report.degradations)
+    assert store.list_suggestions(status="new")
+
+
+def test_an_unfinished_run_is_closed_on_the_next_start(store):
+    """A Supervisor restart mid-analysis left the row saying 'running' forever."""
+    run_id = store.start_run()
+    assert store.last_run()["status"] == "running"
+    assert store.close_interrupted_runs() == 1
+    closed = store.last_run()
+    assert closed["id"] == run_id
+    assert closed["status"] == "interrupted"
+    assert closed["finished_ts"] is not None
+    # Nothing left to close the second time.
+    assert store.close_interrupted_runs() == 0
