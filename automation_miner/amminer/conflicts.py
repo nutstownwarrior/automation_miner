@@ -72,6 +72,8 @@ class DeviceGraph:
         self.entity_to_device: dict[str, str] = {}
         self.entity_to_area: dict[str, str] = {}
         self.device_to_entities: dict[str, list[str]] = defaultdict(list)
+        self.area_to_entities: dict[str, list[str]] = defaultdict(list)
+        self.known = resolver is not None
         if resolver is not None:
             for info in resolver.entities.values():
                 if info.device_id:
@@ -79,6 +81,7 @@ class DeviceGraph:
                     self.device_to_entities[info.device_id].append(info.entity_id)
                 if info.area_id:
                     self.entity_to_area[info.entity_id] = info.area_id
+                    self.area_to_entities[info.area_id].append(info.entity_id)
 
     def device_of(self, entity_id: str) -> str | None:
         return self.entity_to_device.get(entity_id)
@@ -92,6 +95,47 @@ class DeviceGraph:
     def share_device(self, a: str, b: str) -> bool:
         device_a, device_b = self.device_of(a), self.device_of(b)
         return bool(device_a and device_a == device_b)
+
+    def expand(self, area_ids: Sequence[str], device_ids: Sequence[str]) -> tuple[set[str], bool]:
+        """Entities named by area/device targets, and whether any could not be.
+
+        "Turn off the kitchen" and "turn off this device" name real entities;
+        they just do not spell them.  Reading only the ``entity_id`` field makes
+        such an automation look like it touches nothing, so a candidate that
+        fights with it is reported as conflict-free.  When the registry cannot
+        say what a target covers, that is returned too - an unenumerable target
+        must not be silently read as an empty one.
+        """
+        found: set[str] = set()
+        unresolved = False
+        for area_id in area_ids:
+            entities = self.area_to_entities.get(area_id)
+            if entities:
+                found.update(entities)
+            else:
+                unresolved = True
+        for device_id in device_ids:
+            entities = self.device_to_entities.get(device_id)
+            if entities:
+                found.update(entities)
+            else:
+                unresolved = True
+        return found, unresolved
+
+
+def existing_targets(
+    automation: ExistingAutomation, graph: DeviceGraph
+) -> tuple[set[tuple[str, str | None]], bool]:
+    """``(entity, wanted state)`` pairs an automation drives, area targets included."""
+    targets = set(automation.targets())
+    unresolved = False
+    for action in automation.actions:
+        if not action.area_ids and not action.device_ids:
+            continue
+        entities, missing = graph.expand(action.area_ids, action.device_ids)
+        unresolved = unresolved or missing
+        targets.update((entity_id, action.target_state) for entity_id in entities)
+    return targets, unresolved
 
 
 # ----------------------------------------------------------------------
@@ -118,8 +162,18 @@ def _existing_times(automation: ExistingAutomation) -> list[int]:
     return minutes
 
 
-def _triggers_overlap(candidate: Candidate, automation: ExistingAutomation) -> bool:
-    """Could both rules plausibly fire in the same situation?"""
+def _triggers_overlap(
+    candidate: Candidate, automation: ExistingAutomation, strict: bool = True
+) -> bool:
+    """Could both rules plausibly fire in the same situation?
+
+    ``strict`` asks the conservative question - is there positive evidence that
+    these two fire together?  That is the right test for calling something a
+    near-duplicate, where flagging every unrelated pair would be noise.  It is
+    the wrong test for two rules driving one entity to opposite states: "at
+    22:00, off" and "when motion stops, on" never share a trigger and never
+    share a clock time, and they still fight over the same lamp every evening.
+    """
     shared_entities = set(candidate.trigger_entities) & set(automation.trigger_entities)
     if shared_entities:
         return True
@@ -131,30 +185,54 @@ def _triggers_overlap(candidate: Candidate, automation: ExistingAutomation) -> b
             for a in candidate_minutes
             for b in existing_minutes
         )
-    # One rule is time-driven and the other state-driven: they can overlap in
-    # principle, but flagging every such pair is noise, so we do not.
-    return False
+    # One rule is time-driven and the other state-driven.  Nothing rules out
+    # their firing in the same situation; there is simply no evidence either
+    # way.
+    return not strict
 
 
 def check_value_inconsistency(
-    candidate: Candidate, automations: Sequence[ExistingAutomation]
+    candidate: Candidate,
+    automations: Sequence[ExistingAutomation],
+    graph: DeviceGraph | None = None,
 ) -> list[Conflict]:
     out: list[Conflict] = []
+    graph = graph or DeviceGraph()
     candidate_targets = {
         (action.entity_id, action.target_state)
         for action in candidate.actions
         if action.entity_id
     }
+    candidate_entities = {entity_id for entity_id, _ in candidate_targets}
     for automation in automations:
         if not automation.enabled:
             continue
+        targets, unresolved = existing_targets(automation, graph)
+        if unresolved and candidate_entities:
+            out.append(
+                Conflict(
+                    kind="unenumerable_target",
+                    severity="warning",
+                    message=(
+                        f"'{automation.alias}' acts on a whole area or device that this "
+                        "instance's registry could not expand, so it may well touch "
+                        f"{', '.join(sorted(candidate_entities))} too - the conflict check "
+                        "cannot rule it out."
+                    ),
+                    other=automation.alias,
+                    other_entity_id=automation.entity_id,
+                    entities=sorted(candidate_entities),
+                )
+            )
         for entity_id, wanted in candidate_targets:
-            for other_entity, other_state in automation.targets():
+            for other_entity, other_state in targets:
                 if other_entity != entity_id:
                     continue
                 if wanted is None or other_state is None or wanted == other_state:
                     continue
-                if not _triggers_overlap(candidate, automation):
+                # Two rules pulling one entity opposite ways is worth reporting
+                # even without positive evidence that they fire together.
+                if not _triggers_overlap(candidate, automation, strict=False):
                     continue
                 out.append(
                     Conflict(
@@ -173,16 +251,19 @@ def check_value_inconsistency(
 
 
 def check_redundancy(
-    candidate: Candidate, automations: Sequence[ExistingAutomation]
+    candidate: Candidate,
+    automations: Sequence[ExistingAutomation],
+    graph: DeviceGraph | None = None,
 ) -> list[Conflict]:
     out: list[Conflict] = []
+    graph = graph or DeviceGraph()
     candidate_targets = {
         (action.entity_id, action.target_state)
         for action in candidate.actions
         if action.entity_id
     }
     for automation in automations:
-        overlap = candidate_targets & automation.targets()
+        overlap = candidate_targets & existing_targets(automation, graph)[0]
         if not overlap:
             continue
         if not _triggers_overlap(candidate, automation):
@@ -327,9 +408,9 @@ def check_candidate(
     graph = graph or DeviceGraph()
     conflicts = (
         check_self_conflicts(candidate)
-        + check_value_inconsistency(candidate, automations)
+        + check_value_inconsistency(candidate, automations, graph)
         + check_loops(candidate, automations)
-        + check_redundancy(candidate, automations)
+        + check_redundancy(candidate, automations, graph)
         + check_shared_device_races(candidate, automations, graph)
     )
     # De-duplicate identical findings and rank the worst first.

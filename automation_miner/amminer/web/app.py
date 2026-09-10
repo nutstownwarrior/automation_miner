@@ -238,15 +238,18 @@ def create_app(
         return PlainTextResponse(preview.get("yaml", ""), media_type="text/yaml")
 
     @api.post("/suggestions/{suggestion_id}/apply")
-    async def apply_suggestion(suggestion_id: str):
+    async def apply_suggestion(suggestion_id: str, confirm: bool = False):
         if runner is None:
             raise HTTPException(status_code=503, detail="no runner available")
-        result = runner.apply(suggestion_id)
+        result = runner.apply(suggestion_id, confirm_conflicts=confirm)
         if result is None:
             raise HTTPException(status_code=404, detail="unknown suggestion")
         if result.get("ok"):
             store.set_status(suggestion_id, STATUS_ACCEPTED)
             store.add_feedback(suggestion_id, "accepted", result)
+        elif result.get("needs_confirmation"):
+            # Not a failure: the user has not answered yet.
+            store.add_feedback(suggestion_id, "apply_needs_confirmation", result)
         else:
             store.add_feedback(suggestion_id, "apply_failed", result)
         return result

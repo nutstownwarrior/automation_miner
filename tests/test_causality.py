@@ -7,6 +7,16 @@ from amminer.recorderdb.causality import build_index, detect_overrides
 from amminer.recorderdb.models import Cause, RecorderEvent, StateChange
 
 
+def _make_event(event_type, context_id, entity_id=None, user_id=None) -> RecorderEvent:
+    return RecorderEvent(
+        event_type,
+        99.0,
+        {"entity_id": entity_id} if entity_id else {},
+        context_id=context_id,
+        context_user_id=user_id,
+    )
+
+
 def _change(entity_id, state, ts, **kwargs) -> StateChange:
     kwargs.setdefault("old_state", "off" if state == "on" else "on")
     return StateChange(entity_id=entity_id, state=state, ts=ts, **kwargs)
@@ -55,10 +65,52 @@ def test_human_parent_chain_resolves_to_human():
     assert child.cause is Cause.HUMAN
 
 
-def test_no_context_means_device():
+def test_no_context_at_all_is_unknown_not_device():
+    """A guess recorded as a fact is worse than an honest gap."""
     change = _change("sensor.temp", "21.5", 100.0)
     causality.classify([change], build_index([change]))
+    assert change.cause is Cause.UNKNOWN
+
+
+def test_a_context_that_names_nobody_is_a_device():
+    """Something in the house acted, and told us so - it just was not a person."""
+    change = _change("sensor.temp", "21.5", 100.0, context_id="c1")
+    causality.classify([change], build_index([change]))
     assert change.cause is Cause.DEVICE
+
+
+def test_a_script_a_person_started_is_not_a_person_acting():
+    """Home Assistant carries the starting user's id down the whole run."""
+    started = _make_event("script_started", "s1", entity_id="script.good_night", user_id="u1")
+    child = _change("light.a", "off", 101.0, context_id="s1", context_user_id="u1")
+    causality.classify([child], build_index([child], [started]))
+    assert child.cause is Cause.SCRIPT
+    assert child.origin_entity_id == "script.good_night"
+
+
+def test_an_automation_a_person_triggered_is_still_an_automation():
+    fired = _make_event("automation_triggered", "a1", entity_id="automation.evening", user_id="u1")
+    child = _change("light.a", "on", 101.0, context_id="a1", context_user_id="u1")
+    causality.classify([child], build_index([child], [fired]))
+    assert child.cause is Cause.AUTOMATION
+    assert child.origin_entity_id == "automation.evening"
+
+
+def test_a_plain_manual_change_is_still_human():
+    change = _change("light.a", "on", 101.0, context_id="c1", context_user_id="u1")
+    causality.classify([change], build_index([change]))
+    assert change.cause is Cause.HUMAN
+
+
+def test_an_automation_calling_a_script_credits_the_automation():
+    """Both events can carry the same context; event order must not decide."""
+    fired = _make_event("automation_triggered", "x1", entity_id="automation.evening")
+    started = _make_event("script_started", "x1", entity_id="script.lights")
+    for events in ([fired, started], [started, fired]):
+        child = _change("light.a", "on", 101.0, context_id="x1")
+        causality.classify([child], build_index([child], events))
+        assert child.cause is Cause.AUTOMATION
+        assert child.origin_entity_id == "automation.evening"
 
 
 def test_cyclic_parent_chain_terminates():

@@ -60,14 +60,22 @@ class CausalityIndex:
             if event.context_user_id:
                 self.users.setdefault(event.context_id, event.context_user_id)
                 self.has_user_context = True
-            if event.event_type == "automation_triggered":
-                entity_id = event.entity_id or event.data.get("entity_id")
-                self.origins[event.context_id] = ContextOrigin(
-                    Cause.AUTOMATION, entity_id=entity_id
+            if event.event_type in ("automation_triggered", "script_started"):
+                cause = (
+                    Cause.AUTOMATION
+                    if event.event_type == "automation_triggered"
+                    else Cause.SCRIPT
                 )
-            elif event.event_type == "script_started":
                 entity_id = event.entity_id or event.data.get("entity_id")
-                self.origins[event.context_id] = ContextOrigin(Cause.SCRIPT, entity_id=entity_id)
+                existing = self.origins.get(event.context_id)
+                # An automation that calls a script shares its context with the
+                # script it started.  The automation is the root cause; which of
+                # the two events the recorder hands us first is not something to
+                # depend on, so state the precedence rather than assume an order.
+                if existing is None or (
+                    cause is Cause.AUTOMATION and existing.cause is Cause.SCRIPT
+                ):
+                    self.origins[event.context_id] = ContextOrigin(cause, entity_id=entity_id)
 
     def add_state(self, change: StateChange) -> None:
         if not change.context_id:
@@ -87,10 +95,23 @@ class CausalityIndex:
 
     # ------------------------------------------------------------------
     def resolve(self, context_id: str | None, user_id: str | None = None) -> ContextOrigin:
-        """Walk the parent chain to the root cause of *context_id*."""
-        if user_id:
-            return ContextOrigin(Cause.HUMAN, user_id=user_id)
+        """Walk the parent chain to the root cause of *context_id*.
+
+        A user id does *not* win over an automation or script origin on the same
+        context.  Home Assistant reuses one context for a whole automation or
+        script run and carries the starting user's id down it, so a light turned
+        off by a script that someone pressed "run" on arrives carrying that
+        person's user id.  Reading that as "a human turned this light off" makes
+        every step of every hand-started script look like manual behaviour worth
+        automating - behaviour that is, by definition, already automated.  What
+        the *context* says happened comes first; the user id answers a different
+        question, which is who set it going.
+        """
         if not context_id:
+            # No context to reason about.  A user id alone still identifies a
+            # person, and its absence is genuinely unknown, not a device.
+            if user_id:
+                return ContextOrigin(Cause.HUMAN, user_id=user_id)
             return ContextOrigin(Cause.UNKNOWN)
 
         seen: set[str] = set()
@@ -98,15 +119,19 @@ class CausalityIndex:
         depth = 0
         while current and current not in seen and depth <= MAX_CHAIN_DEPTH:
             seen.add(current)
-            direct_user = self.users.get(current)
-            if direct_user:
-                return ContextOrigin(Cause.HUMAN, user_id=direct_user, depth=depth)
             origin = self.origins.get(current)
             if origin is not None:
                 return ContextOrigin(origin.cause, entity_id=origin.entity_id, depth=depth)
+            direct_user = self.users.get(current)
+            if direct_user:
+                return ContextOrigin(Cause.HUMAN, user_id=direct_user, depth=depth)
             current = self.parents.get(current)
             depth += 1
-        return ContextOrigin(Cause.UNKNOWN, depth=depth)
+        if user_id:
+            return ContextOrigin(Cause.HUMAN, user_id=user_id, depth=depth)
+        # A context that named nobody and no automation: something in the house
+        # acted on its own.
+        return ContextOrigin(Cause.DEVICE, depth=depth)
 
 
 def build_index(
@@ -136,7 +161,11 @@ def classify(
             change.cause = Cause.AUTOMATION
             change.origin_entity_id = None
         elif origin.cause is Cause.UNKNOWN:
-            change.cause = Cause.DEVICE
+            # No context at all.  That is not the same as "a device did it" -
+            # it is a row from before Home Assistant recorded contexts, or one
+            # restored after a restart.  Recording the guess as a fact would
+            # put it into device-driven pattern counts as though we knew.
+            change.cause = Cause.UNKNOWN
             change.origin_entity_id = None
         else:
             change.cause = origin.cause

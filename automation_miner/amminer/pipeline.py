@@ -198,6 +198,15 @@ def run_analysis(
                 "No context_user_id found in this history window: human and automated changes "
                 "cannot be told apart reliably, so all mining runs at reduced confidence."
             )
+        unknown = report.causality.get("unknown", 0)
+        if unknown and len(changes):
+            share = unknown / len(changes)
+            if share >= 0.1:
+                report.degradations.append(
+                    f"{share:.0%} of state rows carry no context at all, so who caused them "
+                    "is genuinely unknown. Those rows take no part in mining rather than "
+                    "being counted as device activity."
+                )
         overrides = causality.detect_overrides(changes, options.override_window_seconds)
         report.overrides = len(overrides)
         store.record_overrides(overrides)

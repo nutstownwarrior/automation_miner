@@ -59,17 +59,31 @@
         notify("Shadow-testing: it will be logged when it would fire, but will not act.");
       });
     },
-    apply: function (id) {
-      if (!window.confirm("Write this automation to Home Assistant and reload automations?")) {
+    apply: function (id, confirmed) {
+      if (!confirmed &&
+          !window.confirm("Write this automation to Home Assistant and reload automations?")) {
         return null;
       }
-      return post("/api/suggestions/" + id + "/apply").then(function (result) {
+      var url = "/api/suggestions/" + id + "/apply" + (confirmed ? "?confirm=true" : "");
+      return post(url).then(function (result) {
         if (result.ok) {
           notify("Applied as " + (result.automation_id || "a new automation") +
                  (result.reloaded ? " and reloaded." : ". Reload automations manually."));
-        } else {
-          notify((result.errors || ["Apply failed"]).join(" "), true);
+          return;
         }
+        if (result.needs_confirmation) {
+          // Not a failure: this rule fights an automation they already have,
+          // and they have not been asked about that specifically yet.
+          var lines = (result.conflicts || []).map(function (c) { return "\u2022 " + c.message; });
+          if (window.confirm(
+                "This rule conflicts with an automation you already have:\n\n" +
+                lines.join("\n") + "\n\nApply it anyway?")) {
+            return handlers.apply(id, true);
+          }
+          notify("Not applied.");
+          return;
+        }
+        notify((result.errors || ["Apply failed"]).join(" "), true);
       });
     },
     "dismiss-gap": function (id) {

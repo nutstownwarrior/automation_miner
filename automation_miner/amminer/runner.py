@@ -164,7 +164,9 @@ class Runner:
         data["digest"] = generation_digest(result.config) if result.config else None
         return data
 
-    def apply(self, suggestion_id: str) -> dict[str, Any] | None:
+    def apply(
+        self, suggestion_id: str, confirm_conflicts: bool = False
+    ) -> dict[str, Any] | None:
         """Generate, fully validate (including check_config) and write."""
         stored = self.store.get_suggestion(suggestion_id)
         if stored is None:
@@ -173,6 +175,26 @@ class Runner:
         if not payload.get("actions"):
             return {"ok": False, "errors": ["This finding has no automation to apply."]}
         candidate = candidate_from_payload(payload)
+
+        # A conflict of error severity means this rule and an existing one pull
+        # the same entity opposite ways.  The conflict check was being run,
+        # counted in the report, and then not consulted by the one operation it
+        # exists to inform.  The user still decides - they just have to say so.
+        blocking = [
+            conflict
+            for conflict in (payload.get("conflicts") or [])
+            if conflict.get("severity") == "error"
+        ]
+        if blocking and not confirm_conflicts:
+            return {
+                "ok": False,
+                "needs_confirmation": True,
+                "conflicts": blocking,
+                "errors": [
+                    "This rule conflicts with an automation you already have: "
+                    + "; ".join(str(c.get("message", "")) for c in blocking[:3])
+                ],
+            }
 
         # Apply what was reviewed. Regenerating here would ask a
         # non-deterministic model the same question a second time and write the

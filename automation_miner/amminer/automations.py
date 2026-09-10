@@ -136,9 +136,21 @@ def _normalise_action(step: Any) -> list[NormalisedAction]:
     if isinstance(service, str):
         entity_ids = _entity_ids(step.get("entity_id"))
         entity_ids.extend(_entity_ids(step.get("target")))
+        # Home Assistant's original spelling put the target inside data:, and
+        # plenty of long-lived configurations still do.  Missing it means the
+        # conflict checks see an automation that touches nothing.
+        if isinstance(step.get("data"), dict):
+            entity_ids.extend(_entity_ids(step["data"].get("entity_id")))
         target = step.get("target") if isinstance(step.get("target"), dict) else {}
         area_ids = [a for a in _as_list(target.get("area_id")) if isinstance(a, str)]
         device_ids = [d for d in _as_list(target.get("device_id")) if isinstance(d, str)]
+        if isinstance(step.get("data"), dict):
+            area_ids.extend(
+                a for a in _as_list(step["data"].get("area_id")) if isinstance(a, str)
+            )
+            device_ids.extend(
+                d for d in _as_list(step["data"].get("device_id")) if isinstance(d, str)
+            )
         data = step.get("data") if isinstance(step.get("data"), dict) else {}
         state = SERVICE_STATE.get(service.split(".", 1)[-1])
         if state is None and "hvac_mode" in data:

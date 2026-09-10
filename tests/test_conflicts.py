@@ -289,3 +289,79 @@ def test_audit_is_clean_for_unrelated_rules():
                    [{"service": "switch.turn_off", "entity_id": "switch.b"}]),
     ]
     assert audit_existing(existing) == []
+
+
+# --- blind spots --------------------------------------------------------
+def _candidate_on(entity_id: str = "light.hallway") -> Candidate:
+    return Candidate(
+        miner="test",
+        title="turn it on",
+        triggers=[Trigger(kind="state", entity_id="binary_sensor.motion", to_state="off")],
+        actions=[Action(service="light.turn_on", entity_id=entity_id)],
+    )
+
+
+class _Info:
+    def __init__(self, entity_id, area_id=None, device_id=None):
+        self.entity_id, self.area_id, self.device_id = entity_id, area_id, device_id
+
+
+class _Resolver:
+    def __init__(self, *infos):
+        self.entities = {info.entity_id: info for info in infos}
+
+
+def test_a_legacy_target_inside_data_is_not_invisible():
+    """service + data: {entity_id: ...} is still valid, still very common."""
+    existing = normalise_automation({
+        "alias": "Legacy off",
+        "trigger": [{"platform": "state", "entity_id": "binary_sensor.motion", "to": "off"}],
+        "action": [{"service": "light.turn_off", "data": {"entity_id": "light.hallway"}}],
+    })
+    assert existing.targets() == {("light.hallway", "off")}
+    conflicts = check_candidate(_candidate_on(), [existing], DeviceGraph())
+    assert [c.kind for c in conflicts] == ["value_inconsistency"]
+
+
+def test_an_area_target_is_expanded_through_the_registry():
+    existing = normalise_automation({
+        "alias": "Area off",
+        "trigger": [{"platform": "state", "entity_id": "binary_sensor.motion", "to": "off"}],
+        "action": [{"service": "light.turn_off", "target": {"area_id": "hallway"}}],
+    })
+    graph = DeviceGraph(_Resolver(_Info("light.hallway", area_id="hallway")))
+    conflicts = check_candidate(_candidate_on(), [existing], graph)
+    assert any(c.kind == "value_inconsistency" for c in conflicts)
+
+
+def test_an_unexpandable_target_is_reported_rather_than_ignored():
+    """Not knowing what an automation touches is not the same as it touching nothing."""
+    existing = normalise_automation({
+        "alias": "Area off",
+        "trigger": [{"platform": "state", "entity_id": "binary_sensor.motion", "to": "off"}],
+        "action": [{"service": "light.turn_off", "target": {"area_id": "hallway"}}],
+    })
+    conflicts = check_candidate(_candidate_on(), [existing], DeviceGraph())
+    assert [c.kind for c in conflicts] == ["unenumerable_target"]
+
+
+def test_a_clock_rule_and_a_state_rule_can_still_fight_over_one_lamp():
+    """Never sharing a trigger is not the same as never colliding."""
+    existing = normalise_automation({
+        "alias": "Night off",
+        "trigger": [{"platform": "time", "at": "22:00:00"}],
+        "action": [{"service": "light.turn_off", "target": {"entity_id": "light.hallway"}}],
+    })
+    conflicts = check_candidate(_candidate_on(), [existing], DeviceGraph())
+    assert [c.kind for c in conflicts] == ["value_inconsistency"]
+
+
+def test_redundancy_still_needs_positive_evidence_of_overlap():
+    """The looser test is for value conflicts only; near-duplicate stays strict."""
+    existing = normalise_automation({
+        "alias": "Night on",
+        "trigger": [{"platform": "time", "at": "22:00:00"}],
+        "action": [{"service": "light.turn_on", "target": {"entity_id": "light.hallway"}}],
+    })
+    conflicts = check_candidate(_candidate_on(), [existing], DeviceGraph())
+    assert [c.kind for c in conflicts] == []

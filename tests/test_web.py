@@ -250,3 +250,33 @@ def test_candidate_round_trips_through_the_store(wired):
     # The identity must survive serialisation, or dismissals would not stick.
     assert rebuilt.id == payload["id"]
     assert rebuilt.actions and rebuilt.triggers
+
+
+def test_apply_refuses_a_conflicting_rule_until_it_is_confirmed(wired):
+    """The conflict check was run, counted, and then not consulted by apply."""
+    client, store, _runner, ha = wired
+    actionable = [s for s in store.list_suggestions(status="new") if s["payload"].get("actions")]
+    suggestion_id = actionable[0]["id"]
+    stored = store.get_suggestion(suggestion_id)
+    payload = dict(stored["payload"])
+    payload["conflicts"] = [
+        {
+            "kind": "value_inconsistency",
+            "severity": "error",
+            "message": "'Bedtime dim' drives light.kitchen to 'off' at the same time.",
+        }
+    ]
+    store.upsert_suggestion(
+        suggestion_id, stored["miner"], stored["title"], stored.get("summary") or "",
+        stored.get("score") or 0.0, payload, stored.get("run_id"),
+    )
+
+    result = client.post(f"/api/suggestions/{suggestion_id}/apply").json()
+    assert result["ok"] is False
+    assert result["needs_confirmation"] is True
+    assert not ha.written
+    assert store.get_suggestion(suggestion_id)["status"] != "accepted"
+
+    confirmed = client.post(f"/api/suggestions/{suggestion_id}/apply?confirm=true").json()
+    assert confirmed["ok"] is True, confirmed
+    assert ha.written
