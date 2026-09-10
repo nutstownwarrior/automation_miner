@@ -9,7 +9,7 @@ from amminer.backtest import backtest, backtest_all, ground_truth_actions, simul
 from amminer.config import Options
 from amminer.enrich.signals import SignalSeries, SignalStore
 from amminer.miners.base import Action, Candidate, Condition, Trigger
-from amminer.recorderdb.models import Cause, StateChange
+from amminer.recorderdb.models import Cause, OverrideEvent, StateChange
 from amminer.util.timeutil import local_tz
 
 TZ = local_tz()
@@ -303,3 +303,150 @@ def test_nuisance_fires_counted_against_overrides():
     )
     assert result.false_fires > 0
     assert result.nuisance_fires > 0
+
+
+# --- the evidence floor -------------------------------------------------
+def test_a_single_correct_fire_is_not_evidence():
+    """100% precision, zero nuisance, one observation."""
+    once = (START + dt.timedelta(days=3, hours=6, minutes=30)).timestamp()
+    candidate = Candidate(
+        miner="test",
+        title="one-off",
+        triggers=[Trigger(kind="state", entity_id="binary_sensor.door", to_state="on")],
+        actions=[Action(service="light.turn_on", entity_id="light.kitchen")],
+    )
+    store = SignalStore()
+    series = SignalSeries("binary_sensor.door")
+    series.add(once - 30, "on")
+    store.add(series)
+
+    result = backtest(candidate, [human("light.kitchen", "on", once)], store, Options(), WINDOW)
+
+    assert result.true_fires == 1
+    assert result.false_fires == 0
+    assert result.precision == 1.0
+    assert result.false_fires_per_week == 0.0
+    # Every ratio is perfect and there is still nothing here.
+    assert result.passed is False
+    assert "too little to judge" in result.reason
+
+
+def test_the_floor_is_cleared_by_a_habit_that_repeats():
+    candidate = Candidate(
+        miner="test",
+        title="repeats",
+        triggers=[Trigger(kind="state", entity_id="binary_sensor.door", to_state="on")],
+        actions=[Action(service="light.turn_on", entity_id="light.kitchen")],
+    )
+    store = SignalStore()
+    series = SignalSeries("binary_sensor.door")
+    changes = []
+    for day in range(10):
+        ts = (START + dt.timedelta(days=day, hours=18)).timestamp()
+        series.add(ts - 30, "on")
+        series.add(ts - 20, "off")
+        changes.append(human("light.kitchen", "on", ts))
+    store.add(series)
+
+    result = backtest(candidate, changes, store, Options(), WINDOW)
+
+    assert result.true_fires == 10
+    assert result.passed is True, result.reason
+    assert "right 10 times" in result.reason
+
+
+def test_a_precise_rule_that_covers_almost_nothing_is_rejected():
+    """Firing correctly 3 times out of 20 is precise and useless."""
+    candidate = Candidate(
+        miner="test",
+        title="rare",
+        triggers=[Trigger(kind="state", entity_id="binary_sensor.door", to_state="on")],
+        actions=[Action(service="light.turn_on", entity_id="light.kitchen")],
+    )
+    store = SignalStore()
+    series = SignalSeries("binary_sensor.door")
+    changes = []
+    for day in range(20):
+        ts = (START + dt.timedelta(days=day % 20, hours=18)).timestamp()
+        changes.append(human("light.kitchen", "on", ts))
+        if day < 3:  # the door only explains the first three
+            series.add(ts - 30, "on")
+            series.add(ts - 20, "off")
+    store.add(series)
+
+    result = backtest(candidate, changes, store, Options(), WINDOW)
+
+    assert result.precision == 1.0
+    assert result.recall == pytest.approx(0.15)
+    assert result.passed is False
+    assert "would only have covered" in result.reason
+
+
+def test_false_fires_next_to_an_override_are_disqualifying():
+    """Where the user has already reached over and undone an automation."""
+    candidate = Candidate(
+        miner="test",
+        title="unwanted",
+        triggers=[Trigger(kind="state", entity_id="binary_sensor.door", to_state="on")],
+        actions=[Action(service="light.turn_on", entity_id="light.kitchen")],
+    )
+    store = SignalStore()
+    series = SignalSeries("binary_sensor.door")
+    changes, overrides = [], []
+    for day in range(10):
+        ts = (START + dt.timedelta(days=day, hours=18)).timestamp()
+        series.add(ts - 30, "on")
+        series.add(ts - 20, "off")
+        changes.append(human("light.kitchen", "on", ts))
+    # One extra opening the user did not follow with the light, and did
+    # actively undo.
+    stray = (START + dt.timedelta(days=11, hours=3)).timestamp()
+    series.add(stray, "on")
+    series.add(stray + 10, "off")
+    store.add(series)
+    overrides.append(
+        OverrideEvent(
+            entity_id="light.kitchen",
+            ts=stray + 60,
+            automation_entity_id="automation.x",
+            automation_state="on",
+            human_state="off",
+            delay_seconds=60.0,
+        )
+    )
+
+    options = Options()
+    baseline = backtest(candidate, changes, store, options, WINDOW)
+    assert baseline.nuisance_fires == 0
+    assert baseline.passed is True, baseline.reason
+
+    result = backtest(candidate, changes, store, options, WINDOW, overrides=overrides)
+    assert result.nuisance_fires == 1
+    assert result.passed is False
+    assert "previously overridden" in result.reason
+
+
+def test_a_state_trigger_is_not_judged_by_the_clock_tolerance():
+    """A mixed-trigger rule must not borrow the loosest tolerance it has."""
+    door_ts = (START + dt.timedelta(days=1, hours=18)).timestamp()
+    candidate = Candidate(
+        miner="test",
+        title="mixed",
+        triggers=[
+            Trigger(kind="time", at="06:30:00"),
+            Trigger(kind="state", entity_id="binary_sensor.door", to_state="on"),
+        ],
+        actions=[Action(service="light.turn_on", entity_id="light.kitchen")],
+    )
+    store = SignalStore()
+    series = SignalSeries("binary_sensor.door")
+    series.add(door_ts, "on")
+    store.add(series)
+
+    # 10 minutes after the door: inside the 15-minute clock tolerance, well
+    # outside the 5-minute one a state trigger is held to.
+    result = backtest(
+        candidate, [human("light.kitchen", "on", door_ts + 600)], store, Options(), WINDOW
+    )
+    assert door_ts in result.false_fire_samples
+    assert result.true_fires == 0

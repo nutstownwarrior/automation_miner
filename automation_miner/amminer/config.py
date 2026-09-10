@@ -106,6 +106,16 @@ class Options:
     backtest_min_precision: float = 0.7
     backtest_max_false_fires_per_week: float = 3.0
     backtest_match_tolerance_seconds: int = 900
+    #: How often the rule has to have been *right* before a ratio means
+    #: anything.  One correct fire and no wrong ones is 100% precision and no
+    #: evidence at all.
+    backtest_min_true_fires: int = 4
+    #: How much of the real behaviour the rule has to account for.  A rule that
+    #: catches 3 of a user's 60 evening routines is precise and useless.
+    backtest_min_recall: float = 0.25
+    #: False fires next to a historical override are not merely unnecessary,
+    #: they land exactly where the user has already said no.
+    backtest_max_nuisance_fires: int = 0
 
     # --- staleness ---
     stale_automation_days: int = 30
@@ -161,6 +171,14 @@ class Options:
         self.min_confidence = min(max(float(self.min_confidence), 0.0), 1.0)
         self.min_support = min(max(float(self.min_support), 0.0), 1.0)
         self.backtest_min_precision = min(max(float(self.backtest_min_precision), 0.0), 1.0)
+        self.backtest_min_recall = min(max(float(self.backtest_min_recall), 0.0), 1.0)
+        self.backtest_min_true_fires = max(int(self.backtest_min_true_fires), 1)
+        self.backtest_max_nuisance_fires = max(int(self.backtest_max_nuisance_fires), 0)
+        self.backtest_match_tolerance_seconds = max(int(self.backtest_match_tolerance_seconds), 1)
+        self.sequence_min_occurrences = max(int(self.sequence_min_occurrences), 2)
+        self.association_window_seconds = max(int(self.association_window_seconds), 1)
+        self.stale_automation_days = max(int(self.stale_automation_days), 1)
+        self.llm_timeout_seconds = max(int(self.llm_timeout_seconds), 1)
         self.min_occurrences = max(int(self.min_occurrences), 2)
         self.llm_triage_penalty = min(max(float(self.llm_triage_penalty), 0.0), 1.0)
         self.llm_classification_batch = max(int(self.llm_classification_batch), 5)

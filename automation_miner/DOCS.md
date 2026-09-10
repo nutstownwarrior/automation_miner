@@ -93,12 +93,28 @@ Association-rule thresholds. Defaults `0.02`, `0.6`, `1.5`.
 How soon after an automation acts a human correction counts as an *override*.
 Default `120`.
 
+### `backtest_min_true_fires`
+How many times a rule must have been *right* during the analysis window before
+its percentages are allowed to speak for it. A rule that fired once, correctly,
+scores 100% precision with no unwanted fires and rests on a single observation.
+Default `4`.
+
 ### `backtest_min_precision`
 Minimum backtest precision for a rule to be surfaced. Default `0.7`.
+
+### `backtest_min_recall`
+How much of the real behaviour the rule has to account for. A rule that fires
+correctly three times out of the twenty you actually did something is precise
+and useless. Default `0.25`.
 
 ### `backtest_max_false_fires_per_week`
 Nuisance budget. A rule that would have fired more often than this when you did
 not want it is rejected regardless of its precision. Default `3`.
+
+### `backtest_max_nuisance_fires`
+Unwanted fires allowed at moments where you have previously reached over and
+undone an automation on the same entity. These are not merely unnecessary - they
+land exactly where you have already said no - so the default is `0`.
 
 ### `excluded_domains`, `excluded_entities`, `excluded_users`
 Added to sensible built-in exclusions (`sensor.time`, `update.*`, …). Entities

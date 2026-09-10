@@ -34,8 +34,26 @@ suggestions that would misfire the same way.
 **It backtests before it suggests.** Every candidate is replayed against your
 real history: how often would it have fired correctly, how often would it have
 fired when you did *not* want it, how many of your actions would it have missed.
-Anything below the precision threshold, or above the nuisance budget
-(unwanted fires per week), never reaches you. The numbers are shown on the card.
+A rule has to clear all five of these to reach you, and the numbers are shown on
+the card:
+
+- **enough evidence** — it must have been right at least `backtest_min_true_fires`
+  times. This one comes first because it is the one a percentage hides: a rule
+  that fired once, correctly, has 100% precision and zero unwanted fires per
+  week, and has shown nothing at all.
+- **precision** — of the times it would have fired, how many you wanted.
+- **recall** — how much of the real behaviour it accounts for. Firing correctly
+  three times out of the twenty you actually did something is precise and
+  useless.
+- **nuisance budget** — unwanted fires per week.
+- **no fires where you have already said no** — an unwanted fire that lands next
+  to a moment when you reached over and undid an automation is not merely
+  unnecessary, and is disqualifying on its own.
+
+Rules that trigger on an event rather than a clock time are matched more
+strictly, per trigger: "some time in the next quarter hour" is a fair reading of
+a daily habit and a dishonest one for a rule claiming the door opening caused
+the light.
 
 **It checks for conflicts.** Before surfacing a rule it looks for value
 inconsistencies, dependency loops, redundancy with an existing automation, and
@@ -250,7 +268,10 @@ without touching any of it.
 | `min_support` / `min_confidence` / `min_lift` | `0.02` / `0.6` / `1.5` | association-rule thresholds |
 | `override_window_seconds` | `120` | how soon a correction counts as an override |
 | `backtest_min_precision` | `0.7` | minimum backtest precision to surface a rule |
+| `backtest_min_recall` | `0.25` | how much of the real behaviour a rule must account for |
+| `backtest_min_true_fires` | `4` | times a rule must have been right before its percentages count |
 | `backtest_max_false_fires_per_week` | `3` | nuisance budget |
+| `backtest_max_nuisance_fires` | `0` | unwanted fires allowed where you previously overrode an automation |
 | `excluded_domains` / `excluded_entities` / `excluded_users` | `[]` | added to sensible built-in exclusions; entities accept globs |
 | `llm_provider` | `none` | `none`, `ollama`, or a cloud provider (opt-in) |
 | `schedule` | `0 3 * * *` | cron for the nightly analysis |

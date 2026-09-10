@@ -16,8 +16,16 @@ We compute, over the analysis window:
     the usual ratios, plus ``false_fires_per_week`` which is what a person
     actually feels.
 
-A candidate is only surfaced when it clears ``backtest_min_precision`` and
-``backtest_max_false_fires_per_week``.
+A candidate is only surfaced when it clears every one of
+``backtest_min_true_fires``, ``backtest_min_precision``, ``backtest_min_recall``,
+``backtest_max_false_fires_per_week`` and ``backtest_max_nuisance_fires``.
+
+The evidence floor comes first and is the one that is easy to leave out.  A rule
+that fired once, correctly, has 100% precision and zero false fires per week: it
+clears every ratio in this module while resting on a single observation.  Ratios
+only mean something once there is enough underneath them to divide, so a
+candidate must have been right ``backtest_min_true_fires`` times before its
+percentages are allowed to speak for it.
 """
 
 from __future__ import annotations
@@ -40,6 +48,28 @@ WEEKDAY_INDEX = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "su
 
 #: A state trigger must line up much more tightly than a daily time trigger.
 STATE_TRIGGER_TOLERANCE = 300.0
+
+#: Trigger kinds that are events rather than clock times, and so are held to
+#: :data:`STATE_TRIGGER_TOLERANCE` regardless of what else the rule triggers on.
+EVENT_TRIGGER_KINDS = ("state", "numeric_state")
+
+
+@dataclass(frozen=True)
+class Fire:
+    """One moment the rule would have fired, and what set it off.
+
+    The trigger kind travels with the fire because the two kinds are matched
+    against reality at different tolerances: "some time in the next quarter
+    hour" is a reasonable reading of a daily habit, and a dishonest one for a
+    rule that claims the door opening caused the light.
+    """
+
+    ts: float
+    trigger_kind: str
+
+    @property
+    def tolerance_is_tight(self) -> bool:
+        return self.trigger_kind in EVENT_TRIGGER_KINDS
 
 
 @dataclass
@@ -210,35 +240,47 @@ def _numeric_trigger_fires(trigger: Trigger, store: SignalStore) -> list[float]:
 
 def simulate_fires(
     candidate: Candidate, store: SignalStore, window: tuple[float, float], tz=None
-) -> tuple[list[float], str | None]:
-    """Every moment the candidate would have fired.  Returns ``(times, error)``."""
+) -> tuple[list[Fire], str | None]:
+    """Every moment the candidate would have fired.  Returns ``(fires, error)``."""
     tz = tz or local_tz()
-    fires: list[float] = []
+    fires: list[Fire] = []
     for trigger in candidate.triggers:
         if trigger.kind == "time":
-            fires.extend(_time_trigger_fires(trigger, window, tz))
+            times = _time_trigger_fires(trigger, window, tz)
         elif trigger.kind == "state":
-            fires.extend(_state_trigger_fires(trigger, store))
+            times = _state_trigger_fires(trigger, store)
         elif trigger.kind == "numeric_state":
-            fires.extend(_numeric_trigger_fires(trigger, store))
+            times = _numeric_trigger_fires(trigger, store)
         else:
             return [], f"trigger kind '{trigger.kind}' cannot be simulated"
+        fires.extend(Fire(ts, trigger.kind) for ts in times)
     if not fires:
         return [], None
 
-    fires = sorted(set(fires))
+    # Two triggers landing on the same instant is one fire, held to the tighter
+    # of the two tolerances - a rule does not get the benefit of its loosest
+    # trigger just for having one.
+    by_ts: dict[float, Fire] = {}
+    for fire in fires:
+        existing = by_ts.get(fire.ts)
+        if existing is None or (fire.tolerance_is_tight and not existing.tolerance_is_tight):
+            by_ts[fire.ts] = fire
+
     kept = [
-        ts
-        for ts in fires
+        by_ts[ts]
+        for ts in sorted(by_ts)
         if window[0] <= ts <= window[1]
         and all(_condition_holds(c, ts, store, tz) for c in candidate.conditions)
     ]
     # Collapse bursts: a rule that fires five times in a minute is one event to
     # a human, and Home Assistant's own trigger would also be re-entrant-guarded.
-    collapsed: list[float] = []
-    for ts in kept:
-        if not collapsed or ts - collapsed[-1] > 60.0:
-            collapsed.append(ts)
+    collapsed: list[Fire] = []
+    for fire in kept:
+        if not collapsed or fire.ts - collapsed[-1].ts > 60.0:
+            collapsed.append(fire)
+        elif fire.tolerance_is_tight and not collapsed[-1].tolerance_is_tight:
+            # Same burst, but this one must be matched more strictly.
+            collapsed[-1] = Fire(collapsed[-1].ts, fire.trigger_kind)
     return collapsed, None
 
 
@@ -301,26 +343,27 @@ def backtest(
         result.passed = False
         return result
 
-    tolerance = (
-        options.backtest_match_tolerance_seconds
-        if any(t.kind == "time" for t in candidate.triggers)
-        else STATE_TRIGGER_TOLERANCE
-    )
-
     unmatched_truth = list(truth)
-    for fire_ts in fires:
+    for fire in fires:
+        # Per fire, not per candidate: a rule that triggers on both a clock time
+        # and a door opening must not judge the door by the clock's tolerance.
+        tolerance = (
+            STATE_TRIGGER_TOLERANCE
+            if fire.tolerance_is_tight
+            else float(options.backtest_match_tolerance_seconds)
+        )
         best_index: int | None = None
         best_delta = tolerance + 1
         for index, action_ts in enumerate(unmatched_truth):
-            delta = abs(action_ts - fire_ts)
+            delta = abs(action_ts - fire.ts)
             if delta <= tolerance and delta < best_delta:
                 best_index, best_delta = index, delta
         if best_index is None:
             result.false_fires += 1
-            result.false_fire_samples.append(fire_ts)
+            result.false_fire_samples.append(fire.ts)
         else:
             result.true_fires += 1
-            result.fire_samples.append(fire_ts)
+            result.fire_samples.append(fire.ts)
             unmatched_truth.pop(best_index)
 
     result.missed = len(unmatched_truth)
@@ -336,20 +379,54 @@ def backtest(
     )
 
     precision = result.precision
+    recall = result.recall
     reasons: list[str] = []
+
+    # The floor comes before the ratios.  One correct fire and no wrong ones is
+    # 100% precision, 0 nuisance fires per week, and one observation - it clears
+    # every threshold below without having shown anything.
     if precision is None:
         reasons.append("the rule never fired in the analysed window")
-    elif precision < options.backtest_min_precision:
-        reasons.append(
-            f"precision {precision:.0%} is below the {options.backtest_min_precision:.0%} threshold"
-        )
+    else:
+        if result.true_fires < options.backtest_min_true_fires:
+            reasons.append(
+                f"the rule was only right {result.true_fires} "
+                f"time{'' if result.true_fires == 1 else 's'} in "
+                f"{result.window_days:.0f} days, which is too little to judge it on "
+                f"(at least {options.backtest_min_true_fires} needed)"
+            )
+        if precision < options.backtest_min_precision:
+            reasons.append(
+                f"precision {precision:.0%} is below the "
+                f"{options.backtest_min_precision:.0%} threshold"
+            )
+        if recall is not None and recall < options.backtest_min_recall:
+            reasons.append(
+                f"the rule would only have covered {recall:.0%} of the "
+                f"{result.true_fires + result.missed} times you actually did this, "
+                f"below the {options.backtest_min_recall:.0%} threshold"
+            )
+
     if result.false_fires_per_week > options.backtest_max_false_fires_per_week:
         reasons.append(
             f"{result.false_fires_per_week:.1f} unwanted fires per week exceeds the "
             f"limit of {options.backtest_max_false_fires_per_week:g}"
         )
+    # Computing this and then not acting on it was the worst of both: a rule
+    # that fires exactly where the user has already reached over and undone an
+    # automation is the one most likely to be resented.
+    if result.nuisance_fires > options.backtest_max_nuisance_fires:
+        reasons.append(
+            f"{result.nuisance_fires} of its unwanted fires land where you have "
+            "previously overridden an automation"
+        )
+
     result.passed = not reasons
-    result.reason = "; ".join(reasons) if reasons else "meets precision and nuisance thresholds"
+    result.reason = (
+        "; ".join(reasons)
+        if reasons
+        else f"right {result.true_fires} times, meets every threshold"
+    )
     return result
 
 

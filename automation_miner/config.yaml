@@ -34,7 +34,10 @@ options:
   min_lift: 1.5
   override_window_seconds: 120
   backtest_min_precision: 0.7
+  backtest_min_recall: 0.25
+  backtest_min_true_fires: 4
   backtest_max_false_fires_per_week: 3
+  backtest_max_nuisance_fires: 0
   excluded_domains: []
   excluded_entities: []
   excluded_users: []
@@ -58,7 +61,10 @@ schema:
   min_lift: float(0.0,1000.0)?
   override_window_seconds: int(1,3600)?
   backtest_min_precision: float(0.0,1.0)?
+  backtest_min_recall: float(0.0,1.0)?
+  backtest_min_true_fires: int(1,1000)?
   backtest_max_false_fires_per_week: float(0.0,1000.0)?
+  backtest_max_nuisance_fires: int(0,1000)?
   excluded_domains:
     - str?
   excluded_entities:
