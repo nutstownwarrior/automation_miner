@@ -195,7 +195,7 @@ many invented entity ids were discarded.
 
 ### The validation gate
 
-Nothing reaches your configuration without passing all four checks:
+Nothing reaches your configuration without passing all five checks:
 
 1. **Equivalence** — the model's automation is reduced to a canonical form of
    its triggers, conditions, actions and mode, and compared against the same
@@ -205,12 +205,22 @@ Nothing reaches your configuration without passing all four checks:
    entirely different automation built from real entities and real services
    passes both. This one is what makes "the rule you read the evidence for" and
    "the rule that gets written" the same rule.
-2. **Existence** — every `entity_id`, `device_id`, `area_id` and service must
+2. **Knowable targets** — a Jinja template names nothing, so an existence check
+   on `service: "{{ svc }}"` passes vacuously; `entity_id: all` names everything.
+   Both defer the decision to runtime, where no gate can see it, and neither is
+   something this add-on ever generates, so both are refused outright.
+3. **Existence** — every `entity_id`, `device_id`, `area_id` and service must
    exist in the registry-union-states set. This is what catches hallucination;
    Home Assistant's own config check does not.
-3. **Schema** — the YAML must parse and match Home Assistant's automation schema
+4. **Schema** — the YAML must parse and match Home Assistant's automation schema
    (mirrored in voluptuous).
-4. **`POST /api/config/core/check_config`** must pass.
+5. **`POST /api/config/core/check_config`** must pass.
+
+Every one of them fails closed. If Home Assistant is unreachable and the live
+service list is unavailable, the service check does not quietly become a no-op:
+it falls back to the closed set of services the miners are capable of emitting,
+which is narrower than your real instance. An unreachable Core can cost you a
+legitimate suggestion; it cannot turn "unverified" into "fine".
 
 If the LLM's output fails the gate, it is rejected, the reason is shown
 (including which entity ids it invented, or which field it rewrote), and you are

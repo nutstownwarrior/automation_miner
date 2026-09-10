@@ -60,7 +60,15 @@
     {% if preview.validation %}
     <ul class="validation">
       <li class="{{ 'ok' if preview.validation.schema_ok else 'fail' }}">Schema valid</li>
-      <li class="{{ 'ok' if preview.validation.references_ok else 'fail' }}">All entities and services exist</li>
+      <li class="{{ 'ok' if preview.validation.references_ok else 'fail' }}">
+        All entities and services exist
+        {%- if preview.validation.references_ok and not preview.validation.services_verified %}
+        <span class="muted">(service names checked against this add-on's own list; Home Assistant was not reachable)</span>
+        {%- endif %}
+      </li>
+      <li class="{{ 'ok' if preview.validation.targets_static else 'fail' }}">
+        Everything it touches is named outright
+      </li>
       {% if preview.llm_validation and preview.llm_validation.semantics_ok is not none %}
       <li class="{{ 'ok' if preview.llm_validation.semantics_ok else 'fail' }}">
         The model kept the mined rule intact
