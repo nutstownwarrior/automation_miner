@@ -118,6 +118,33 @@ def test_any_other_source_is_refused(ha_config_dir, store, fake_client):
         assert status == 403, f"{host} must not reach the ingress port"
 
 
+def test_a_partially_failed_ai_step_is_not_shown_as_a_success(wired):
+    """A feature can return results AND an error, so `ran` alone is not success."""
+    client, _store, runner, _ha = wired
+    runner.last_report.ai = {
+        "entity_classification": {
+            "requested": True, "ran": True, "added_count": 2,
+            "error": "connection reset after the first batch",
+        },
+        "triage": {"requested": True, "ran": True, "reviewed": 4, "error": None},
+    }
+    import re
+
+    body = client.get("/status").text
+    assert "connection reset after the first batch" in body
+    section = body[body.index("AI assistance"):]
+    items = {}
+    for item in re.findall(r"<li>.*?</li>", section, re.S):
+        flat = " ".join(item.split())
+        match = re.search(r'<span class="tag (\w+)">([^<]+)</span>', flat)
+        if match:
+            items[match.group(2).strip()] = match.group(1)
+
+    # The step that errored must not wear a success tag; the clean one may.
+    assert items["entity classification"] == "warning"
+    assert items["triage"] == "ok"
+
+
 def test_health_endpoint(wired):
     client, _store, _runner, _ha = wired
     payload = client.get("/api/health").json()

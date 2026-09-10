@@ -99,10 +99,18 @@ class ClassificationResult:
         return sum(len(v) for v in self.added.values())
 
     def as_dict(self) -> dict[str, Any]:
+        """A bounded summary, safe to persist in every run record.
+
+        The full ``assignments`` and ``added`` maps are deliberately NOT here:
+        this dict ends up in the ``runs.stats`` column on every nightly run, and
+        on a large instance those maps would grow that table for no benefit -
+        the authoritative copy already lives in the classification cache, and
+        the UI only needs the counts and a sample.
+        """
         return {
-            "assignments": self.assignments,
-            "added": self.added,
             "added_count": self.added_count,
+            "added_sample": dict(sorted(self.added.items())[:20]),
+            "assigned_entities": len(self.assignments),
             "unknown_entities": self.unknown_entities[:20],
             "unknown_roles": sorted(set(self.unknown_roles))[:20],
             "batches": self.batches,

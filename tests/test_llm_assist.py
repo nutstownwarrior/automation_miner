@@ -455,6 +455,75 @@ def test_triage_withholds_the_statistics_from_the_model():
     assert "precision" not in prompt
 
 
+# ======================================================================
+# Bounding what a model writes into the database and the UI
+# ======================================================================
+PATHOLOGICAL = "why " * 5000
+
+
+def test_model_text_helper_collapses_and_caps():
+    from amminer.util.text import clean_model_text
+
+    assert clean_model_text("  a\n\n  b  ") == "a b"
+    assert clean_model_text(None, fallback="none") == "none"
+    assert clean_model_text("") == ""
+    capped = clean_model_text(PATHOLOGICAL, limit=50)
+    assert len(capped) == 50 and capped.endswith("\u2026")
+
+
+def test_a_pathological_hypothesis_reason_is_capped(cold_evening_case):
+    """The reason is persisted and rendered, so it is bounded on entry."""
+    changes, store, options, rejected = cold_evening_case
+    provider = StubLLM({"hypotheses": [
+        {"reason": PATHOLOGICAL,
+         "conditions": [{"kind": "numeric_state", "entity_id": "sensor.outdoor_temp",
+                         "below": 10}]},
+    ]})
+    result = hypothesis_mod.propose_and_verify(
+        rejected, changes, store, options, WINDOW, provider
+    )
+    assert result.accepted
+    stored = result.accepted[0].extra["hypothesis"]["reason"]
+    assert len(stored) <= 300
+    assert len(result.accepted[0].description) < 1000
+    assert len(result.attempts[0]["reason"]) <= 300
+
+
+def test_a_pathological_triage_reason_is_capped():
+    sensible, _absurd = _pair()
+    provider = StubLLM({"reviews": [
+        {"id": sensible.id, "verdict": "implausible", "reason": PATHOLOGICAL},
+    ]})
+    result = triage_mod.triage([sensible], provider)
+    triage_mod.apply_verdicts([sensible], result)
+    assert len(sensible.extra["triage"]["reason"]) <= 300
+
+
+def test_classification_summary_does_not_carry_the_whole_inventory():
+    """as_dict() lands in runs.stats on every nightly run, so it stays bounded."""
+    resolver = resolver_with(*[
+        state(f"sensor.price_{i}", "1", friendly_name=f"Price {i}") for i in range(200)
+    ])
+    provider = StubLLM({"assignments": [
+        {"entity_id": f"sensor.price_{i}", "roles": ["energy_price"]} for i in range(200)
+    ]})
+    result = classify_mod.classify(resolver, provider, batch_size=200)
+    signals = SignalSet()
+    classify_mod.apply_to_signals(signals, result)
+
+    assert len(result.assignments) == 200  # the real mapping is still available
+    summary = result.as_dict()
+    assert "assignments" not in summary
+    assert "added" not in summary
+    assert summary["added_count"] == 200
+    assert summary["assigned_entities"] == 200
+    assert len(summary["added_sample"]) == 20
+
+    import json
+
+    assert len(json.dumps(summary)) < 2000, "a run record must not grow with the inventory"
+
+
 def test_triage_noops_without_a_provider():
     sensible, _absurd = _pair()
     result = triage_mod.triage([sensible], NullProvider())

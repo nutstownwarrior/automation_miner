@@ -65,7 +65,7 @@
   <ul class="plain small">
     {% for name, info in report.ai.items() %}
     <li>
-      <span class="tag {{ 'ok' if info.ran else 'warning' }}">{{ name.replace('_', ' ') }}</span>
+      <span class="tag {{ 'ok' if info.ran and not info.error else 'warning' }}">{{ name.replace('_', ' ') }}</span>
       {% if not info.ran %}
         did not run &mdash; {{ info.reason }}
       {% elif name == 'entity_classification' %}

@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..miners.base import Candidate
+from ..util.text import clean_model_text
 from .provider import BaseProvider, LLMError
 
 _LOGGER = logging.getLogger(__name__)
@@ -155,10 +156,9 @@ def triage(
                 if isinstance(candidate_id, str):
                     result.unknown_ids.append(candidate_id)
                 continue
-            reason = str(review.get("reason") or "").strip()
             result.verdicts[candidate_id] = {
                 "verdict": verdict,
-                "reason": reason[:300],
+                "reason": clean_model_text(review.get("reason")),
             }
     return result
 

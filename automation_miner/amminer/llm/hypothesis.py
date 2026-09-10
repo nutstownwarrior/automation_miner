@@ -30,6 +30,7 @@ from typing import Any
 
 from ..backtest import backtest
 from ..miners.base import Candidate, Condition
+from ..util.text import clean_model_text
 from .provider import BaseProvider, LLMError
 
 _LOGGER = logging.getLogger(__name__)
@@ -325,7 +326,11 @@ def propose_and_verify(
                 continue
             result.proposed += 1
             hypothesis = Hypothesis(
-                reason=str(proposal.get("reason") or "no reason given"),
+                # The reason is persisted into the suggestion payload and
+                # rendered on the card, so it is capped where it enters.
+                reason=clean_model_text(
+                    proposal.get("reason"), fallback="no reason given"
+                ),
                 conditions=conditions,
             )
             variant = _variant(candidate, hypothesis)
