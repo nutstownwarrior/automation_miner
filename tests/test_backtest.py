@@ -450,3 +450,160 @@ def test_a_state_trigger_is_not_judged_by_the_clock_tolerance():
     )
     assert door_ts in result.false_fire_samples
     assert result.true_fires == 0
+
+
+# --- Home Assistant semantics -------------------------------------------
+def _minute(day: int, hour: int, minute: int = 0) -> float:
+    return (START + dt.timedelta(days=day, hours=hour, minutes=minute)).timestamp()
+
+
+@pytest.mark.parametrize(
+    "hour, expected",
+    [
+        (23, True),   # late evening: inside the wrapped window
+        (2, True),    # small hours: still inside it
+        (5, True),    # just before the end
+        (12, False),  # midday: outside
+        (21, False),  # just before the start
+    ],
+)
+def test_an_overnight_window_wraps_around_midnight(hour, expected):
+    """'after 22:00 and before 06:00' is an evening, not an empty set."""
+    condition = Condition(kind="time", after="22:00:00", before="06:00:00")
+    from amminer.backtest import _condition_holds
+
+    holds = _condition_holds(condition, _minute(2, hour), SignalStore(), local_tz())
+    assert holds is expected
+
+
+def test_a_daytime_window_still_reads_normally():
+    from amminer.backtest import _condition_holds
+
+    condition = Condition(kind="time", after="09:00:00", before="17:00:00")
+    tz = local_tz()
+    assert _condition_holds(condition, _minute(2, 12), SignalStore(), tz) is True
+    assert _condition_holds(condition, _minute(2, 3), SignalStore(), tz) is False
+    assert _condition_holds(condition, _minute(2, 20), SignalStore(), tz) is False
+
+
+def test_an_overnight_rule_can_actually_fire():
+    """The wrap bug made every night-time candidate unsimulatable, so every
+    one of them was rejected for never having fired."""
+    candidate = Candidate(
+        miner="test",
+        title="late night",
+        triggers=[Trigger(kind="state", entity_id="binary_sensor.motion", to_state="on")],
+        conditions=[Condition(kind="time", after="22:00:00", before="06:00:00")],
+        actions=[Action(service="light.turn_on", entity_id="light.hallway")],
+    )
+    store = SignalStore()
+    series = SignalSeries("binary_sensor.motion")
+    changes = []
+    for day in range(8):
+        ts = _minute(day, 23, 30)
+        series.add(ts, "on")
+        series.add(ts + 60, "off")
+        changes.append(human("light.hallway", "on", ts + 5))
+    store.add(series)
+
+    result = backtest(candidate, changes, store, Options(), WINDOW)
+    assert result.true_fires == 8
+    assert result.passed is True, result.reason
+
+
+def test_numeric_range_entry_only():
+    trigger = Trigger(kind="numeric_state", entity_id="sensor.temp", above=10, below=20)
+    store = SignalStore()
+    series = SignalSeries("sensor.temp")
+    base = _minute(1, 12)
+    # 5 -> 25 jumps clean over the band; 25 -> 15 enters it; 15 -> 25 leaves it;
+    # 25 -> 5 crosses both bounds downward without ever being inside.
+    for offset, value in enumerate([5, 25, 15, 25, 5]):
+        series.add(base + offset * 60, value)
+    store.add(series)
+
+    from amminer.backtest import _numeric_trigger_fires
+
+    fires = _numeric_trigger_fires(trigger, store)
+    assert fires == [base + 2 * 60]
+
+
+def test_a_single_bound_numeric_trigger_is_unchanged():
+    trigger = Trigger(kind="numeric_state", entity_id="sensor.lux", below=600)
+    store = SignalStore()
+    series = SignalSeries("sensor.lux")
+    base = _minute(1, 12)
+    for offset, value in enumerate([700, 500, 400, 800, 300]):
+        series.add(base + offset * 60, value)
+    store.add(series)
+
+    from amminer.backtest import _numeric_trigger_fires
+
+    assert _numeric_trigger_fires(trigger, store) == [base + 60, base + 4 * 60]
+
+
+def test_an_unavailable_gap_re_arms_a_numeric_trigger():
+    """Coming back into range after a restart is a fire in Home Assistant."""
+    trigger = Trigger(kind="numeric_state", entity_id="sensor.temp", below=10)
+    store = SignalStore()
+    series = SignalSeries("sensor.temp")
+    base = _minute(1, 12)
+    series.add(base, 20)
+    series.add(base + 60, 5)  # enters
+    series.add(base + 120, "unavailable")  # restart
+    series.add(base + 180, 5)  # back, still in range
+    store.add(series)
+
+    from amminer.backtest import _numeric_trigger_fires
+
+    assert _numeric_trigger_fires(trigger, store) == [base + 60, base + 180]
+
+
+def test_a_flapping_trigger_is_not_smoothed_into_a_pass():
+    """Collapsing a burst is a courtesy to the reader; HA runs the action each time."""
+    candidate = Candidate(
+        miner="test",
+        title="flapper",
+        triggers=[Trigger(kind="state", entity_id="binary_sensor.motion", to_state="on")],
+        actions=[Action(service="light.turn_on", entity_id="light.hallway")],
+    )
+    store = SignalStore()
+    series = SignalSeries("binary_sensor.motion")
+    changes = []
+    for day in range(8):
+        ts = _minute(day, 18)
+        # One "event" to a person: twelve service calls to Home Assistant.
+        for i in range(12):
+            series.add(ts + i * 4, "on")
+            series.add(ts + i * 4 + 2, "off")
+        changes.append(human("light.hallway", "on", ts + 5))
+    store.add(series)
+
+    result = backtest(candidate, changes, store, Options(), WINDOW)
+
+    assert result.total_fires == 8  # what a person would say happened
+    assert result.burst_fires == 8 * 11  # what would really have run
+    assert result.passed is False
+    assert "flaps" in result.reason
+
+
+def test_an_ordinary_rule_reports_no_bursts():
+    candidate = Candidate(
+        miner="test",
+        title="calm",
+        triggers=[Trigger(kind="state", entity_id="binary_sensor.motion", to_state="on")],
+        actions=[Action(service="light.turn_on", entity_id="light.hallway")],
+    )
+    store = SignalStore()
+    series = SignalSeries("binary_sensor.motion")
+    changes = []
+    for day in range(8):
+        ts = _minute(day, 18)
+        series.add(ts, "on")
+        series.add(ts + 300, "off")
+        changes.append(human("light.hallway", "on", ts + 5))
+    store.add(series)
+
+    result = backtest(candidate, changes, store, Options(), WINDOW)
+    assert result.burst_fires == 0
+    assert result.passed is True, result.reason

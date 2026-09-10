@@ -49,6 +49,14 @@ WEEKDAY_INDEX = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "su
 #: A state trigger must line up much more tightly than a daily time trigger.
 STATE_TRIGGER_TOLERANCE = 300.0
 
+#: A rule that fires several times inside this is one event to a person - but
+#: only to a person.  Home Assistant really does run the action each time.
+BURST_WINDOW = 60.0
+
+#: How many times over the fires it keeps a rule may re-fire in bursts before
+#: the collapsing is hiding more than it is smoothing.
+MAX_BURST_RATIO = 3.0
+
 #: Trigger kinds that are events rather than clock times, and so are held to
 #: :data:`STATE_TRIGGER_TOLERANCE` regardless of what else the rule triggers on.
 EVENT_TRIGGER_KINDS = ("state", "numeric_state")
@@ -87,6 +95,10 @@ class BacktestResult:
     simulated: bool = True
     fire_samples: list[float] = field(default_factory=list)
     false_fire_samples: list[float] = field(default_factory=list)
+    #: Fires swallowed by burst collapsing.  Home Assistant would really have
+    #: run the action for each of these, so they are what the nuisance figures
+    #: leave out.
+    burst_fires: int = 0
 
     @property
     def precision(self) -> float | None:
@@ -120,6 +132,7 @@ class BacktestResult:
             "simulated": self.simulated,
             "fire_samples": self.fire_samples[:20],
             "false_fire_samples": self.false_fire_samples[:20],
+            "burst_fires": self.burst_fires,
             "summary": self.summary(),
         }
 
@@ -145,17 +158,28 @@ def _condition_holds(
             if allowed and dt.datetime.fromtimestamp(ts, tz).weekday() not in allowed:
                 return False
         minute = minute_of_day(ts, tz)
-        for bound, fails in ((condition.after, lambda m, b: m < b),
-                             (condition.before, lambda m, b: m > b)):
-            if not bound:
-                continue
-            limit = time_of_day_minutes(bound)
-            if limit is None:
+        after = before = None
+        if condition.after:
+            after = time_of_day_minutes(condition.after)
+            if after is None:
                 # An unevaluable bound is "cannot verify", which for a gate
                 # means not satisfied - never silently no constraint at all.
                 return False
-            if fails(minute, limit):
+        if condition.before:
+            before = time_of_day_minutes(condition.before)
+            if before is None:
                 return False
+        if after is not None and before is not None and after > before:
+            # "after 22:00 and before 06:00" is a window across midnight, which
+            # is how people describe evenings.  Testing the two bounds
+            # independently makes it unsatisfiable at every instant: nothing is
+            # both later than 22:00 and earlier than 06:00 on the same clock
+            # face.  Home Assistant wraps; so do we.
+            return minute >= after or minute <= before
+        if after is not None and minute < after:
+            return False
+        if before is not None and minute > before:
+            return False
         return True
     if condition.kind == "state":
         value = store.value_at(condition.entity_id or "", ts, max_staleness=6 * 3600)
@@ -214,34 +238,62 @@ def _state_trigger_fires(trigger: Trigger, store: SignalStore) -> list[float]:
     return fires
 
 
+def _numeric_in_range(value: float, trigger: Trigger) -> bool:
+    """Home Assistant's ``numeric_state`` membership test: strict on both sides."""
+    if trigger.above is not None and value <= trigger.above:
+        return False
+    if trigger.below is not None and value >= trigger.below:
+        return False
+    return True
+
+
 def _numeric_trigger_fires(trigger: Trigger, store: SignalStore) -> list[float]:
+    """Every crossing *into* the trigger's range.
+
+    A ``numeric_state`` trigger is not two independent thresholds.  With both
+    ``above`` and ``below`` set it describes one band, and Home Assistant fires
+    when the value enters it - not each time either bound is crossed in any
+    direction.  Treating them separately fires on a value that jumped clean over
+    the band and landed outside it, and fires again on the way out.
+    """
     series = store.get(trigger.entity_id or "")
     if series is None:
         return []
     fires: list[float] = []
-    previous: float | None = None
+    inside: bool | None = None  # None until the first reading: no prior state
     for ts, value in zip(series.times, series.values, strict=True):
         try:
             current = float(value)
         except (TypeError, ValueError):
+            # unavailable/unknown is not in the range, and Home Assistant will
+            # fire again when the entity comes back into it.
+            inside = False
             continue
-        if previous is not None:
-            crossed_below = (
-                trigger.below is not None and previous >= trigger.below > current
-            )
-            crossed_above = (
-                trigger.above is not None and previous <= trigger.above < current
-            )
-            if crossed_below or crossed_above:
-                fires.append(ts)
-        previous = current
+        now_inside = _numeric_in_range(current, trigger)
+        if now_inside and inside is False:
+            fires.append(ts)
+        inside = now_inside
     return fires
 
 
 def simulate_fires(
     candidate: Candidate, store: SignalStore, window: tuple[float, float], tz=None
 ) -> tuple[list[Fire], str | None]:
-    """Every moment the candidate would have fired.  Returns ``(fires, error)``."""
+    """Every moment the candidate would have fired.  Returns ``(fires, error)``.
+
+    Bursts are collapsed, which is the right unit for "did the user want this"
+    and the wrong one for "how often would this have run".  Use
+    :func:`simulate_fires_detailed` when the difference matters.
+    """
+    fires, suppressed, error = simulate_fires_detailed(candidate, store, window, tz)
+    del suppressed
+    return fires, error
+
+
+def simulate_fires_detailed(
+    candidate: Candidate, store: SignalStore, window: tuple[float, float], tz=None
+) -> tuple[list[Fire], int, str | None]:
+    """``(collapsed fires, fires swallowed by collapsing, error)``."""
     tz = tz or local_tz()
     fires: list[Fire] = []
     for trigger in candidate.triggers:
@@ -252,10 +304,10 @@ def simulate_fires(
         elif trigger.kind == "numeric_state":
             times = _numeric_trigger_fires(trigger, store)
         else:
-            return [], f"trigger kind '{trigger.kind}' cannot be simulated"
+            return [], 0, f"trigger kind '{trigger.kind}' cannot be simulated"
         fires.extend(Fire(ts, trigger.kind) for ts in times)
     if not fires:
-        return [], None
+        return [], 0, None
 
     # Two triggers landing on the same instant is one fire, held to the tighter
     # of the two tolerances - a rule does not get the benefit of its loosest
@@ -275,13 +327,16 @@ def simulate_fires(
     # Collapse bursts: a rule that fires five times in a minute is one event to
     # a human, and Home Assistant's own trigger would also be re-entrant-guarded.
     collapsed: list[Fire] = []
+    suppressed = 0
     for fire in kept:
-        if not collapsed or fire.ts - collapsed[-1].ts > 60.0:
+        if not collapsed or fire.ts - collapsed[-1].ts > BURST_WINDOW:
             collapsed.append(fire)
-        elif fire.tolerance_is_tight and not collapsed[-1].tolerance_is_tight:
+            continue
+        suppressed += 1
+        if fire.tolerance_is_tight and not collapsed[-1].tolerance_is_tight:
             # Same burst, but this one must be matched more strictly.
             collapsed[-1] = Fire(collapsed[-1].ts, fire.trigger_kind)
-    return collapsed, None
+    return collapsed, suppressed, None
 
 
 def ground_truth_actions(
@@ -329,7 +384,7 @@ def backtest(
         result.passed = True  # audit-only findings (stale/unused) are not gated
         return result
 
-    fires, error = simulate_fires(candidate, store, window, tz)
+    fires, result.burst_fires, error = simulate_fires_detailed(candidate, store, window, tz)
     if error:
         result.simulated = False
         result.reason = error
@@ -415,6 +470,15 @@ def backtest(
     # Computing this and then not acting on it was the worst of both: a rule
     # that fires exactly where the user has already reached over and undone an
     # automation is the one most likely to be resented.
+    # Collapsing a burst is a courtesy to the reader, not a description of what
+    # would happen: Home Assistant runs the action on every one of them.  When
+    # most of the activity is being collapsed away, the figures above are
+    # describing a calmer rule than the one the user would actually live with.
+    if result.burst_fires > MAX_BURST_RATIO * max(result.total_fires, 1):
+        reasons.append(
+            f"the trigger flaps: it would have re-fired {result.burst_fires} more "
+            f"times in bursts on top of the {result.total_fires} counted here"
+        )
     if result.nuisance_fires > options.backtest_max_nuisance_fires:
         reasons.append(
             f"{result.nuisance_fires} of its unwanted fires land where you have "
