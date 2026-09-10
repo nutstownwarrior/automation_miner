@@ -27,6 +27,11 @@ You can **Review** (see the YAML and the full explanation), **Shadow-test**
 (log when it would fire without acting), or **Dismiss** (permanently — it will
 never be suggested again).
 
+Shadow-testing does not run continuously: each nightly analysis replays the
+rules you are watching over the history since it last looked and records every
+would-be fire, marking whether you really did that thing around then. So the
+count on the suggestion's page fills in a run at a time, not minute by minute.
+
 If the list is empty, open **Status**. It says exactly what limited the run.
 
 ## Pages
