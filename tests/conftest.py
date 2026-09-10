@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
+import time
 from pathlib import Path
 
 import pytest
@@ -19,8 +21,29 @@ from amminer.recorderdb.queries import ORIGIN_EVENT_TYPES, RecorderQueries
 from amminer.store import Store
 from amminer.testing.synthetic import build_default_fixture
 
+# Pinned before any test module is imported, because several of them compute
+# timestamps at module scope.  The synthetic history is built in UTC and the
+# miners read the *local* timezone (TZ, which the Supervisor sets in the
+# container); with the two disagreeing, a habit injected at 06:30 is recovered
+# at 20:30 and the suite fails for a reason that has nothing to do with the
+# code.  test_timezones.py covers the non-UTC case this pin would otherwise
+# hide.
+os.environ["TZ"] = "UTC"
+time.tzset()
+
 FIXTURE_DAYS = 45
 FIXTURE_TZ = dt.UTC
+
+#: The fixture ends on a fixed date, not on "today".
+#:
+#: The seed alone does not make it reproducible: several injected patterns are
+#: conditioned on the weekday, and the weekday branches consume different
+#: numbers of random() calls, so the same seed run on a Tuesday and on a Friday
+#: produced different ground truth - measured at hits 28-30 and consistency
+#: 0.82-0.91 for the same habit.  Today's margins happen to be wide enough not
+#: to flip an assertion, which is not the same as the suite being deterministic.
+#: A Wednesday, so the 45-day window covers whole weeks plus a remainder.
+FIXTURE_END = dt.datetime(2024, 5, 1, 12, 0, tzinfo=FIXTURE_TZ)
 
 
 @pytest.fixture(scope="session")
@@ -28,7 +51,9 @@ def fixture_db(tmp_path_factory) -> tuple[Path, object]:
     """A synthetic recorder database plus the ground truth used to build it."""
     directory = tmp_path_factory.mktemp("recorder")
     path = directory / "home-assistant_v2.db"
-    truth = build_default_fixture(path, days=FIXTURE_DAYS, seed=20240501, tz=FIXTURE_TZ)
+    truth = build_default_fixture(
+        path, days=FIXTURE_DAYS, end=FIXTURE_END, seed=20240501, tz=FIXTURE_TZ
+    )
     return path, truth
 
 

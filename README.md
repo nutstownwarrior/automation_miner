@@ -383,13 +383,26 @@ python -m amminer.testing.synthetic /tmp/rec.db --days 45
   `statistics`) and injects known patterns: a 06:30 weekday habit, an
   arrive-home sequence, a temperature-driven heater habit, and deliberate
   override events. The miners are asserted to recover exactly those.
-- **Both dialects** — the same production SQL runs against SQLite always, and
-  against MariaDB/PostgreSQL when `AMMINER_TEST_MYSQL_URL` is set
-  (`pytest -m mariadb`).
+- **Dialects** — every test runs the production SQL against SQLite. Setting
+  `AMMINER_TEST_MYSQL_URL` adds one MariaDB test (`pytest -m mariadb`) that
+  asserts the same queries execute there and return context ids; it does not
+  compare results between the two. PostgreSQL is supported by the same
+  SQLAlchemy code path and the DDL translator in `testing/mysql_loader.py`, but
+  nothing in CI exercises it — treat Postgres as untested rather than verified.
+- **Timezones** — the suite pins `TZ=UTC` so the synthetic history and the
+  miners agree, and `tests/test_timezones.py` deliberately runs the mining path
+  under several real zones, which is the case a Home Assistant instance is
+  actually in.
+- **Mutation checks** — the thresholds that decide what a user is shown
+  (`min_consistency`, the conditional miner's lift/purity/staleness bounds, the
+  association lift and human-consequent filters, the stale-automation cutoff)
+  each have a test that fails when the check is deleted. They were added because
+  every one of them could be removed with the suite staying green.
 - **Public datasets** — `amminer.testing.datasets` maps CASAS, ARAS and
   Kasteren into the internal schema. The archives are not redistributable, so
   the tests run on data generated in those exact on-disk formats; point
   `AMMINER_CASAS_FILE` at a real CASAS file to run against the genuine archive.
+  CI does not set it, so CI validates the format handling, not the archives.
 - **Registry snapshots** — including entities with no `unique_id` (recovered via
   the states union) and large `deleted_entities` sections (which must be ignored).
 - **Golden LLM tests** — a deliberately hallucinating model is asserted to be

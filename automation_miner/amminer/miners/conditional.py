@@ -128,7 +128,10 @@ def _numeric_stump(
     if len(positives) < MIN_POSITIVE_SAMPLES or len(background) < 10:
         return None
     thresholds = sorted({round(v, 2) for v in list(positives) + list(background)})
-    if len(thresholds) < 3:
+    if len(thresholds) < 2:
+        # One distinct value cannot separate anything.  Requiring three
+        # threw away the cleanest case there is: a signal that takes one value
+        # whenever the user acts and another whenever they do not.
         return None
 
     best: ConditionFinding | None = None

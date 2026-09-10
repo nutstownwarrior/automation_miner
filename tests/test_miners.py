@@ -66,7 +66,7 @@ def test_time_of_day_needs_enough_occurrences(options, window):
     assert time_of_day.mine(changes, options, window) == []
 
 
-def test_time_of_day_rejects_scattered_times(options, window):
+def test_time_of_day_rejects_too_few_clustered_occurrences(options, window):
     """Twenty actions at random hours is not a habit, however many there are."""
     changes = []
     for day in range(40):
@@ -221,7 +221,9 @@ def test_conditional_recovers_the_temperature_driven_heater(
     assert trigger.below is not None
     # The generator's threshold is 8.0 C.
     assert abs(trigger.below - truth.conditional["below"]) <= 2.5
-    assert heater.evidence.lift > 1.4
+    # Not `lift > MIN_LIFT`, which the miner guarantees by construction and so
+    # asserts nothing.  This is the lift the injected pattern actually has.
+    assert heater.evidence.lift > 3.0
 
 
 def test_conditional_skips_when_no_signals(classified, options, window):

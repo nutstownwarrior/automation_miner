@@ -145,8 +145,10 @@ def test_config_yaml_maps_the_right_directories(addon_config):
 
 
 def test_config_yaml_grants_the_apis_we_use(addon_config):
-    assert addon_config["hassio_api"] is True
     assert addon_config["homeassistant_api"] is True
+    # An add-on that asks for a privilege it does not use is asking for trust
+    # it does not need.  Nothing here calls a Supervisor endpoint.
+    assert "hassio_api" not in addon_config
 
 
 def test_config_yaml_is_multi_arch(addon_config):

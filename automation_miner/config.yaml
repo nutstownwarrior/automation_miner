@@ -15,7 +15,8 @@ stage: experimental
 ingress: true
 panel_icon: mdi:pickaxe
 panel_title: Automation Miner
-hassio_api: true
+# No hassio_api: nothing here calls a Supervisor endpoint.  The Core API is
+# reached through the Supervisor proxy, which homeassistant_api alone grants.
 homeassistant_api: true
 map:
   - homeassistant_config:ro
