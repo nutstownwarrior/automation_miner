@@ -89,3 +89,38 @@ def circular_std_minutes(values: list[int] | list[float]) -> float:
     r = math.sqrt(sin_mean**2 + cos_mean**2)
     r = min(max(r, 1e-9), 1.0)
     return math.sqrt(-2.0 * math.log(r)) * MINUTES_PER_DAY / (2 * math.pi)
+
+
+def time_of_day_minutes(value: object) -> int | None:
+    """Minutes since midnight for ``"HH:MM"`` / ``"HH:MM:SS"``, else ``None``.
+
+    Strict on purpose. Callers use ``None`` to mean "this is not a time I can
+    reason about", and both of them treat that as a failure rather than as an
+    absent constraint - a bound nobody can evaluate must never read as "no
+    bound", which would silently turn a condition into a no-op.
+    """
+    if not isinstance(value, str):
+        return None
+    parts = value.strip().split(":")
+    if len(parts) not in (2, 3):
+        return None
+    try:
+        hour, minute = int(parts[0]), int(parts[1])
+        second = int(parts[2]) if len(parts) == 3 else 0
+    except ValueError:
+        return None
+    if not (0 <= hour < 24 and 0 <= minute < 60 and 0 <= second < 60):
+        return None
+    return hour * 60 + minute
+
+
+def parse_time_of_day(value: object) -> str | None:
+    """Normalise a time-of-day string to ``"HH:MM:SS"``, or ``None``."""
+    minutes = time_of_day_minutes(value)
+    if minutes is None:
+        return None
+    seconds = 0
+    parts = str(value).strip().split(":")
+    if len(parts) == 3:
+        seconds = int(parts[2])
+    return f"{minutes // 60:02d}:{minutes % 60:02d}:{seconds:02d}"

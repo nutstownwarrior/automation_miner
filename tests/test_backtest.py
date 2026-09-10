@@ -171,6 +171,45 @@ def test_state_trigger_simulation_uses_a_tight_tolerance():
     assert result.passed is True
 
 
+def test_an_unevaluable_time_bound_fails_closed():
+    """A gate must never read a bound it cannot parse as 'no constraint'."""
+    from amminer.backtest import _condition_holds
+
+    moment = (START + dt.timedelta(days=1, hours=12)).timestamp()
+    assert _condition_holds(Condition(kind="time", after="06:00:00"), moment, SignalStore(), TZ)
+    for bogus in ("evening", "25:00", "12:70", "half past six"):
+        assert not _condition_holds(
+            Condition(kind="time", after=bogus), moment, SignalStore(), TZ
+        ), bogus
+        assert not _condition_holds(
+            Condition(kind="time", before=bogus), moment, SignalStore(), TZ
+        ), bogus
+
+
+def test_a_rule_with_an_unevaluable_condition_never_fires():
+    """The end-to-end consequence: it cannot be surfaced by accident."""
+    changes = [
+        human("light.kitchen", "on", (START + dt.timedelta(days=d, hours=6, minutes=30)).timestamp())
+        for d in range(DAYS)
+    ]
+    candidate = daily_candidate()
+    candidate.conditions = [Condition(kind="time", after="breakfast")]
+    result = backtest(candidate, changes, SignalStore(), Options(), WINDOW)
+    assert result.true_fires == 0
+    assert result.passed is False
+
+
+def test_time_of_day_parsing_is_strict():
+    from amminer.util.timeutil import parse_time_of_day, time_of_day_minutes
+
+    assert time_of_day_minutes("06:30") == 390
+    assert time_of_day_minutes("06:30:45") == 390
+    assert parse_time_of_day("6:5") == "06:05:00"
+    for bogus in ("evening", "25:00", "12:70", "6", "", None, 630, "06:30:99"):
+        assert time_of_day_minutes(bogus) is None, bogus
+        assert parse_time_of_day(bogus) is None, bogus
+
+
 def test_unsimulatable_trigger_is_rejected_not_crashed():
     candidate = daily_candidate()
     candidate.triggers = [Trigger(kind="webhook")]

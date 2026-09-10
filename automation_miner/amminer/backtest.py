@@ -32,7 +32,7 @@ from .config import Options
 from .enrich.signals import SignalStore
 from .miners.base import Candidate, Condition, Trigger
 from .recorderdb.models import Cause, OverrideEvent, StateChange
-from .util.timeutil import local_tz, minute_of_day
+from .util.timeutil import local_tz, minute_of_day, time_of_day_minutes
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -115,13 +115,16 @@ def _condition_holds(
             if allowed and dt.datetime.fromtimestamp(ts, tz).weekday() not in allowed:
                 return False
         minute = minute_of_day(ts, tz)
-        if condition.after:
-            after = _hhmm_to_minutes(condition.after)
-            if after is not None and minute < after:
+        for bound, fails in ((condition.after, lambda m, b: m < b),
+                             (condition.before, lambda m, b: m > b)):
+            if not bound:
+                continue
+            limit = time_of_day_minutes(bound)
+            if limit is None:
+                # An unevaluable bound is "cannot verify", which for a gate
+                # means not satisfied - never silently no constraint at all.
                 return False
-        if condition.before:
-            before = _hhmm_to_minutes(condition.before)
-            if before is not None and minute > before:
+            if fails(minute, limit):
                 return False
         return True
     if condition.kind == "state":
@@ -143,17 +146,9 @@ def _condition_holds(
     return False
 
 
-def _hhmm_to_minutes(value: str) -> int | None:
-    parts = str(value).split(":")
-    try:
-        return int(parts[0]) * 60 + int(parts[1])
-    except (ValueError, IndexError):
-        return None
-
-
 def _time_trigger_fires(trigger: Trigger, window: tuple[float, float], tz) -> list[float]:
     """Every daily occurrence of a ``time`` trigger inside the window."""
-    minutes = _hhmm_to_minutes(trigger.at or "")
+    minutes = time_of_day_minutes(trigger.at or "")
     if minutes is None:
         return []
     start_ts, end_ts = window

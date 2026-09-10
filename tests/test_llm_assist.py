@@ -293,6 +293,31 @@ def test_unusable_proposals_are_rejected_before_backtesting(
     assert result.rejected_invalid >= 1
 
 
+@pytest.mark.parametrize(
+    "conditions",
+    [
+        [{"kind": "time", "after": "evening"}],
+        [{"kind": "time", "before": "sunset"}],
+        [{"kind": "time", "after": "25:00"}],
+        [{"kind": "time", "after": "12:70"}],
+        [{"kind": "time", "after": "noon", "weekday": ["mon"]}],
+        [{"kind": "time", "after": ""}],
+    ],
+)
+def test_a_time_bound_that_does_not_parse_is_rejected(conditions):
+    """It would be an unevaluable no-op here and invalid YAML once applied."""
+    assert hypothesis_mod.parse_conditions(conditions, {"sensor.outdoor_temp"}) is None
+
+
+def test_valid_time_bounds_are_normalised():
+    parsed = hypothesis_mod.parse_conditions(
+        [{"kind": "time", "after": "6:5", "before": "23:00:30"}], {"sensor.x"}
+    )
+    assert parsed is not None
+    assert parsed[0].after == "06:05:00"
+    assert parsed[0].before == "23:00:30"
+
+
 def test_hypotheses_may_not_reference_the_entity_being_acted_on(cold_evening_case):
     """Explaining 'turn the heater on' with 'the heater is on' is circular."""
     changes, store, options, rejected = cold_evening_case

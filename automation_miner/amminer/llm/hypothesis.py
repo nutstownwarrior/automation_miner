@@ -31,6 +31,7 @@ from typing import Any
 from ..backtest import backtest
 from ..miners.base import Candidate, Condition
 from ..util.text import clean_model_text
+from ..util.timeutil import parse_time_of_day
 from .provider import BaseProvider, LLMError
 
 _LOGGER = logging.getLogger(__name__)
@@ -178,9 +179,16 @@ def parse_conditions(
                 for d in (weekday or [])
                 if str(d).strip().lower()[:3] in WEEKDAYS
             ]
-            after, before = raw.get("after"), raw.get("before")
-            after = str(after) if isinstance(after, str) else None
-            before = str(before) if isinstance(before, str) else None
+            # A time bound that does not parse is rejected rather than
+            # dropped: the backtester cannot evaluate it, and left in place it
+            # would be rendered straight into the applied automation's YAML.
+            after_raw, before_raw = raw.get("after"), raw.get("before")
+            after = parse_time_of_day(after_raw)
+            before = parse_time_of_day(before_raw)
+            if after_raw is not None and after is None:
+                return None
+            if before_raw is not None and before is None:
+                return None
             if not weekday and not after and not before:
                 return None
             conditions.append(
