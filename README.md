@@ -195,18 +195,34 @@ many invented entity ids were discarded.
 
 ### The validation gate
 
-Nothing reaches your configuration without passing all three checks:
+Nothing reaches your configuration without passing all four checks:
 
-1. **Existence** — every `entity_id`, `device_id`, `area_id` and service must
+1. **Equivalence** — the model's automation is reduced to a canonical form of
+   its triggers, conditions, actions and mode, and compared against the same
+   reduction of the deterministic rendering. The prompt allows it to reword the
+   alias and description; anything else it changes is a rejection that names the
+   field. Checks 2 and 3 only prove that what the model named *exists* — an
+   entirely different automation built from real entities and real services
+   passes both. This one is what makes "the rule you read the evidence for" and
+   "the rule that gets written" the same rule.
+2. **Existence** — every `entity_id`, `device_id`, `area_id` and service must
    exist in the registry-union-states set. This is what catches hallucination;
    Home Assistant's own config check does not.
-2. **Schema** — the YAML must parse and match Home Assistant's automation schema
+3. **Schema** — the YAML must parse and match Home Assistant's automation schema
    (mirrored in voluptuous).
-3. **`POST /api/config/core/check_config`** must pass.
+4. **`POST /api/config/core/check_config`** must pass.
 
 If the LLM's output fails the gate, it is rejected, the reason is shown
-(including which entity ids it invented), and you are given the deterministic
-rendering instead.
+(including which entity ids it invented, or which field it rewrote), and you are
+given the deterministic rendering instead.
+
+**Apply writes the artifact you previewed.** The automation shown on the detail
+page is stored when it is rendered, and Apply writes that stored object rather
+than asking the model the same question a second time — a second answer would be
+an automation you never saw. It is re-validated in full, `check_config`
+included, before it is written; reuse means no new content, not no new checks.
+If the finding has since been re-mined into a different rule, the stale preview
+is discarded and regenerated rather than applied.
 
 ---
 

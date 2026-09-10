@@ -41,12 +41,16 @@ If the list is empty, open **Status**. It says exactly what limited the run.
 
 ## Applying a suggestion
 
-Press **Apply to Home Assistant** on a suggestion's detail page. Before anything
-is written, the automation must pass all three gates:
+Press **Apply to Home Assistant** on a suggestion's detail page. What gets
+written is the automation you were shown: it is stored when the preview is
+rendered, and Apply writes that stored object rather than generating a fresh
+one. Before anything is written it must pass all four gates:
 
-1. every entity, device, area and service it references exists,
-2. the YAML parses and matches Home Assistant's automation schema,
-3. `POST /api/config/core/check_config` succeeds.
+1. it still means what the mined rule meant - same triggers, conditions,
+   actions and mode (an LLM may reword the alias and description, nothing else),
+2. every entity, device, area and service it references exists,
+3. the YAML parses and matches Home Assistant's automation schema,
+4. `POST /api/config/core/check_config` succeeds.
 
 Only then is it written through the config API and `automation.reload` called.
 If any check fails, the reason is shown and nothing is written.

@@ -109,6 +109,14 @@ CREATE TABLE IF NOT EXISTS runs (
     error        TEXT
 );
 
+CREATE TABLE IF NOT EXISTS generations (
+    suggestion_id TEXT PRIMARY KEY,
+    ts            REAL NOT NULL,
+    digest        TEXT NOT NULL,
+    source        TEXT,
+    payload       TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS gap_suggestions (
     id          TEXT PRIMARY KEY,
     kind        TEXT NOT NULL,
@@ -478,6 +486,35 @@ class Store:
             "precision": (matched / (matched + unmatched)) if (matched + unmatched) else None,
         }
 
+    # --- generated automations ----------------------------------------
+    def save_generation(self, suggestion_id: str, digest: str, source: str, payload: dict) -> None:
+        """Remember the exact automation a user was shown.
+
+        Apply must write what was reviewed. Regenerating at apply time asks a
+        non-deterministic model the same question twice and writes the second
+        answer, which is not the one that was consented to.
+        """
+        self._execute(
+            "INSERT INTO generations(suggestion_id, ts, digest, source, payload)"
+            " VALUES(?,?,?,?,?)"
+            " ON CONFLICT(suggestion_id) DO UPDATE SET ts=excluded.ts,"
+            " digest=excluded.digest, source=excluded.source, payload=excluded.payload",
+            (suggestion_id, time.time(), digest, source, _json(payload)),
+        )
+
+    def get_generation(self, suggestion_id: str) -> dict[str, Any] | None:
+        rows = self._query(
+            "SELECT * FROM generations WHERE suggestion_id = ?", (suggestion_id,)
+        )
+        if not rows:
+            return None
+        data = dict(rows[0])
+        try:
+            data["payload"] = json.loads(data["payload"])
+        except (json.JSONDecodeError, TypeError):
+            return None
+        return data
+
     # --- gap suggestions ---------------------------------------------
     def upsert_gap(self, gap_id: str, kind: str, title: str, payload: dict[str, Any]) -> None:
         now = time.time()
@@ -521,6 +558,7 @@ class Store:
             "overrides",
             "shadow_events",
             "runs",
+            "generations",
             "gap_suggestions",
         ):
             rows = self._query(f"SELECT COUNT(*) AS c FROM {table}")

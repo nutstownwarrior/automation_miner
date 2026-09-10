@@ -16,13 +16,29 @@ from .config import Options
 from .discovery.ha_config import HAConfig
 from .entities import EntityResolver, build_resolver
 from .ha_api import HAClient
-from .llm.generate import generate
+from .llm.blueprint import candidate_to_automation, render_yaml
+from .llm.equivalence import matches, semantic_form
+from .llm.generate import GenerationResult, generate
 from .llm.provider import build_provider
+from .llm.validate import validate_automation
 from .miners.base import Action, Candidate, Condition, Evidence, Trigger
 from .pipeline import RunReport, run_analysis
 from .store import Store
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def generation_digest(config: dict[str, Any]) -> str:
+    """Identity of what an automation *does*, for consent purposes.
+
+    Keyed on the semantic form, so re-rendering the same rule yields the same
+    digest while any change to trigger/condition/action changes it.
+    """
+    import hashlib
+    import json as _json
+
+    payload = _json.dumps(semantic_form(config), sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
 def candidate_from_payload(payload: dict[str, Any]) -> Candidate:
@@ -138,7 +154,15 @@ class Runner:
             services=self._ensure_services(),
             run_check_config=False,  # a preview must not hammer Core
         )
-        return result.as_dict()
+        # Persist exactly what is about to be rendered, so Apply writes this
+        # artifact rather than asking the model the same question again.
+        if result.config:
+            self.store.save_generation(
+                suggestion_id, generation_digest(result.config), result.source, result.config
+            )
+        data = result.as_dict()
+        data["digest"] = generation_digest(result.config) if result.config else None
+        return data
 
     def apply(self, suggestion_id: str) -> dict[str, Any] | None:
         """Generate, fully validate (including check_config) and write."""
@@ -149,14 +173,52 @@ class Runner:
         if not payload.get("actions"):
             return {"ok": False, "errors": ["This finding has no automation to apply."]}
         candidate = candidate_from_payload(payload)
-        generation = generate(
-            candidate,
-            resolver=self._ensure_resolver(),
-            provider=build_provider(self.options),
-            client=self.client if self.client.configured else None,
-            services=self._ensure_services(),
-            run_check_config=True,
-        )
+
+        # Apply what was reviewed. Regenerating here would ask a
+        # non-deterministic model the same question a second time and write the
+        # second answer - an automation the user never saw. The stored artifact
+        # is still re-validated below, including check_config, before it is
+        # written; reuse means "no new content", not "no new checks".
+        stored = self.store.get_generation(suggestion_id)
+        if stored is not None and not matches(
+            stored["payload"], candidate_to_automation(candidate, self._ensure_resolver())
+        ):
+            # The finding was re-mined into a different rule after the preview.
+            # The stored artifact is no longer what this suggestion says, so it
+            # is not what the user approved either.
+            stored = None
+
+        if stored is not None:
+            generation = GenerationResult()
+            generation.config = stored["payload"]
+            generation.source = f"{stored.get('source') or 'stored'} (reviewed)"
+            generation.yaml_text = render_yaml(stored["payload"])
+            generation.notes.append(
+                "Applying the automation exactly as it was previewed."
+            )
+            generation.report = validate_automation(
+                generation.config,
+                resolver=self._ensure_resolver(),
+                client=self.client if self.client.configured else None,
+                known_services=self._ensure_services(),
+                run_check_config=True,
+            )
+        else:
+            # Never previewed (an API caller, or a store that lost the row):
+            # generate once and apply that same object - still a single
+            # generation, so there is no divergence window.
+            generation = generate(
+                candidate,
+                resolver=self._ensure_resolver(),
+                provider=build_provider(self.options),
+                client=self.client if self.client.configured else None,
+                services=self._ensure_services(),
+                run_check_config=True,
+            )
+            generation.notes.append(
+                "No stored preview for this suggestion; generated and applied in one step."
+            )
+
         result = apply_generation(generation, self.client)
         data = result.as_dict()
         data["generation"] = generation.as_dict()

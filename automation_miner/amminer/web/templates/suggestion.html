@@ -61,6 +61,11 @@
     <ul class="validation">
       <li class="{{ 'ok' if preview.validation.schema_ok else 'fail' }}">Schema valid</li>
       <li class="{{ 'ok' if preview.validation.references_ok else 'fail' }}">All entities and services exist</li>
+      {% if preview.llm_validation and preview.llm_validation.semantics_ok is not none %}
+      <li class="{{ 'ok' if preview.llm_validation.semantics_ok else 'fail' }}">
+        The model kept the mined rule intact
+      </li>
+      {% endif %}
       <li class="{{ 'ok' if preview.validation.check_config_ok else ('skip' if preview.validation.check_config_ok is none else 'fail') }}">
         Home Assistant config check
         {%- if preview.validation.check_config_ok is none %} (not reachable){% endif %}
@@ -70,6 +75,9 @@
     {% endif %}
     {% for note in preview.notes or [] %}<p class="muted small">{{ note }}</p>{% endfor %}
     <pre><code>{{ preview.yaml }}</code></pre>
+    {% if preview.digest %}
+    <p class="muted small">Apply writes exactly this automation ({{ preview.digest }}).</p>
+    {% endif %}
   </section>
   {% endif %}
 

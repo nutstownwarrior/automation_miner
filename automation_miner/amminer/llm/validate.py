@@ -138,6 +138,9 @@ class ValidationReport:
     ok: bool = False
     schema_ok: bool = False
     references_ok: bool = False
+    #: Does the automation still mean what the mined candidate meant?  Only
+    #: meaningful for LLM output; the deterministic renderer is the reference.
+    semantics_ok: bool | None = None
     check_config_ok: bool | None = None  # None == not run (Core unreachable)
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -150,6 +153,7 @@ class ValidationReport:
             "ok": self.ok,
             "schema_ok": self.schema_ok,
             "references_ok": self.references_ok,
+            "semantics_ok": self.semantics_ok,
             "check_config_ok": self.check_config_ok,
             "errors": self.errors,
             "warnings": self.warnings,
