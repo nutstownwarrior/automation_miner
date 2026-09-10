@@ -75,22 +75,50 @@ class ConditionFinding:
 def _background_timestamps(
     action_timestamps: Sequence[float], window: tuple[float, float], per_day: int = 6
 ) -> list[float]:
-    """Sample the analysis window uniformly, as a "what usually happens" baseline.
+    """A baseline of "the same moment, on a day you did not do it".
 
-    Sampling at the *same times of day* as the actions would bake the
-    time-of-day pattern into the baseline and hide any genuine external driver,
-    so the background is a plain uniform grid instead.
+    A uniform grid over the whole window was the wrong control.  It makes
+    time-of-day the difference between the two samples, so *any* signal with a
+    daily shape separates them - and the miner cannot tell a genuine driver from
+    something unrelated that happens to dip in the evening.  Given a pure clock
+    habit (the light at 18:00 every day) and a server-load sensor that dips
+    during a nightly backup, the uniform baseline reports 100% purity and 2x
+    lift for "turn on the light when server load is above 50".
+
+    Matching the times of day is what removes the clock from the comparison.
+    The question becomes "at this hour, on days you did not do it, did the
+    signal look different?", which a real driver still answers and a coincidence
+    of scheduling does not.  Days on which the action did happen are excluded so
+    the baseline is genuinely the other case.
     """
     start_ts, end_ts = window
     if end_ts <= start_ts:
         return []
-    step = 86400.0 / max(per_day, 1)
-    samples: list[float] = []
-    ts = start_ts
-    while ts < end_ts:
-        samples.append(ts)
-        ts += step
-    return samples
+    if not action_timestamps:
+        step = 86400.0 / max(per_day, 1)
+        samples: list[float] = []
+        ts = start_ts
+        while ts < end_ts:
+            samples.append(ts)
+            ts += step
+        return samples
+
+    action_days = {int((ts - start_ts) // 86400) for ts in action_timestamps}
+    times_of_day = sorted({ts % 86400.0 for ts in action_timestamps})
+    total_days = int((end_ts - start_ts) // 86400) + 1
+    day_zero = start_ts - (start_ts % 86400.0)
+
+    samples = []
+    for day in range(total_days):
+        if day in action_days:
+            continue
+        for time_of_day in times_of_day:
+            ts = day_zero + day * 86400.0 + time_of_day
+            if start_ts <= ts < end_ts:
+                samples.append(ts)
+    # Too few off-days to compare against is a reason to say nothing, and the
+    # callers already treat a short background as "no finding".
+    return sorted(samples)
 
 
 def _numeric_stump(

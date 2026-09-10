@@ -117,6 +117,19 @@ DAY_FILTERS = (
     DayFilter("weekends", (5, 6)),
 )
 
+#: How much better a day-restricted hypothesis has to look than "every day"
+#: before it is believed.
+#:
+#: Three correlated hypotheses are tried per habit and the best is reported as
+#: though it had been the only one.  On a process with no day dependence at all
+#: that roughly doubles the rate at which ``min_consistency`` is cleared - and
+#: the winner is then shown to the user as the specific claim "this happens at
+#: weekends", which is a stronger thing to say than the evidence supports.
+#: Restricting the days can only ever raise consistency (fewer opportunities,
+#: the same hits), so a small edge is what noise produces; a real weekend habit
+#: clears this comfortably.
+DAY_RESTRICTION_MARGIN = 0.15
+
 
 def _eligible_days(start_ts: float, end_ts: float, weekdays: Sequence[int], tz) -> int:
     """Count calendar days in the window matching *weekdays*."""
@@ -211,15 +224,25 @@ def mine(
             subset = [r for r in rows if dt.datetime.fromtimestamp(r.ts, tz).weekday() in day_filter.weekdays]
             if len(subset) < options.min_occurrences:
                 continue
-            minutes = [minute_of_day(r.ts, tz) for r in subset]
+            # One occurrence per calendar day *before* choosing the centre.
+            # Clustering the raw events let a single evening of repeated
+            # fiddling with a dimmer pull the chosen time towards itself, while
+            # contributing exactly 1 to the consistency computed from it.
+            first_per_day: dict[dt.date, StateChange] = {}
+            for row in subset:
+                key = day_key(row.ts, tz)
+                if key not in first_per_day or row.ts < first_per_day[key].ts:
+                    first_per_day[key] = row
+            daily = sorted(first_per_day.values(), key=lambda r: r.ts)
+            if len(daily) < options.min_occurrences:
+                continue
+            minutes = [minute_of_day(r.ts, tz) for r in daily]
             cluster = _best_cluster(minutes, options.time_cluster_minutes)
             if cluster is None:
                 continue
             centre, _members = cluster
-            # Keep at most one occurrence per calendar day: a habit is
-            # "happens on this day", not "happened five times that evening".
             per_day: dict[dt.date, StateChange] = {}
-            for row in subset:
+            for row in daily:
                 if circular_distance(minute_of_day(row.ts, tz), centre) > options.time_cluster_minutes:
                     continue
                 key = day_key(row.ts, tz)
@@ -232,12 +255,16 @@ def mine(
             if opportunities <= 0:
                 continue
             consistency = min(len(hits) / opportunities, 1.0)
-            if best is None or consistency > best[0]:
-                best = (consistency, day_filter, centre, hits, opportunities)
+            # "all days" is the hypothesis we did not go looking for, so it is
+            # believed on its own consistency.  The two restricted ones have to
+            # beat it by a margin, not merely edge it out.
+            required = consistency if day_filter.key == "all" else consistency - DAY_RESTRICTION_MARGIN
+            if best is None or required > best[0]:
+                best = (required, day_filter, centre, hits, opportunities, consistency)
 
         if best is None:
             continue
-        consistency, day_filter, centre, hits, opportunities = best
+        _adjusted, day_filter, centre, hits, opportunities, consistency = best
         if consistency < options.min_consistency:
             continue
 

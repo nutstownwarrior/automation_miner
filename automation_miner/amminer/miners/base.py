@@ -157,7 +157,20 @@ class Action:
 
 @dataclass
 class Evidence:
-    """Why we believe a candidate is real."""
+    """Why we believe a candidate is real.
+
+    One warning about these numbers.  ``confidence`` and ``consistency`` are
+    conditional probabilities, but of different conditions depending on which
+    miner filled them in: P(consequent | antecedent) for association rules,
+    P(the routine follows | the trigger happened) for sequences, hits over
+    eligible days for time-of-day habits, purity for conditional rules, and
+    recall for motifs.  They are all "how often was this right, out of the times
+    it could have been", which is why one field carries them - but they are not
+    interchangeable across miners, and ranking two candidates from different
+    miners by ``confidence`` alone compares different quantities.  The backtest
+    is what makes candidates comparable, because it measures all of them the
+    same way; use its precision and recall for that, not these.
+    """
 
     occurrences: int = 0
     opportunities: int = 0

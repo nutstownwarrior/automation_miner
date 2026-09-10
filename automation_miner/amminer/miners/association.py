@@ -195,7 +195,17 @@ def _rules_from_transactions(
         return []
     try:
         rules = association_rules(frequent, **_rules_kwargs(options, len(transactions)))
-    except (ValueError, KeyError, TypeError):
+    except (ValueError, KeyError, TypeError) as err:
+        # Silently returning [] here made "mlxtend raised" indistinguishable
+        # from "there were no patterns" - an operator saw 0 candidates and had
+        # nothing to go on.  The ImportError path two lines up logs; so does
+        # this one.
+        _LOGGER.warning(
+            "association_rules failed (%s: %s); the association miner produced nothing "
+            "this run",
+            type(err).__name__,
+            err,
+        )
         return []
     if rules.empty:
         return []

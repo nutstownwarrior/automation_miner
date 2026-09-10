@@ -151,7 +151,16 @@ def find_motifs(series: SignalSeries, window_size: int = 12, max_motifs: int = 3
             if np.isfinite(distances[i])
         ]
     except Exception as err:  # noqa: BLE001 - stumpy is optional, never fatal
-        _LOGGER.debug("stumpy motif discovery failed for %s: %s", series.entity_id, err)
+        # At debug level a genuine bug in this path is invisible in production;
+        # a warning costs nothing, because it can only fire once per series and
+        # the caller degrades cleanly either way.
+        _LOGGER.warning(
+            "Matrix-profile search failed for %s (%s: %s); falling back to "
+            "threshold-crossing search",
+            series.entity_id,
+            type(err).__name__,
+            err,
+        )
         return []
 
 
@@ -232,7 +241,14 @@ def mine(
                         f"{best.precision:.0%} (crossings that led to an action).",
                         f"{best.false_crossings} crossings did not lead to an action.",
                         (
-                            "Matrix-profile motifs confirmed a repeating shape in the signal."
+                            # find_motifs runs over the whole raw series and
+                            # knows nothing about the threshold or the actions
+                            # this rule is built from, so "confirmed" was a
+                            # claim about a computation that never looked at
+                            # the rule.  The recall and precision above are
+                            # what the rule actually rests on.
+                            f"Matrix profile also found {len(motifs)} repeating shape(s) "
+                            "elsewhere in this signal; the rule above does not depend on them."
                             if motifs
                             else "stumpy is not installed; used deterministic threshold-crossing "
                             "search instead (same rule shape, no matrix profile)."
