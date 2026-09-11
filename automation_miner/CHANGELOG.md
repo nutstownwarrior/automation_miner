@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.4.0
+
+**Fixed: the audit read triggers and targets, and claimed to have read conditions**
+
+`audit_existing` compared two automations by their trigger entities, their
+trigger times and the entities they act on. It never looked at conditions — yet
+both of its messages ended "under overlapping conditions", asserting something
+nothing had checked.
+
+Conditions are how people say *this one is for when I am out, that one for when
+I am in*. Ignoring them meant complementary automations were reported as
+conflicts:
+
+- "turn the light off when motion, **if nobody is home**" against "turn it on
+  when motion, **if somebody is home**" was an **error**-severity value
+  inconsistency, though the two can never both apply;
+- "turn the hall light on **below 20 lux**" against "**above 500 lux**" was
+  reported as redundancy.
+
+The new `amminer.conditions` module decides the part of this that is decidable:
+whether two condition sets can *provably* never both hold. Opposite required
+states, disjoint numeric ranges, disjoint weekday sets, non-overlapping time
+windows (including ones crossing midnight), and sun-up against sun-down are all
+proven exclusive, and a pair proven exclusive is no longer reported at all. The
+same blind spot existed when checking a mined candidate against an existing
+automation, and is fixed there too.
+
+Where exclusivity **cannot** be proven — two rules conditioned on different
+entities, or on a template — the finding is still reported, but honestly: as a
+warning rather than an error, reading "their conditions differ, so they may
+never both apply". "I cannot prove these are exclusive" is not the same claim as
+"these overlap", and the audit no longer conflates them. Rules with identical or
+no conditions still read "under overlapping conditions", because there it is
+true.
+
+**Added: `llm_audit` (default off)**
+
+For the findings that remain genuinely ambiguous, the model is shown both rules
+in full — triggers, conditions and actions — and asked one question: in a real
+home, can these two ever actually apply at once?
+
+It is given no authority. It may **dismiss** a finding, which hides it with its
+reasoning recorded, or **soften** one from error to warning. It may never raise
+a severity and never invent a finding: a warning the deterministic audit did not
+produce is never shown, whatever the model returns. A finding it does not
+mention is untouched, an unusable verdict is counted and ignored, and a provider
+outage leaves every finding exactly as it was.
+
+The run report keeps the finding count from before and after the review, so a
+model quietly dismissing real conflicts shows up on the Status page rather than
+disappearing.
+
 ## 0.3.0
 
 **Added: you no longer have to go and look**

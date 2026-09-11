@@ -365,3 +365,90 @@ def test_redundancy_still_needs_positive_evidence_of_overlap():
     })
     conflicts = check_candidate(_candidate_on(), [existing], DeviceGraph())
     assert [c.kind for c in conflicts] == []
+
+
+# --- the audit must read conditions -------------------------------------
+def _rule(alias, condition, service, entity_id="light.kitchen", trigger_entity="binary_sensor.motion"):
+    return normalise_automation({
+        "id": alias,
+        "alias": alias,
+        "trigger": [{"platform": "state", "entity_id": trigger_entity, "to": "on"}],
+        "condition": [condition] if condition else [],
+        "action": [{"service": service, "target": {"entity_id": entity_id}}],
+    })
+
+
+AWAY = {"condition": "state", "entity_id": "person.alex", "state": "not_home"}
+HOME = {"condition": "state", "entity_id": "person.alex", "state": "home"}
+DARK = {"condition": "numeric_state", "entity_id": "sensor.lux", "below": 20}
+GLARE = {"condition": "numeric_state", "entity_id": "sensor.lux", "above": 500}
+
+
+def test_complementary_automations_are_not_a_conflict():
+    """The reported bug: same trigger, same entity, opposite conditions."""
+    findings = audit_existing([
+        _rule("Away mode", AWAY, "light.turn_off"),
+        _rule("Home mode", HOME, "light.turn_on"),
+    ])
+    assert findings == [], [f["message"] for f in findings]
+
+
+def test_two_rules_for_different_light_levels_are_not_redundant():
+    findings = audit_existing([
+        _rule("When dark", DARK, "light.turn_on"),
+        _rule("When glare", GLARE, "light.turn_on"),
+    ])
+    assert findings == [], [f["message"] for f in findings]
+
+
+def test_a_genuine_conflict_is_still_an_error():
+    """Same condition, opposite states: they really do fight."""
+    findings = audit_existing([
+        _rule("Home mode", HOME, "light.turn_on"),
+        _rule("Also home", HOME, "light.turn_off"),
+    ])
+    assert [f["kind"] for f in findings] == ["value_inconsistency"]
+    assert findings[0]["severity"] == "error"
+    assert "under overlapping conditions" in findings[0]["message"]
+
+
+def test_conditionless_rules_that_fight_are_still_an_error():
+    findings = audit_existing([
+        _rule("On", None, "light.turn_on"),
+        _rule("Off", None, "light.turn_off"),
+    ])
+    assert findings and findings[0]["severity"] == "error"
+
+
+def test_unprovable_overlap_is_reported_but_not_asserted():
+    """Different entities: it may be a real conflict, and we cannot claim it is."""
+    findings = audit_existing([
+        _rule("Away mode", AWAY, "light.turn_off"),
+        _rule("When dark", DARK, "light.turn_on"),
+    ])
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding["severity"] == "warning", "an unproven overlap is not an error"
+    assert "may never both apply" in finding["message"]
+    assert "under overlapping conditions" not in finding["message"]
+
+
+def test_a_candidate_is_not_flagged_against_an_exclusive_rule():
+    """The same blind spot existed on the candidate-vs-existing path."""
+    from amminer.miners.base import Condition
+
+    candidate = Candidate(
+        miner="test",
+        title="turn it on when home",
+        triggers=[Trigger(kind="state", entity_id="binary_sensor.motion", to_state="on")],
+        conditions=[Condition(kind="state", entity_id="person.alex", state="home")],
+        actions=[Action(service="light.turn_on", entity_id="light.kitchen")],
+    )
+    existing = _rule("Away mode", AWAY, "light.turn_off")
+    assert check_candidate(candidate, [existing], DeviceGraph()) == []
+
+    # ... and is still flagged against one that can coincide with it.
+    clashing = _rule("Also home", HOME, "light.turn_off")
+    assert [c.kind for c in check_candidate(candidate, [clashing], DeviceGraph())] == [
+        "value_inconsistency"
+    ]

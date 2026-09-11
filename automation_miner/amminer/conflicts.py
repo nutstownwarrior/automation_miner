@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .automations import ExistingAutomation
+from .conditions import provably_exclusive
 from .miners.base import Candidate
 from .util.timeutil import MINUTES_PER_DAY, circular_distance
 
@@ -174,6 +175,13 @@ def _triggers_overlap(
     22:00, off" and "when motion stops, on" never share a trigger and never
     share a clock time, and they still fight over the same lamp every evening.
     """
+    # A mined candidate carries conditions too, and the same rule applies: two
+    # rules whose conditions cannot both hold never fire in the same situation.
+    if provably_exclusive(
+        candidate.conditions,
+        automation.raw.get("condition") or automation.raw.get("conditions"),
+    ):
+        return False
     shared_entities = set(candidate.trigger_entities) & set(automation.trigger_entities)
     if shared_entities:
         return True
@@ -445,6 +453,13 @@ def has_blocking_conflict(candidate: Candidate) -> bool:
     return any(conflict.get("severity") == "error" for conflict in candidate.conflicts)
 
 
+def _condition_signature(conditions: Any) -> str:
+    """A stable rendering, so "the same conditions" is decidable."""
+    from .conditions import describe
+
+    return describe(conditions)
+
+
 def audit_existing(
     automations: Sequence[ExistingAutomation], resolver=None
 ) -> list[dict[str, Any]]:
@@ -470,6 +485,22 @@ def audit_existing(
             )
             if not (shared_triggers or shared_time):
                 continue
+            # Sharing a trigger is not sharing a situation.  Conditions are how
+            # people say "this one is for when I am out, that one for when I am
+            # in", and two rules whose conditions cannot both hold never collide
+            # however much else they have in common.
+            first_conditions = first.raw.get("condition") or first.raw.get("conditions")
+            second_conditions = second.raw.get("condition") or second.raw.get("conditions")
+            if provably_exclusive(first_conditions, second_conditions):
+                continue
+            differ = _condition_signature(first_conditions) != _condition_signature(
+                second_conditions
+            )
+            qualifier = (
+                "their conditions differ, so they may never both apply"
+                if differ
+                else "under overlapping conditions"
+            )
             for entity_a, state_a in first.targets():
                 for entity_b, state_b in second.targets():
                     if entity_a != entity_b:
@@ -480,11 +511,12 @@ def audit_existing(
                         findings.append(
                             {
                                 "kind": "value_inconsistency",
-                                "severity": "error",
+                                # Only an error when they really do coincide;
+                                # unproven overlap is a question, not a verdict.
+                                "severity": "warning" if differ else "error",
                                 "message": (
                                     f"'{first.alias}' sets {entity_a} to '{state_a}' while "
-                                    f"'{second.alias}' sets it to '{state_b}' under overlapping "
-                                    "conditions."
+                                    f"'{second.alias}' sets it to '{state_b}' - {qualifier}."
                                 ),
                                 "automations": [first.alias, second.alias],
                                 "entities": [entity_a],
@@ -497,7 +529,7 @@ def audit_existing(
                                 "severity": "info",
                                 "message": (
                                     f"'{first.alias}' and '{second.alias}' both set {entity_a} "
-                                    f"to '{state_a}' under overlapping conditions."
+                                    f"to '{state_a}' - {qualifier}."
                                 ),
                                 "automations": [first.alias, second.alias],
                                 "entities": [entity_a],

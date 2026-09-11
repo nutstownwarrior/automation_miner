@@ -29,6 +29,7 @@ from .enrich.detect import detect_signals
 from .enrich.signals import SignalStore, build_signal_store
 from .entities import build_resolver
 from .ha_api import HAClient
+from .llm import audit as llm_audit
 from .llm import classify as llm_classify
 from .llm import hypothesis as llm_hypothesis
 from .llm import triage as llm_triage
@@ -557,11 +558,24 @@ def run_analysis(
         report.gaps = run_stage("gap analysis", _suggest_gaps) or 0
 
         def _write_audit() -> bool:
+            findings = conflict_checks.audit_existing(existing, resolver)
+            # Advisory only, and after the deterministic audit: the model can
+            # hide or soften a finding, never add one.  report.ai keeps the
+            # original count, so a model quietly dismissing real conflicts
+            # shows up on the Status page rather than disappearing.
+            if provider is not None and options.llm_audit and findings:
+                verdicts = run_ai(
+                    "audit_review", llm_audit.review, findings, existing, provider
+                )
+                if verdicts is not None:
+                    before = len(findings)
+                    findings = llm_audit.apply_verdicts(findings, verdicts)
+                    report.ai["audit_review"].update(
+                        {**verdicts.as_dict(), "findings_before": before,
+                         "findings_after": len(findings)}
+                    )
             store.set_meta("last_audit", str(int(time.time())))
-            store.set_meta(
-                "existing_automation_audit",
-                json.dumps(conflict_checks.audit_existing(existing, resolver)),
-            )
+            store.set_meta("existing_automation_audit", json.dumps(findings))
             return True
 
         run_stage("automation audit", _write_audit)
