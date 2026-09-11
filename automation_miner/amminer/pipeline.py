@@ -19,6 +19,7 @@ from typing import Any
 from . import backtest as backtest_module
 from . import conflicts as conflict_checks
 from . import gaps as gap_analysis
+from . import notify as notifier
 from .automations import load_existing_automations
 from .backtest import backtest_all
 from .config import Options
@@ -71,6 +72,8 @@ class RunReport:
     rejected: int = 0
     conflicted: int = 0
     gaps: int = 0
+    #: What was announced to Home Assistant about this run's new suggestions.
+    notified: dict[str, Any] = field(default_factory=dict)
     #: Would-be fires recorded for suggestions the user asked to shadow-test.
     shadow_fires: int = 0
     degradations: list[str] = field(default_factory=list)
@@ -98,6 +101,7 @@ class RunReport:
             "rejected": self.rejected,
             "conflicted": self.conflicted,
             "gaps": self.gaps,
+            "notified": self.notified,
             "shadow_fires": self.shadow_fires,
             "degradations": self.degradations,
             "state_rows": self.state_rows,
@@ -561,6 +565,17 @@ def run_analysis(
             return True
 
         run_stage("automation audit", _write_audit)
+
+        # Last, and deliberately so: it can only announce suggestions that are
+        # already persisted and readable.
+        report.notified = run_stage(
+            "notification", notifier.announce, store, client, options, run_id
+        ) or {}
+        if report.notified.get("error"):
+            report.degradations.append(
+                f"Could not tell Home Assistant about new suggestions: "
+                f"{report.notified['error']}"
+            )
 
         # A run where some miners failed still produced results, but saying it
         # was plain "ok" would hide that from the user.

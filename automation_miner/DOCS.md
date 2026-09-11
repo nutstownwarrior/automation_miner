@@ -121,6 +121,25 @@ Unwanted fires allowed at moments where you have previously reached over and
 undone an automation on the same entity. These are not merely unnecessary - they
 land exactly where you have already said no - so the default is `0`.
 
+### `notify_on_new_suggestions`
+On by default. Posts a notification in Home Assistant when a run finds something
+new, listing the first few and linking back here.
+
+Only *new* suggestions are announced. Every run re-surfaces the rules that still
+hold, so announcing all of them would repeat the same list nightly; a suggestion
+you have dismissed is never announced again. Each run replaces its own previous
+notification rather than adding another one.
+
+### `notify_service`
+Empty by default. A notify service to call as well, e.g.
+`notify.mobile_app_your_phone`, so new suggestions reach your phone without you
+writing an automation. Run **Developer Tools → Actions** and search for `notify.`
+to see what your instance offers.
+
+Notifying happens after everything is saved, and never at the run's expense: an
+unreachable Home Assistant or a service that does not exist costs you the
+message and nothing else. The Status page reports what was sent and what was not.
+
 ### `allow_security_actions`
 Off by default. While it is off, no suggestion whose action would unlock a door,
 open a cover or valve, or disarm an alarm is ever surfaced, no matter how strong

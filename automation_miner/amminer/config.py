@@ -151,6 +151,15 @@ class Options:
     #: by default: these are security decisions, not conveniences.
     allow_security_actions: bool = False
 
+    # --- being told ---
+    #: Post a notification in Home Assistant when a run finds something new.
+    #: On by default: suggestions live in this add-on's own database, so
+    #: without it nothing outside the ingress page knows a run happened.
+    notify_on_new_suggestions: bool = True
+    #: A notify service to call as well, e.g. "notify.mobile_app_your_phone".
+    #: Empty means only the notification above.
+    notify_service: str = ""
+
     # --- staleness ---
     stale_automation_days: int = 30
 
@@ -213,6 +222,7 @@ class Options:
         self.association_window_seconds = max(int(self.association_window_seconds), 1)
         self.stale_automation_days = max(int(self.stale_automation_days), 1)
         self.llm_timeout_seconds = max(int(self.llm_timeout_seconds), 1)
+        self.notify_service = (self.notify_service or "").strip()
         self.min_occurrences = max(int(self.min_occurrences), 2)
         self.llm_triage_penalty = min(max(float(self.llm_triage_penalty), 0.0), 1.0)
         self.llm_classification_batch = max(int(self.llm_classification_batch), 5)

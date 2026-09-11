@@ -1,6 +1,6 @@
 ---
 name: Automation Miner
-version: "0.2.1"
+version: "0.3.0"
 slug: automation_miner
 description: >-
   Mines your Home Assistant history for genuinely useful, explainable automation
@@ -41,6 +41,8 @@ options:
   backtest_max_false_fires_per_week: 3
   backtest_max_nuisance_fires: 0
   allow_security_actions: false
+  notify_on_new_suggestions: true
+  notify_service: ""
   excluded_domains: []
   excluded_entities: []
   excluded_users: []
@@ -70,6 +72,8 @@ schema:
   backtest_max_false_fires_per_week: float(0.0,1000.0)?
   backtest_max_nuisance_fires: int(0,1000)?
   allow_security_actions: bool?
+  notify_on_new_suggestions: bool?
+  notify_service: str?
   excluded_domains:
     - str?
   excluded_entities:
