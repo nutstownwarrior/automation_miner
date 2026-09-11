@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 from amminer.config import Options
 from amminer.discovery.ha_config import HAConfig
 from amminer.runner import Runner, candidate_from_payload
 from amminer.web.app import create_app
 from fastapi.testclient import TestClient
+from markupsafe import escape
 
 
 @pytest.fixture
@@ -300,3 +303,385 @@ def test_restore_is_not_undone_by_the_next_run(wired):
 def test_restoring_an_unknown_suggestion_is_404(wired):
     client, _store, _runner, _ha = wired
     assert client.post("/api/suggestions/nope/restore").status_code == 404
+
+
+# --- what the optional AI features put on screen ------------------------
+def test_a_hidden_suggestion_is_shown_with_the_rule_that_hid_it(wired):
+    """Hiding something without saying so is not something this add-on does."""
+    from amminer.store import STATUS_SUPPRESSED
+
+    client, store, _runner, _ha = wired
+    store.save_preferences([
+        {"id": "pguest", "rule": "Never automate the guest room.", "evidence": ["d1", "d2"]}
+    ])
+    suggestion = store.list_suggestions(status="new")[0]
+    payload = dict(suggestion["payload"])
+    payload["extra"] = {
+        "suppressed_by": {"preference": "pguest", "rule": "Never automate the guest room.",
+                          "reason": "This is the guest room."}
+    }
+    store.upsert_suggestion(
+        suggestion["id"], suggestion["miner"], suggestion["title"], suggestion["summary"],
+        suggestion["score"], payload,
+    )
+    store.set_status(suggestion["id"], STATUS_SUPPRESSED)
+
+    title = str(escape(suggestion["title"]))
+    page = client.get("/dismissed").text
+    assert "Hidden by a preference" in page
+    assert "Never automate the guest room." in page
+    assert title in page
+    # And it is not on the suggestions page it was hidden from.
+    assert title not in client.get("/").text
+
+
+def test_switching_a_preference_off_restores_what_it_hid(wired):
+    from amminer.store import STATUS_NEW, STATUS_SUPPRESSED
+
+    client, store, _runner, _ha = wired
+    store.save_preferences([{"id": "pguest", "rule": "No guest room.", "evidence": ["d1"]}])
+    suggestion = store.list_suggestions(status="new")[0]
+    payload = dict(suggestion["payload"])
+    payload["extra"] = {"suppressed_by": {"preference": "pguest", "rule": "No guest room."}}
+    store.upsert_suggestion(
+        suggestion["id"], suggestion["miner"], suggestion["title"], suggestion["summary"],
+        suggestion["score"], payload,
+    )
+    store.set_status(suggestion["id"], STATUS_SUPPRESSED)
+
+    assert client.post("/api/preferences/pguest/off").status_code == 200
+    assert store.get_suggestion(suggestion["id"])["status"] == STATUS_NEW
+    assert store.list_preferences() == []
+
+
+def test_switching_off_an_unknown_preference_is_404(wired):
+    client, _store, _runner, _ha = wired
+    assert client.post("/api/preferences/nope/off").status_code == 404
+
+
+def test_a_plain_language_explanation_is_rendered(wired):
+    client, store, _runner, _ha = wired
+    suggestion = store.list_suggestions(status="new")[0]
+    payload = dict(suggestion["payload"])
+    payload["extra"] = {"explanation": "You did this on 30 of the 34 weekday mornings."}
+    store.upsert_suggestion(
+        suggestion["id"], suggestion["miner"], suggestion["title"], suggestion["summary"],
+        suggestion["score"], payload,
+    )
+    page = client.get("/").text
+    assert "You did this on 30 of the 34 weekday mornings." in page
+    # The figures it paraphrases are still there underneath.
+    assert "Evidence:" in page
+
+
+def test_a_scene_card_says_it_was_measured_as_one_rule(wired):
+    client, store, _runner, _ha = wired
+    suggestion = store.list_suggestions(status="new")[0]
+    payload = dict(suggestion["payload"])
+    payload["extra"] = {"scene": {"name": "Bedtime", "reason": "The house shuts down.",
+                                  "members": ["a", "b"],
+                                  "member_titles": ["Kitchen off", "Hall off"]}}
+    store.upsert_suggestion(
+        suggestion["id"], suggestion["miner"], suggestion["title"], suggestion["summary"],
+        suggestion["score"], payload,
+    )
+    page = client.get("/").text
+    assert "backtested as a single rule" in page
+    assert "Kitchen off" in page
+
+
+def test_the_preferences_panel_is_editable(wired):
+    """A guess about what someone meant has to be correctable in the UI."""
+    client, store, _runner, _ha = wired
+    store.save_preferences([
+        {"id": "pguest", "rule": "Never automate the guest room.", "evidence": ["d1", "d2"]}
+    ])
+    page = client.get("/dismissed").text
+    assert 'value="Never automate the guest room."' in page
+    assert 'data-action="preference-save"' in page
+    assert 'data-action="preference-delete"' in page
+    assert 'data-action="preference-add"' in page
+
+
+def test_editing_a_preference_through_the_ui_sticks(wired):
+    client, store, _runner, _ha = wired
+    store.save_preferences([{"id": "pguest", "rule": "Wrong.", "evidence": ["d1", "d2"]}])
+
+    response = client.post("/api/preferences/pguest", json={"rule": "Right, actually."})
+    assert response.status_code == 200
+    assert store.list_preferences()[0]["rule"] == "Right, actually."
+    # And the next run cannot put the model's wording back.
+    store.save_preferences([{"id": "pguest", "rule": "Wrong.", "evidence": ["d1", "d2"]}])
+    assert store.list_preferences()[0]["rule"] == "Right, actually."
+
+
+def test_editing_a_preference_to_nothing_is_refused(wired):
+    client, store, _runner, _ha = wired
+    store.save_preferences([{"id": "pguest", "rule": "A rule.", "evidence": ["d1"]}])
+    assert client.post("/api/preferences/pguest", json={"rule": "  "}).status_code == 400
+    assert store.list_preferences()[0]["rule"] == "A rule."
+
+
+def test_editing_an_unknown_preference_is_404(wired):
+    client, _store, _runner, _ha = wired
+    assert client.post("/api/preferences/nope", json={"rule": "x"}).status_code == 404
+
+
+def test_deleting_and_re_enabling_a_preference(wired):
+    client, store, _runner, _ha = wired
+    store.save_preferences([{"id": "pguest", "rule": "A rule.", "evidence": ["d1"]}])
+
+    assert client.post("/api/preferences/pguest/off").status_code == 200
+    assert store.list_preferences() == []
+    assert client.post("/api/preferences/pguest/on").status_code == 200
+    assert len(store.list_preferences()) == 1
+    deleted = client.post("/api/preferences/pguest/delete")
+    assert deleted.status_code == 200
+    # A preference that hid nothing still deletes: 0 restored is not "not found".
+    assert deleted.json()["restored"] == 0
+    assert store.list_preferences(active_only=False) == []
+    assert client.post("/api/preferences/pguest/delete").status_code == 404
+
+
+def test_a_preference_can_be_written_by_hand(wired):
+    client, store, _runner, _ha = wired
+    response = client.post("/api/preferences", json={"rule": "Nothing in the bathroom."})
+    assert response.status_code == 200
+    assert response.json()["preference"]["source"] == "user"
+    assert client.post("/api/preferences", json={"rule": ""}).status_code == 400
+
+
+# --- wording help, which proposes and never writes -----------------------
+def _drafting_app(ha_config_dir, store, fake_client, monkeypatch, reply=None,
+                  raises=False, delay=0.0):
+    """The archive page with the wording helper on and a stub model behind it."""
+    import amminer.web.app as web_app
+    from amminer.llm.provider import LLMError, NullProvider
+
+    class StubLLM(NullProvider):
+        name, enabled = "stub", True
+
+        def complete_json(self, system, user):
+            if delay:
+                time.sleep(delay)
+            if raises:
+                raise LLMError("stub is down")
+            return reply if reply is not None else {}
+
+    monkeypatch.setattr(web_app, "build_provider", lambda _options: StubLLM())
+    options = Options(
+        ha_config_dir=str(ha_config_dir), state_dir=str(ha_config_dir),
+        llm_provider="ollama", llm_preferences=True,
+    )
+    runner = Runner(options, store, fake_client)
+    runner.ha_config = HAConfig(ha_config_dir)
+    return create_app(options, store, runner=runner, client=fake_client, ingress_only=False)
+
+
+def _with_drafting(ha_config_dir, store, fake_client, monkeypatch, **kwargs):
+    app = _drafting_app(ha_config_dir, store, fake_client, monkeypatch, **kwargs)
+    return TestClient(app), app
+
+
+def test_the_wording_helper_proposes_and_stores_nothing(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    client, _app = _with_drafting(
+        ha_config_dir, store, fake_client, monkeypatch,
+        reply={"rule": "Do not suggest anything for the guest room lamp."},
+    )
+    store.save_preferences([{"id": "pg", "rule": "Never automate the guest room.",
+                             "evidence": ["d1", "d2"]}])
+
+    response = client.post("/api/preferences/draft", json={
+        "preference": "pg", "instruction": "only the lamp, not the whole room",
+    })
+    assert response.status_code == 200
+    assert response.json()["rule"] == "Do not suggest anything for the guest room lamp."
+    assert response.json()["saved"] is False
+    # The stored rule is untouched until a person presses Save.
+    assert store.list_preferences()[0]["rule"] == "Never automate the guest room."
+
+    client.post("/api/preferences/pg", json={"rule": response.json()["rule"]})
+    assert store.list_preferences()[0]["rule"] == (
+        "Do not suggest anything for the guest room lamp."
+    )
+    assert store.list_preferences()[0]["edited"] == 1
+
+
+def test_the_wording_helper_has_its_own_path_not_the_edit_one(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    """`/preferences/draft` must not be read as editing a preference called 'draft'."""
+    client, _app = _with_drafting(
+        ha_config_dir, store, fake_client, monkeypatch, reply={"rule": "A worded rule."},
+    )
+    assert client.post(
+        "/api/preferences/draft", json={"instruction": "nothing in the bathroom"}
+    ).status_code == 200
+    assert store.list_preferences(active_only=False) == []
+
+
+def test_the_wording_helper_needs_the_feature_switched_on(wired):
+    client, store, _runner, _ha = wired
+    response = client.post("/api/preferences/draft", json={"instruction": "narrow it"})
+    assert response.status_code == 503
+    assert "llm_preferences" in response.json()["detail"]
+
+
+def test_a_draft_for_an_unknown_preference_is_404(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    client, _app = _with_drafting(
+        ha_config_dir, store, fake_client, monkeypatch, reply={"rule": "x"},
+    )
+    assert client.post(
+        "/api/preferences/draft", json={"preference": "nope", "instruction": "narrow it"}
+    ).status_code == 404
+
+
+def test_a_model_that_is_down_does_not_change_a_preference(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    client, _app = _with_drafting(ha_config_dir, store, fake_client, monkeypatch, raises=True)
+    store.save_preferences([{"id": "pg", "rule": "A rule.", "evidence": ["d1"]}])
+    response = client.post(
+        "/api/preferences/draft", json={"preference": "pg", "instruction": "narrow it"}
+    )
+    assert response.status_code == 503
+    assert store.list_preferences()[0]["rule"] == "A rule."
+
+
+def test_something_that_is_not_a_preference_is_refused(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    client, _app = _with_drafting(
+        ha_config_dir, store, fake_client, monkeypatch, reply={"rule": ""}
+    )
+    response = client.post(
+        "/api/preferences/draft", json={"instruction": "what is the weather"}
+    )
+    assert response.status_code == 422
+
+
+def test_a_slow_model_does_not_freeze_the_rest_of_the_ui(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    """The one handler here that is `async def` must not hold the event loop.
+
+    A provider call has a timeout measured in minutes. Awaiting it on the loop
+    would stall every other request behind it, /health included - which is what
+    the Supervisor watches to decide the add-on is alive.
+    """
+    import asyncio
+
+    app = _drafting_app(
+        ha_config_dir, store, fake_client, monkeypatch,
+        reply={"rule": "A worded rule."}, delay=1.0,
+    )
+
+    async def call(method: str, path: str, body: bytes = b""):
+        sent: list[dict] = []
+        scope = {
+            "type": "http", "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": "1.1", "method": method, "scheme": "http",
+            "path": path, "raw_path": path.encode(), "query_string": b"",
+            "root_path": "", "client": ("172.30.32.2", 5000),
+            "server": ("testserver", 80),
+            "headers": [(b"host", b"testserver"), (b"content-type", b"application/json")],
+        }
+
+        async def receive():
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        async def send(message):
+            sent.append(message)
+
+        await app(scope, receive, send)
+        status = next(m["status"] for m in sent if m["type"] == "http.response.start")
+        return status
+
+    async def both():
+        # Timed from before the slow request is scheduled, not from the health
+        # call: a handler that blocks the loop runs to completion first, so the
+        # health call itself would look fast while the whole UI had stalled.
+        started = time.monotonic()
+        slow = asyncio.create_task(
+            call("POST", "/api/preferences/draft", b'{"instruction": "narrow it"}')
+        )
+        await asyncio.sleep(0.1)  # let the slow request reach the provider
+        health = await call("GET", "/api/health")
+        elapsed = time.monotonic() - started
+        answered_while_waiting = not slow.done()
+        return health, elapsed, answered_while_waiting, await slow
+
+    health_status, elapsed, answered_while_waiting, draft_status = asyncio.run(both())
+    assert (health_status, draft_status) == (200, 200)
+    assert answered_while_waiting, "/health only answered once the model call had finished"
+    assert elapsed < 0.5, f"/health waited {elapsed:.2f}s behind a model call"
+
+
+def test_building_the_provider_does_not_freeze_the_ui_either(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    """Constructing the provider is I/O too, and it was left on the event loop.
+
+    The Ollama provider probes several candidate hosts with synchronous HTTP at
+    a two-second timeout each while it is being built, so every click of the
+    wording helper stalled the whole UI for seconds whenever Ollama was simply
+    not running. The other timing test cannot see this: it replaces
+    `build_provider` outright, which is precisely the call that blocked.
+    """
+    import asyncio
+
+    import amminer.llm.provider as provider_mod
+
+    def slow_discovery(*args, **kwargs):
+        time.sleep(1.0)  # what probing unreachable hosts actually costs
+        return None, []
+
+    monkeypatch.setattr(provider_mod, "discover_ollama", slow_discovery)
+    options = Options(
+        ha_config_dir=str(ha_config_dir), state_dir=str(ha_config_dir),
+        llm_provider="ollama", llm_preferences=True,
+    )
+    runner = Runner(options, store, fake_client)
+    runner.ha_config = HAConfig(ha_config_dir)
+    app = create_app(options, store, runner=runner, client=fake_client, ingress_only=False)
+
+    async def call(method, path, body=b""):
+        sent = []
+        scope = {
+            "type": "http", "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": "1.1", "method": method, "scheme": "http",
+            "path": path, "raw_path": path.encode(), "query_string": b"",
+            "root_path": "", "client": ("172.30.32.2", 5000),
+            "server": ("testserver", 80),
+            "headers": [(b"host", b"testserver"), (b"content-type", b"application/json")],
+        }
+
+        async def receive():
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        async def send(message):
+            sent.append(message)
+
+        await app(scope, receive, send)
+        return next(m["status"] for m in sent if m["type"] == "http.response.start")
+
+    async def both():
+        started = time.monotonic()
+        slow = asyncio.create_task(
+            call("POST", "/api/preferences/draft", b'{"instruction": "narrow it"}')
+        )
+        await asyncio.sleep(0.1)
+        health = await call("GET", "/api/health")
+        elapsed = time.monotonic() - started
+        answered_while_waiting = not slow.done()
+        await slow
+        return health, elapsed, answered_while_waiting
+
+    health_status, elapsed, answered_while_waiting = asyncio.run(both())
+    assert health_status == 200
+    assert answered_while_waiting, "/health waited for the provider to be built"
+    assert elapsed < 0.5, f"/health waited {elapsed:.2f}s while a provider was built"

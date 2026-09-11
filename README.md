@@ -208,7 +208,7 @@ entity ids it is allowed to use, and nothing else.
 
 ### Optional AI assistance (all off by default)
 
-Three further features use the model for things statistics cannot do. Each is a
+Nine further features use the model for things statistics cannot do. Each is a
 separate switch, each defaults to **off**, and none of them can put a suggestion
 in front of you that has not passed the same deterministic gates as every other
 suggestion.
@@ -220,6 +220,10 @@ suggestion.
 | `llm_gaps` | Integrations or hardware the fixed detector rules have no case for, judged with world knowledge. | Remove or reword a detected gap, repeat one, cite an entity you do not have, or propose anything without naming the real-world precondition it depends on. |
 | `llm_audit` | For findings about your **existing** automations, judges whether a flagged pair is a real conflict — given both rules in full, conditions included. | Raise a severity or invent a finding. It can only hide or soften what the deterministic audit already produced, and the before/after counts are reported. |
 | `llm_triage` | Flags rules that are statistically real but semantically absurd — two things that merely happen at the same time of day. | Promote or hide anything. It can lower a score and attach a visible reason; the evidence and backtest stay exactly as they were. |
+| `llm_preferences` | Reads the reasons you typed when dismissing things and generalises them into standing preferences — "nothing in the guest room" — then hides new suggestions that match one. Every preference is listed on the Archive page as an editable field: rewrite it, switch it off, delete it, or write your own — by hand, or by telling the model what to change ("only the lamp, not the whole room"). | Hide anything without saying so, or keep a wording you have disagreed with. Every hidden suggestion is listed with the rule that hid it; a preference needs two of your own dismissals behind it; and once you rewrite one, the text is yours and no later run puts the model's version back. The wording helper writes nothing: it fills in the text box, and the rule is stored only when you press Save. It cannot promote or reorder anything, and it never overrules something you have already accepted, dismissed or shadow-tested. |
+| `llm_explain` | Rewrites the evidence line as one plain sentence: "you switched this on at about 06:30 on 30 of the 34 weekdays" instead of "consistency 88%, lift 2.00". | State a number the evidence does not support. A sentence containing one is dropped rather than corrected, and the original figures stay on the card underneath. |
+| `llm_scenes` | Proposes that several suggestions are really one routine — Bedtime, Leaving the house — and names it. | Inherit its parts' scores or replace them. The members must share a trigger the backtester would still credit each of their actions against, the consolidated rule is backtested as one rule from a score of zero, and the individual suggestions stay exactly where they were. |
+| `llm_areas` | Works out which room an entity is in when the registry does not say — `sensor.hue_motion_kitchen_2` is the kitchen. | Touch an area you assigned, invent a room you do not have, or present a guess as fact. It only sees entities with no area, may only answer with an area that already exists, and every inference is marked as a guess wherever it is shown. |
 
 `llm_hypotheses` is the one that changes what the tool can *find*: the built-in
 conditional miner only tests one signal at a time against a single threshold, so
@@ -228,7 +232,8 @@ supplies the guess, your history decides.
 
 Turning these on costs more calls than the YAML step: classification is one call
 per ~60 entities (cached), hypotheses one call per rejected rule, triage one per
-25 suggestions. The Status page reports exactly what each one did, including how
+25 suggestions, explanations one per 20, areas one per ~80 unplaced entities, and
+preferences and scenes one each per run. The Status page reports exactly what each one did, including how
 many invented entity ids were discarded.
 
 ### The validation gate

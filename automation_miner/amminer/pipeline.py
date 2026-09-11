@@ -29,10 +29,14 @@ from .enrich.detect import detect_signals
 from .enrich.signals import SignalStore, build_signal_store
 from .entities import build_resolver
 from .ha_api import HAClient
+from .llm import areas as llm_areas
 from .llm import audit as llm_audit
 from .llm import classify as llm_classify
+from .llm import explain as llm_explain
 from .llm import gaps as llm_gap_proposals
 from .llm import hypothesis as llm_hypothesis
+from .llm import preferences as llm_preferences
+from .llm import scenes as llm_scenes
 from .llm import triage as llm_triage
 from .llm.provider import build_provider
 from .miners import association, conditional, energy, motif, sequence, stale, time_of_day
@@ -78,6 +82,9 @@ class RunReport:
     notified: dict[str, Any] = field(default_factory=dict)
     #: Would-be fires recorded for suggestions the user asked to shadow-test.
     shadow_fires: int = 0
+    #: Suggestions hidden because they match a preference learned from the
+    #: reasons the user gave when dismissing things before.
+    suppressed: int = 0
     degradations: list[str] = field(default_factory=list)
     state_rows: int = 0
 
@@ -105,6 +112,7 @@ class RunReport:
             "gaps": self.gaps,
             "notified": self.notified,
             "shadow_fires": self.shadow_fires,
+            "suppressed": self.suppressed,
             "degradations": self.degradations,
             "state_rows": self.state_rows,
         }
@@ -315,7 +323,38 @@ def run_analysis(
             report.ai[name] = {"requested": True, "ran": True, **outcome.as_dict()}
             return outcome
 
+        def run_stage(name, func, *args):
+            """Run one post-mining stage in isolation.
+
+            Same contract as run_miner, for the parts of the run that come
+            after it: a failure costs that stage and is reported, rather than
+            discarding work that already succeeded.  ``None`` means it failed.
+            """
+            try:
+                return func(*args)
+            except Exception as err:  # noqa: BLE001 - one stage must not end the run
+                _LOGGER.exception("Stage %s failed: %s", name, err)
+                report.miner_errors[name] = f"{type(err).__name__}: {err}"
+                report.degradations.append(
+                    f"The {name} step failed ({type(err).__name__}: {err})."
+                )
+                return None
+
         # --- enrichment ----------------------------------------------
+        # Areas first: every description, prompt and card built below reads
+        # `area_name`, so an inference made afterwards would be invisible to
+        # everything that could have used it.
+        if provider is not None and options.llm_areas:
+            inferred = run_ai("area_inference", llm_areas.infer, resolver, provider)
+            if inferred is not None:
+                # Isolated like the model call itself: applying the result
+                # mutates the resolver every later step reads, and an exception
+                # here used to fall through to the outer handler - which ends
+                # the whole run before a single miner has been asked anything.
+                run_stage("applying area inferences", llm_areas.apply_inferences,
+                          resolver, inferred)
+                report.ai["area_inference"].update(inferred.as_dict())
+
         signals = detect_signals(resolver)
 
         if provider is not None and options.llm_entity_classification:
@@ -370,23 +409,6 @@ def run_analysis(
                     f"({type(err).__name__}: {err}). Other miners still ran."
                 )
                 return []
-
-        def run_stage(name, func, *args):
-            """Run one post-mining stage in isolation.
-
-            Same contract as run_miner, for the parts of the run that come
-            after it: a failure costs that stage and is reported, rather than
-            discarding work that already succeeded.  ``None`` means it failed.
-            """
-            try:
-                return func(*args)
-            except Exception as err:  # noqa: BLE001 - one stage must not end the run
-                _LOGGER.exception("Stage %s failed: %s", name, err)
-                report.miner_errors[name] = f"{type(err).__name__}: {err}"
-                report.degradations.append(
-                    f"The {name} step failed ({type(err).__name__}: {err})."
-                )
-                return None
 
         produced["time_of_day"] = run_miner(
             "time_of_day", time_of_day.mine, changes, options, window, resolver
@@ -480,7 +502,93 @@ def run_analysis(
                 report.ai["triage"].update(verdicts.as_dict())
                 passed.sort(key=lambda c: c.score, reverse=True)
 
-        report.surfaced = len(passed)
+        # --- AI scenes: propose a grouping, measure it as one rule -----
+        if provider is not None and options.llm_scenes and len(passed) >= 2:
+            grouped = run_ai(
+                "scenes",
+                llm_scenes.propose_and_verify,
+                passed,
+                changes,
+                full_store,
+                options,
+                window,
+                provider,
+                resolver,
+                overrides,
+            )
+            if grouped is not None and grouped.accepted:
+                # Added alongside its members, never instead of them: a scene is
+                # a proposal about several suggestions the user has already been
+                # shown, and it may not make any of them disappear.
+                run_stage("applying scenes", llm_scenes.apply_scenes, passed, grouped)
+                # A scene's id is a hash of its parts, so a dismissed grouping
+                # comes back identical every run.  Mined candidates are filtered
+                # against the dismissal list before backtesting; scenes are built
+                # afterwards, so they have to be filtered here or a dismissed
+                # scene keeps being counted as surfaced forever.
+                passed.extend(c for c in grouped.accepted if c.id not in dismissed)
+                passed.sort(key=lambda c: c.score, reverse=True)
+
+        # --- AI explanations: rendering only ---------------------------
+        if provider is not None and options.llm_explain and passed:
+            explained = run_ai("explanations", llm_explain.explain, passed, provider, resolver)
+            if explained is not None:
+                run_stage("applying explanations", llm_explain.apply_explanations,
+                          passed, explained)
+
+        # --- AI preferences: what the user has already said no to ------
+        suppressed_ids: set[str] = set()
+        if provider is not None and options.llm_preferences:
+            def _learn() -> tuple[list, str | None]:
+                found, why = llm_preferences.learn(
+                    store.dismissals_with_reasons(), provider
+                )
+                # Only a successful call may rewrite the stored set.  `learn`
+                # reports a provider that timed out the same way it reports
+                # "nothing to generalise" - an empty list - and
+                # `save_preferences` reads an empty list as "the model withdrew
+                # every preference".  Saving unconditionally therefore deleted
+                # every learned preference the user had, silently, on one bad
+                # night.
+                if why is None:
+                    store.save_preferences([p.as_dict() for p in found])
+                # Read back rather than using what the model just said: the
+                # stored row is the one the user can switch off, rewrite or
+                # delete, and it is that text - not the model's - that decides
+                # what gets hidden.  Preferences the user wrote by hand are in
+                # here too, and apply whether or not anything was learned.
+                return [
+                    llm_preferences.Preference.from_row(row)
+                    for row in store.list_preferences(active_only=True)
+                ], why
+
+            # Learning runs whether or not anything survived the backtest: the
+            # preference set is derived from dismissals, not from this run's
+            # candidates, and a quiet night should not stop it being refreshed.
+            usable, learn_error = run_stage("learning preferences", _learn) or ([], None)
+            matched = run_ai(
+                "preferences",
+                llm_preferences.apply_preferences,
+                passed,
+                usable,
+                provider,
+                resolver,
+            ) if passed else None
+            if learn_error and "preferences" in report.ai:
+                report.ai["preferences"]["learn_error"] = learn_error
+                report.degradations.append(
+                    "Standing preferences could not be refreshed this run "
+                    f"({learn_error}); the ones you already have were kept."
+                )
+            if matched is not None:
+                suppressed_ids = set(matched.suppressed)
+                for candidate in passed:
+                    hidden = matched.suppressed.get(candidate.id)
+                    if hidden:
+                        candidate.extra["suppressed_by"] = dict(hidden)
+        report.suppressed = len(suppressed_ids)
+
+        report.surfaced = len(passed) - len(suppressed_ids)
         report.rejected = len(rejected)
 
         # --- shadow mode -----------------------------------------------
@@ -525,6 +633,15 @@ def run_analysis(
                 )
                 if candidate.backtest:
                     store.save_backtest(candidate.id, candidate.backtest)
+                # Only a brand-new suggestion may be hidden, and only while the
+                # preference that hid it is still switched on.  Both conditions
+                # are checked inside the write rather than out here: this run
+                # decided what to hide from a snapshot taken minutes ago, and
+                # the user may have accepted the rule or switched the
+                # preference off since.
+                hidden_by = candidate.extra.get("suppressed_by") or {}
+                if hidden_by.get("preference"):
+                    store.suppress_if_active(candidate.id, hidden_by["preference"])
                 return True
 
             run_stage(f"saving {candidate.id}", _save)

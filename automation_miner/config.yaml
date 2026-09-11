@@ -1,6 +1,6 @@
 ---
 name: Automation Miner
-version: "0.5.0"
+version: "0.6.0"
 slug: automation_miner
 description: >-
   Mines your Home Assistant history for genuinely useful, explainable automation
@@ -55,6 +55,10 @@ options:
   llm_triage: false
   llm_audit: false
   llm_gaps: false
+  llm_preferences: false
+  llm_explain: false
+  llm_scenes: false
+  llm_areas: false
 schema:
   log_level: list(trace|debug|info|notice|warning|error|fatal)?
   schedule: str?
@@ -91,6 +95,10 @@ schema:
   llm_triage: bool?
   llm_audit: bool?
   llm_gaps: bool?
+  llm_preferences: bool?
+  llm_explain: bool?
+  llm_scenes: bool?
+  llm_areas: bool?
   llm_classification_batch: int(5,200)?
   llm_hypothesis_candidates: int(0,100)?
   llm_hypotheses_per_candidate: int(0,10)?

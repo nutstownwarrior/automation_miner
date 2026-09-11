@@ -15,6 +15,7 @@
   </header>
   <h2>{{ suggestion.title }}</h2>
   <p class="sentence lead">{{ p.sentence or suggestion.summary }}</p>
+  {{ m.explanation_block(p.extra) }}
 
   <section class="rule">
     <h4>The rule</h4>
@@ -29,6 +30,7 @@
   </section>
 
   {{ m.assist_block(p.extra) }}
+  {{ m.scene_block(p.extra) }}
   {{ m.backtest_block(p.backtest) }}
   {{ m.evidence_block(p.evidence) }}
   {{ m.conflict_block(p.conflicts) }}

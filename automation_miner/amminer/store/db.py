@@ -7,6 +7,7 @@ feedback, override history, backtests, shadow-mode logs and run metadata.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import sqlite3
@@ -24,6 +25,8 @@ STATUS_NEW = "new"
 STATUS_DISMISSED = "dismissed"
 STATUS_ACCEPTED = "accepted"
 STATUS_SHADOW = "shadow"
+#: Hidden because it matches something the user has said before.
+STATUS_SUPPRESSED = "suppressed"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -54,6 +57,20 @@ CREATE TABLE IF NOT EXISTS dismissals (
     signature     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_dismissals_signature ON dismissals(signature);
+
+CREATE TABLE IF NOT EXISTS preferences (
+    id       TEXT PRIMARY KEY,
+    ts       REAL NOT NULL,
+    rule     TEXT NOT NULL,
+    evidence TEXT,
+    active   INTEGER NOT NULL DEFAULT 1,
+    -- 'learned' (generalised from dismissal reasons) or 'user' (written by
+    -- hand).  A user's own preference is never removed by relearning.
+    source   TEXT NOT NULL DEFAULT 'learned',
+    -- Set once the user has rewritten the rule.  From then on the text is
+    -- theirs and relearning refreshes everything about the row except that.
+    edited   INTEGER NOT NULL DEFAULT 0
+);
 
 CREATE TABLE IF NOT EXISTS feedback (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -148,9 +165,26 @@ class Store:
         self._migrate()
 
     # ------------------------------------------------------------------
+    #: Columns added to an existing table after it first shipped.  CREATE TABLE
+    #: IF NOT EXISTS does nothing to a table that already exists, so a column
+    #: added later has to be applied by hand.
+    _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+        ("preferences", "source", "TEXT NOT NULL DEFAULT 'learned'"),
+        ("preferences", "edited", "INTEGER NOT NULL DEFAULT 0"),
+    )
+
     def _migrate(self) -> None:
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            for table, column, definition in self._ADDED_COLUMNS:
+                present = {
+                    row["name"]
+                    for row in self._conn.execute(f"PRAGMA table_info({table})")
+                }
+                if column not in present:
+                    self._conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+                    )
             self._conn.execute(
                 "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -355,10 +389,15 @@ class Store:
         self._execute("UPDATE suggestions SET status = ? WHERE id = ?", (status, suggestion_id))
 
     def prune_suggestions(self, run_id: int) -> int:
-        """Drop untouched ``new`` suggestions from earlier runs."""
+        """Drop untouched ``new`` and ``suppressed`` suggestions from earlier runs.
+
+        Suppressed rows prune on the same terms as new ones: they are hidden,
+        not decided, so a stale one is as much litter as a stale new one.
+        Leaving them out of the sweep would grow the table forever.
+        """
         cursor = self._execute(
-            "DELETE FROM suggestions WHERE status = ? AND (run_id IS NULL OR run_id < ?)",
-            (STATUS_NEW, run_id),
+            "DELETE FROM suggestions WHERE status IN (?, ?) AND (run_id IS NULL OR run_id < ?)",
+            (STATUS_NEW, STATUS_SUPPRESSED, run_id),
         )
         return cursor.rowcount or 0
 
@@ -404,6 +443,206 @@ class Store:
             rows = self._query("SELECT 1 FROM dismissals WHERE signature = ?", (signature,))
             return bool(rows)
         return False
+
+    def dismissals_with_reasons(self, limit: int = 200) -> list[dict[str, Any]]:
+        """Dismissals the user gave a reason for, newest first.
+
+        The reason column has been written since the first release and read by
+        nothing.  It is the only place a person says, in their own words, why a
+        suggestion was wrong for them - which is exactly what a per-rule mute
+        cannot generalise from.
+        """
+        rows = self._query(
+            "SELECT d.suggestion_id, d.ts, d.reason, s.title, s.miner, s.payload"
+            " FROM dismissals d LEFT JOIN suggestions s ON s.id = d.suggestion_id"
+            " WHERE d.reason IS NOT NULL AND TRIM(d.reason) != ''"
+            " ORDER BY d.ts DESC LIMIT ?",
+            (limit,),
+        )
+        out = []
+        for row in rows:
+            entry = dict(row)
+            try:
+                entry["payload"] = json.loads(entry["payload"]) if entry.get("payload") else {}
+            except (json.JSONDecodeError, TypeError):
+                entry["payload"] = {}
+            out.append(entry)
+        return out
+
+    # --- learned preferences -----------------------------------------
+    def save_preferences(self, preferences: Sequence[dict[str, Any]]) -> None:
+        """Refresh the learned set, keeping every switch the user has flipped.
+
+        Preferences are derived and so are rebuilt each run, but ``active`` is
+        not derived - it is the one thing here the *user* decided.  Replacing
+        the table wholesale would silently re-enable a preference they switched
+        off, which is the one bug that would make turning one off pointless.
+        """
+        with self._lock:
+            keep = {p["id"] for p in preferences}
+            rows = list(
+                self._conn.execute("SELECT id, source, edited FROM preferences")
+            )
+            for row in rows:
+                # Only a purely learned row is the model's to withdraw.  A
+                # preference the user wrote or rewrote is theirs, and it goes
+                # when they delete it and not before.
+                if row["id"] in keep or row["source"] != "learned" or row["edited"]:
+                    continue
+                self._conn.execute("DELETE FROM preferences WHERE id = ?", (row["id"],))
+            for preference in preferences:
+                # The conflict clause deliberately does not touch `active`,
+                # `source` or `edited`, and updates `rule` only where the user
+                # has not rewritten it: relearning refreshes what the model
+                # knows, never what the user decided.
+                self._conn.execute(
+                    "INSERT INTO preferences(id, ts, rule, evidence, active, source, edited)"
+                    " VALUES(?,?,?,?,1,'learned',0)"
+                    " ON CONFLICT(id) DO UPDATE SET ts=excluded.ts,"
+                    " rule=CASE WHEN preferences.edited THEN preferences.rule"
+                    "           ELSE excluded.rule END,"
+                    " evidence=excluded.evidence",
+                    (
+                        preference["id"],
+                        time.time(),
+                        preference["rule"],
+                        _json(preference.get("evidence") or []),
+                    ),
+                )
+            self._conn.commit()
+
+    def list_preferences(self, active_only: bool = True) -> list[dict[str, Any]]:
+        clause = " WHERE active = 1" if active_only else ""
+        rows = self._query(f"SELECT * FROM preferences{clause} ORDER BY ts DESC")
+        return [self._row_to_preference(row) for row in rows]
+
+    @staticmethod
+    def _row_to_preference(row: sqlite3.Row) -> dict[str, Any]:
+        entry = dict(row)
+        try:
+            entry["evidence"] = json.loads(entry["evidence"] or "[]")
+        except (json.JSONDecodeError, TypeError):
+            entry["evidence"] = []
+        return entry
+
+    def add_preference(self, rule: str) -> dict[str, Any] | None:
+        """Store a preference the user wrote themselves."""
+        rule = " ".join(str(rule or "").split())[:200]
+        if not rule:
+            return None
+        preference_id = "u" + hashlib.sha1(rule.encode()).hexdigest()[:10]
+        self._execute(
+            "INSERT INTO preferences(id, ts, rule, evidence, active, source, edited)"
+            " VALUES(?,?,?,'[]',1,'user',0)"
+            " ON CONFLICT(id) DO UPDATE SET ts=excluded.ts, active=1",
+            (preference_id, time.time(), rule),
+        )
+        return self.get_preference(preference_id)
+
+    def get_preference(self, preference_id: str) -> dict[str, Any] | None:
+        rows = self._query("SELECT * FROM preferences WHERE id = ?", (preference_id,))
+        return self._row_to_preference(rows[0]) if rows else None
+
+    def update_preference(self, preference_id: str, rule: str) -> dict[str, Any] | None:
+        """Rewrite a preference's rule.  The text becomes the user's from now on.
+
+        ``edited`` is what stops the next run's relearning from quietly putting
+        the model's wording back: without it an amendment would last until the
+        following night and no longer.
+        """
+        rule = " ".join(str(rule or "").split())[:200]
+        if not rule:
+            return None
+        cursor = self._execute(
+            "UPDATE preferences SET rule = ?, edited = 1, ts = ? WHERE id = ?",
+            (rule, time.time(), preference_id),
+        )
+        if not cursor.rowcount:
+            return None
+        # The suggestions this preference is already hiding quote the old
+        # wording, and a rule the user has just disagreed with is not a rule to
+        # keep hiding things by.  They come back, and the amended preference
+        # applies from the next run like any other.
+        preference = self.get_preference(preference_id)
+        if preference is not None:
+            preference["restored"] = self._unhide(preference_id)
+        return preference
+
+    def delete_preference(self, preference_id: str) -> int | None:
+        """Forget a preference entirely and bring back everything it hid.
+
+        Returns how many suggestions came back, or ``None`` if there was no such
+        preference.
+        """
+        restored = self._unhide(preference_id)
+        cursor = self._execute("DELETE FROM preferences WHERE id = ?", (preference_id,))
+        return restored if cursor.rowcount else None
+
+    def activate_preference(self, preference_id: str) -> bool:
+        cursor = self._execute(
+            "UPDATE preferences SET active = 1 WHERE id = ?", (preference_id,)
+        )
+        return bool(cursor.rowcount)
+
+    def _unhide(self, preference_id: str) -> int:
+        """Restore every suggestion this preference is hiding.  Returns how many.
+
+        One statement, scoped to the preference, with no limit.  Reading the
+        suppressed rows into Python first was wrong twice over: it went through
+        :meth:`list_suggestions`, which caps at 200 rows *ordered by score*, and
+        it fetched suppressed rows for every preference rather than this one -
+        so a preference hiding low-scored suggestions could have all of them
+        left behind simply because other preferences were hiding higher-scored
+        ones.  Those rows then stayed hidden with nothing pointing at them.
+
+        ``json_valid`` guards the extract: payloads are written as JSON, but
+        ``json_extract`` raises on a malformed one and would take the whole undo
+        with it.
+        """
+        cursor = self._execute(
+            "UPDATE suggestions SET status = ? WHERE status = ? AND json_valid(payload)"
+            " AND json_extract(payload, '$.extra.suppressed_by.preference') = ?",
+            (STATUS_NEW, STATUS_SUPPRESSED, preference_id),
+        )
+        return cursor.rowcount or 0
+
+    def suppress_if_active(self, suggestion_id: str, preference_id: str) -> bool:
+        """Hide a suggestion, but only if the preference is still switched on.
+
+        A run decides what to hide from a snapshot of the preferences taken
+        minutes earlier, and persists it at the end.  If the user switches that
+        preference off in between, the undo has already swept the table and this
+        write would land behind it - leaving a suggestion hidden by a preference
+        that is off, which nothing would ever look at again.  Deciding it here,
+        in one statement, means the write simply does not happen.
+
+        The status check is in the same statement for the same reason: a rule
+        the user accepted, dismissed or shadow-tested mid-run is theirs.
+        """
+        cursor = self._execute(
+            "UPDATE suggestions SET status = ? WHERE id = ? AND status = ?"
+            " AND EXISTS (SELECT 1 FROM preferences WHERE id = ? AND active = 1)",
+            (STATUS_SUPPRESSED, suggestion_id, STATUS_NEW, preference_id),
+        )
+        return bool(cursor.rowcount)
+
+    def deactivate_preference(self, preference_id: str) -> int | None:
+        """Switch a preference off and bring back everything it hid.
+
+        Returns how many suggestions came back, or ``None`` if there was no such
+        preference - the count is what the UI tells the user, so it is not a
+        number worth computing and dropping.
+
+        Switching it off without unhiding would leave the suggestions it
+        suppressed invisible until the next run, with nothing on screen to say
+        why - so the undo is one action, not two.
+        """
+        cursor = self._execute(
+            "UPDATE preferences SET active = 0 WHERE id = ?", (preference_id,)
+        )
+        if not cursor.rowcount:
+            return None
+        return self._unhide(preference_id)
 
     def dismissed_signatures(self) -> set[str]:
         return {
@@ -623,6 +862,7 @@ class Store:
             "shadow_events",
             "runs",
             "generations",
+            "preferences",
             "gap_suggestions",
         ):
             rows = self._query(f"SELECT COUNT(*) AS c FROM {table}")

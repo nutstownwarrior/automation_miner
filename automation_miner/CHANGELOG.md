@@ -1,5 +1,219 @@
 # Changelog
 
+## 0.6.0
+
+Four more optional AI features, all `false` by default and all requiring
+`llm_provider`. As before, none of them can put a suggestion in front of you
+that has not passed the same deterministic gates as every other suggestion.
+
+**Added: `llm_preferences` — learning from the reasons you already gave**
+
+`dismissals.reason` has been written since the first release and read by
+nothing. Dismissing was therefore a mute keyed to one exact rule: reword the
+rule and it came back, and the sentence you typed explaining *why* — the only
+place you say anything about your own home in your own words — was stored and
+ignored.
+
+Those sentences are now read back and generalised into standing preferences
+("nothing in the guest room"), which hide new suggestions that match one. This
+is the only optional feature that can make a suggestion disappear, so it is the
+most constrained one here:
+
+- a preference needs at least **two** of your own dismissals behind it, cited by
+  the model and checked against the real ones; a citation that does not exist
+  does not count;
+- a suppression must name a preference you can read, or it is refused;
+- everything hidden is listed under **Archive** with the rule that hid it and a
+  button to show it anyway;
+- a suggestion you have already accepted, dismissed or asked to shadow-test is
+  never touched.
+
+A learned preference is a guess about what someone meant, made from a sentence
+they typed in a hurry, so it is not allowed to be permanent. The Archive page
+lists preferences as **editable fields**, not as verdicts:
+
+- **rewriting** one makes the wording the user's. `edited` is what stops the
+  next run's relearning from quietly restoring the model's phrasing — without
+  it an amendment would have lasted until the following night and no longer —
+  and an amended preference is never withdrawn by relearning either. The row
+  keeps its id, because that is what the suggestions it hid point at;
+- **switching off** keeps it listed but inert, and survives relearning;
+- **deleting** forgets it. The UI says plainly that a learned one may be
+  generalised again from the same dismissals, and that switching it off is the
+  option that sticks;
+- **writing one by hand** needs no dismissals at all, and is never touched by
+  relearning;
+- **rewording with the model's help** turns "only the lamp, not the whole room"
+  into the amended sentence. The helper writes nothing: it fills in the same box
+  a hand edit uses, and the rule reaches the store only once a person has read it
+  and pressed Save. A model that could change a stored preference directly would
+  be able to reword the rules that hide things, which is the one power this
+  feature exists to withhold.
+
+Its endpoint is declared ahead of `/preferences/{id}` — routes match in order, so
+the parameterised one would otherwise have tried to edit a preference called
+"draft" — and the provider call runs in a threadpool rather than on the event
+loop, because a timeout measured in minutes awaited there stalls every other
+request, `/health` included.
+
+Switching off, rewriting or deleting brings back everything the preference was
+hiding, immediately. Rewriting does so because a rule the user has just
+disagreed with is not a rule to keep hiding things by.
+
+What the matcher is given is read back from the store rather than taken from
+what the model just said, so an amendment changes what is actually hidden and
+not merely what is displayed.
+
+Only the titles you dismissed and the reasons you gave are sent — never history.
+
+**Added: `llm_explain` — the evidence as a sentence**
+
+A card's evidence line read `30 of 34, consistency 88%, confidence 100%, lift
+2.00, ±6 min`. Worse, as `amminer.miners.base` documents, `confidence` and
+`consistency` carry *different quantities* depending on which miner filled them
+in, so the numbers were not even comparable between two cards on the same page.
+
+The model now writes the "why" in plain language. It cannot change a score, a
+verdict, a backtest or any evidence value, and the original figures stay on the
+card underneath. A sentence containing a number the evidence does not support is
+**dropped, not corrected**: a wrong figure in the sentence explaining why to
+trust something is the one error that cannot be tolerated here.
+
+**Added: `llm_scenes` — several suggestions that are really one routine**
+
+Six cards that all say "at about 22:40" are one habit split six ways, and no
+miner has a vocabulary for that. The model proposes the grouping and names it;
+everything it claims is then checked by something that is not the model:
+
+- the members must exist, and one member cannot be spent on two scenes;
+- they must share a trigger the **backtester would still credit each member's own
+  action against** — the compatibility window is
+  `backtest_match_tolerance_seconds` itself, so a scene can never be measured
+  against a moment its parts never happened at;
+- a group whose members fight over the same entity is refused;
+- only conditions *every* member carries survive into the consolidated rule;
+- the consolidated rule is backtested **as a unit, from a score of zero**. It
+  inherits nothing from its parts, because firing all of those actions together
+  is a different rule from any one of them.
+
+A scene that fails the gate is not surfaced. A scene that passes is added
+alongside its members and never replaces them.
+
+**Added: `llm_areas` — a room for entities the registry never placed**
+
+Area is the only structural fact this add-on has about a home, and it is the one
+most often left half-filled. The room is usually right there in the entity id or
+the device name, which is a reading task: `sensor.hue_motion_kitchen_2` is the
+kitchen, `binary_sensor.0x00158d` is nothing.
+
+The model is shown **only entities whose area is unset** — an area you assigned
+is never sent, never questioned and never overwritten — and may only answer with
+a room that already exists in your registry. If you have no areas at all it says
+so and does nothing, because proposing a set of rooms would be inventing the
+structure the feature exists to read. Every entity it places is flagged as
+inferred and reads "(guessed)" wherever it is shown, including in the prompts
+built from it.
+
+## Found by review, before release
+
+An adversarial review of the four features above, partitioned across the
+preference module, the store, the pipeline, scenes, explanations, the web layer
+and the tests themselves. Every fix below is pinned by a test that was confirmed
+to fail without it.
+
+**Things that could hide or lose a suggestion**
+
+- Undoing a preference read the hidden suggestions back a page at a time,
+  ordered by score, across *every* preference - so a preference hiding
+  low-scored suggestions could have all of them left behind because other
+  preferences were hiding higher-scored ones. Those rows then stayed hidden with
+  nothing pointing at them. It is now one statement scoped to the preference,
+  with no limit.
+- A run decides what to hide from a snapshot of the preferences taken minutes
+  earlier. If the user switched that preference off in between, the write landed
+  behind the undo. The suppression is now conditional on the preference still
+  being active, decided inside the write.
+- A provider timeout made `learn` return an empty list, which
+  `save_preferences` read as "the model withdrew every preference" - deleting
+  every learned preference the user had, silently. Only a successful call may
+  now rewrite the stored set, and a failed one is reported as a degradation.
+- A dismissed scene was rebuilt with the same id every run and kept being
+  counted as surfaced. Scenes are built after the dismissal filter runs, so they
+  are now filtered on their own.
+- Applying an AI result - area inferences, scenes, explanations - ran outside
+  the isolation that wraps the model call, so a bug there ended the whole run
+  and discarded every mined and backtested candidate. All three are isolated.
+
+**Things a model could say that got through**
+
+- A preference citing the same dismissal twice cleared the "at least two
+  dismissals" bar on the strength of one.
+- A citation list that was a bare number, or contained a nested object, crashed
+  `learn`; an unhashable `preference` value crashed the matcher. Both claim
+  never to raise.
+- The `MAX_PREFERENCES` cap counted proposals rather than valid ones, silently
+  discarding good preferences further down the list.
+- An explanation could state a number that is real for one field while asserting
+  it about another - quoting the window length as the number of occurrences,
+  say. "N of M" is now checked as a pair. A raw ratio no longer permits its own
+  rounding, which had been putting "1" into the allowed set for almost every
+  card. Numbers written as words are refused rather than waved through, negative
+  numbers no longer pass on the strength of their magnitude, and a correct
+  figure written with a thousands separator is no longer rejected.
+- The evidence sent for an explanation is now an allowlist. Popping `samples`
+  was not enough: `extra` carries raw epoch timestamps of its own for some
+  miners, and the window bounds are exact timestamps too.
+- Two scene members calling the same service on the same entity with different
+  data - `light.turn_on` at brightness 30 and at 255 - were not a conflict, and
+  both survived into one scene that fired them back to back. Services with no
+  binary state, like `climate.set_temperature`, were invisible here for the same
+  reason. `toggle` alongside anything else on the same entity now counts too.
+- Two groupings could consolidate to the identical rule and be stored under one
+  id, the second silently erasing the first's name.
+- Two areas whose names differ only in case were collapsed, so a guess could be
+  written to whichever of them survived. Neither is offered now.
+
+**Things that were measured wrong**
+
+- Scene members were compared along a number line, so 23:58 and 00:02 looked
+  nearly a day apart and every routine that straddles midnight was refused - the
+  module's own motivating example. Distances are measured around the clock now.
+- A shared condition was dropped whenever two members spelled it differently:
+  `weekday` is built in whatever order it was read, and `source` records which
+  miner found it. Conditions are compared on meaning now.
+- A sun-triggered grouping was built, sent through the gate and rejected there,
+  because the backtester cannot simulate a sun trigger. It is refused up front
+  and reported as what it is.
+
+**Things that blocked or leaked**
+
+- Building the provider for the wording helper ran on the event loop. The Ollama
+  provider probes several candidate hosts with synchronous HTTP at a two-second
+  timeout each, so every click froze the whole UI - `/health` included - for up
+  to fourteen seconds whenever Ollama was not running. The original test could
+  not see this: it replaced `build_provider`, which is the call that blocked.
+- The count of suggestions an undo restored was computed and discarded. It is
+  what the UI now tells the user.
+- `area_inferred_reason` was collected and readable by nothing.
+
+**Tests that were not holding the line**
+
+- "A hidden suggestion is not announced" passed because the suggestion had been
+  seen twice, not because it was hidden - removing the status filter entirely
+  left it green. It now suppresses on a first sighting.
+- The isolation test for scenes never reached the step it was breaking, because
+  the stub proposed no grouping to apply.
+- Several assertions checked a method's return type rather than the state that
+  changed, and broke on a legitimate refactor while the guarantee held.
+
+**Also**
+
+- `prune_suggestions` now sweeps hidden suggestions on the same terms as new
+  ones. Hidden is not decided, so a stale hidden row was as much litter as a
+  stale new one — and it would have accumulated forever.
+- The Status page now describes what `llm_audit` and `llm_gaps` did. Both had
+  been reported as a bare feature name with no summary since they were added.
+
 ## 0.5.0
 
 **Fixed: gap suggestions that assumed things about your life**

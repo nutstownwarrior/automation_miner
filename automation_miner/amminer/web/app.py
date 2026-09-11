@@ -23,12 +23,20 @@ from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from starlette.concurrency import run_in_threadpool
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from ..config import Options
+from ..llm import preferences as llm_preferences
 from ..llm.provider import build_provider
 from ..store import Store
-from ..store.db import STATUS_ACCEPTED, STATUS_DISMISSED, STATUS_NEW, STATUS_SHADOW
+from ..store.db import (
+    STATUS_ACCEPTED,
+    STATUS_DISMISSED,
+    STATUS_NEW,
+    STATUS_SHADOW,
+    STATUS_SUPPRESSED,
+)
 from ..version import __version__
 
 _LOGGER = logging.getLogger(__name__)
@@ -175,7 +183,13 @@ def create_app(
         return templates.TemplateResponse(
             request=request,
             name="dismissed.html",
-            context=context(request, suggestions=store.list_suggestions(status=[STATUS_DISMISSED, STATUS_ACCEPTED])),
+            context=context(
+                request,
+                suggestions=store.list_suggestions(status=[STATUS_DISMISSED, STATUS_ACCEPTED]),
+                # Nothing hides without a place to see it and switch it off.
+                hidden=store.list_suggestions(status=STATUS_SUPPRESSED),
+                preferences=store.list_preferences(active_only=False),
+            ),
         )
 
     @app.get("/status", response_class=HTMLResponse)
@@ -194,6 +208,13 @@ def create_app(
 
     # --- actions ------------------------------------------------------
     api = APIRouter(prefix="/api")
+
+    async def _rule_from(request: Request) -> str:
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            return ""
+        return str(body.get("rule") or "") if isinstance(body, dict) else ""
 
     @api.post("/run")
     async def trigger_run():
@@ -225,6 +246,110 @@ def create_app(
         if not store.restore(suggestion_id):
             raise HTTPException(status_code=404, detail="unknown suggestion")
         return {"status": "restored", "id": suggestion_id}
+
+    # A learned preference is a guess about what someone meant, made from
+    # sentences they typed in a hurry.  It is therefore theirs to correct, and
+    # these five endpoints are what stop a bad generalisation from being
+    # permanent.
+    @api.post("/preferences")
+    async def add_preference(request: Request):
+        """Write a standing preference by hand, with no dismissals behind it."""
+        preference = store.add_preference(await _rule_from(request))
+        if preference is None:
+            raise HTTPException(status_code=400, detail="a preference needs a rule")
+        return {"status": "added", "preference": preference}
+
+    # Declared before "/preferences/{preference_id}": routes match in order, so
+    # the parameterised one would otherwise swallow this path and try to edit a
+    # preference called "draft".
+    @api.post("/preferences/draft")
+    async def draft_preference(request: Request):
+        """Word a preference from an instruction, and write nothing.
+
+        The model drafts; the person saves. It returns a proposal for the same
+        text box a hand edit uses, so nothing reaches the store until someone
+        has read it and pressed Save - and what is then stored is marked as the
+        user's, because they approved it.
+        """
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        instruction = str(body.get("instruction") or "")
+        current = str(body.get("rule") or "")
+        preference_id = body.get("preference")
+        if isinstance(preference_id, str) and preference_id:
+            stored = store.get_preference(preference_id)
+            if stored is None:
+                raise HTTPException(status_code=404, detail="unknown preference")
+            current = current or stored["rule"]
+        if not options.llm_preferences:
+            raise HTTPException(
+                status_code=503,
+                detail="turn on llm_preferences to use the wording helper",
+            )
+
+        def _draft():
+            # `build_provider` is inside the offloaded call, not outside it.
+            # Constructing the Ollama provider probes several candidate hosts
+            # with synchronous HTTP at a two-second timeout each, so leaving it
+            # on the event loop froze every other request for up to ~14 seconds
+            # whenever Ollama was simply not running - which is the state
+            # auto-discovery exists to detect.
+            return llm_preferences.draft(instruction, current, build_provider(options))
+
+        # The model call has a timeout measured in minutes, so none of this may
+        # run on the event loop: one of these would otherwise freeze every other
+        # request, /health included.
+        proposal, error = await run_in_threadpool(_draft)
+        if error:
+            raise HTTPException(status_code=503, detail=error)
+        if not proposal:
+            raise HTTPException(
+                status_code=422,
+                detail="that could not be worded as a preference - try saying it as "
+                "something you do not want suggested",
+            )
+        return {"status": "drafted", "rule": proposal, "saved": False}
+
+    @api.post("/preferences/{preference_id}")
+    async def edit_preference(request: Request, preference_id: str):
+        """Rewrite a preference.  The wording becomes the user's from here on."""
+        preference = store.update_preference(preference_id, await _rule_from(request))
+        if preference is None:
+            if store.get_preference(preference_id) is None:
+                raise HTTPException(status_code=404, detail="unknown preference")
+            raise HTTPException(status_code=400, detail="a preference needs a rule")
+        return {
+            "status": "updated",
+            "preference": preference,
+            "restored": preference.get("restored", 0),
+        }
+
+    @api.post("/preferences/{preference_id}/delete")
+    def delete_preference(preference_id: str):
+        # `None` means no such preference; 0 means it hid nothing, which is a
+        # perfectly good outcome and must not read as "not found".
+        restored = store.delete_preference(preference_id)
+        if restored is None:
+            raise HTTPException(status_code=404, detail="unknown preference")
+        return {"status": "deleted", "id": preference_id, "restored": restored}
+
+    @api.post("/preferences/{preference_id}/on")
+    def preference_on(preference_id: str):
+        if not store.activate_preference(preference_id):
+            raise HTTPException(status_code=404, detail="unknown preference")
+        return {"status": "on", "id": preference_id}
+
+    @api.post("/preferences/{preference_id}/off")
+    def preference_off(preference_id: str):
+        """Switch a preference off and bring back what it hid."""
+        restored = store.deactivate_preference(preference_id)
+        if restored is None:
+            raise HTTPException(status_code=404, detail="unknown preference")
+        return {"status": "off", "id": preference_id, "restored": restored}
 
     @api.post("/suggestions/{suggestion_id}/shadow")
     def shadow(suggestion_id: str):

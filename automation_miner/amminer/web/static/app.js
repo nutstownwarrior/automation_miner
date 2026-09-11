@@ -17,10 +17,11 @@
     toastTimer = setTimeout(function () { toast.hidden = true; }, 4000);
   }
 
-  function post(path) {
+  function post(path, body) {
     return fetch(base + path, {
       method: "POST",
-      headers: { "Content-Type": "application/json" }
+      headers: { "Content-Type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body)
     }).then(function (response) {
       return response.json().catch(function () { return {}; }).then(function (body) {
         if (!response.ok) {
@@ -84,6 +85,78 @@
           return;
         }
         notify((result.errors || ["Apply failed"]).join(" "), true);
+      });
+    },
+    "preference-off": function (id) {
+      return post("/api/preferences/" + id + "/off").then(function () {
+        notify("Switched off. Anything it was hiding is back.");
+        window.location.reload();
+      });
+    },
+    "preference-on": function (id) {
+      return post("/api/preferences/" + id + "/on").then(function () {
+        notify("Switched on. It applies from the next analysis.");
+        window.location.reload();
+      });
+    },
+    "preference-draft": function (id) {
+      // The model only ever fills in the box. Saving stays a deliberate act,
+      // because a rule that hides suggestions should never be written by
+      // anything but the person it hides them from.
+      var input = id
+        ? document.querySelector('[data-rule-for="' + id + '"]')
+        : document.getElementById("new-preference");
+      if (!input) { return null; }
+      var instruction = window.prompt(
+        "What should change about this preference?\n\n" +
+        "For example: \"only the lamp, not the whole room\", or " +
+        "\"this should not apply at weekends\".",
+        "");
+      if (!instruction || !instruction.trim()) { return null; }
+      notify("Asking\u2026");
+      return post("/api/preferences/draft", {
+        preference: id || undefined,
+        rule: input.value,
+        instruction: instruction
+      }).then(function (result) {
+        input.value = result.rule;
+        input.focus();
+        notify("Drafted. Check the wording, then press Save - nothing is stored yet.");
+      });
+    },
+    "preference-save": function (id) {
+      var input = document.querySelector('[data-rule-for="' + id + '"]');
+      if (!input || !input.value.trim()) {
+        notify("A preference needs a rule.", true);
+        return null;
+      }
+      return post("/api/preferences/" + id, { rule: input.value }).then(function () {
+        notify("Saved. That wording is yours now - no later run will change it.");
+        window.location.reload();
+      });
+    },
+    "preference-delete": function (id) {
+      if (!window.confirm(
+            "Delete this preference? Anything it was hiding comes back.\n\n" +
+            "If it was learned and the dismissals behind it are still on record, " +
+            "a later run may learn something like it again. Switching it off instead " +
+            "is permanent.")) {
+        return null;
+      }
+      return post("/api/preferences/" + id + "/delete").then(function () {
+        notify("Deleted.");
+        window.location.reload();
+      });
+    },
+    "preference-add": function () {
+      var input = document.getElementById("new-preference");
+      if (!input || !input.value.trim()) {
+        notify("A preference needs a rule.", true);
+        return null;
+      }
+      return post("/api/preferences", { rule: input.value }).then(function () {
+        notify("Added. It applies from the next analysis.");
+        window.location.reload();
       });
     },
     "dismiss-gap": function (id) {

@@ -16,4 +16,87 @@
   </li>
 {% endfor %}
 </ul>
+
+<h2>Your standing preferences</h2>
+<p class="muted">These are generalised from the reasons you gave when dismissing things,
+so some of them will be wrong &mdash; a guess about what you meant, made from a sentence
+you typed in a hurry. <strong>Rewrite any of them.</strong> Once you do, the wording is
+yours and no later run will put it back.</p>
+<p class="muted">A preference can only <strong>hide</strong> a suggestion. It never ranks
+one up and never changes any evidence. Switching one off, rewriting it or deleting it
+brings back everything it was hiding, straight away.</p>
+
+{% if not preferences %}
+<div class="empty"><p>No preferences yet.</p>
+<p class="muted">They are learned from the reasons you type when dismissing a suggestion,
+once there are a few to generalise from. You can also write one yourself below.</p></div>
+{% endif %}
+
+<ul class="plain findings preferences">
+{% for pref in preferences %}
+  <li class="{{ '' if pref.active else 'muted' }}" data-preference="{{ pref.id }}">
+    <span class="tag status">{{ 'on' if pref.active else 'off' }}</span>
+    <span class="tag">{{ 'yours' if pref.source == 'user' else ('amended' if pref.edited else 'learned') }}</span>
+    <input class="rule-input" type="text" value="{{ pref.rule }}" maxlength="200"
+           aria-label="Preference rule" data-rule-for="{{ pref.id }}">
+    {% if pref.source == 'user' %}
+    <span class="muted small">written by you</span>
+    {% else %}
+    <span class="muted small">learned from {{ pref.evidence | length }} dismissal(s)</span>
+    {% endif %}
+    <span class="actions">
+      {% if options.llm_preferences %}
+      <button class="btn ghost small" data-action="preference-draft" data-id="{{ pref.id }}">Reword with AI</button>
+      {% endif %}
+      <button class="btn ghost small" data-action="preference-save" data-id="{{ pref.id }}">Save</button>
+      {% if pref.active %}
+      <button class="btn ghost small" data-action="preference-off" data-id="{{ pref.id }}">Switch off</button>
+      {% else %}
+      <button class="btn ghost small" data-action="preference-on" data-id="{{ pref.id }}">Switch on</button>
+      {% endif %}
+      <button class="btn ghost small danger" data-action="preference-delete" data-id="{{ pref.id }}">Delete</button>
+    </span>
+  </li>
+{% endfor %}
+</ul>
+
+<p class="muted small">Deleting a learned preference removes it now. If the dismissals it
+was generalised from are still on record, a later run may learn something like it again
+&mdash; switching it off is the one that sticks.</p>
+
+<form class="preference-new" data-action="preference-add" onsubmit="return false">
+  <input class="rule-input" type="text" id="new-preference" maxlength="200"
+         placeholder="Never suggest anything for the bathroom."
+         aria-label="A new preference">
+  {% if options.llm_preferences %}
+  <button class="btn ghost small" data-action="preference-draft" data-id="">Word it with AI</button>
+  {% endif %}
+  <button class="btn ghost small" data-action="preference-add">Add a preference</button>
+</form>
+
+{% if options.llm_preferences %}
+<p class="muted small">&ldquo;Reword with AI&rdquo; asks the model to word a change for you
+&mdash; say <em>&ldquo;only the lamp, not the whole room&rdquo;</em> and it rewrites the
+sentence. It only fills in the box: nothing is stored until you read it and press
+<strong>Save</strong>, and what is saved then counts as your own wording.</p>
+{% endif %}
+
+{% if hidden %}
+<h2>Hidden by a preference <span class="count">{{ hidden | length }}</span></h2>
+<p class="muted">Each of these passed every gate and would have been suggested. It is
+here, and not gone, because hiding something without saying so is not something this
+add-on does.</p>
+<ul class="plain findings">
+{% for s in hidden %}
+  {% set by = ((s.payload or {}).get('extra') or {}).get('suppressed_by') or {} %}
+  <li>
+    <strong>{{ s.title }}</strong>
+    <span class="muted small">{{ s.summary }}</span>
+    {% if by.rule %}<div class="small warn">Hidden by: {{ by.rule }}</div>{% endif %}
+    {% if by.reason %}<div class="small muted">{{ by.reason }}</div>{% endif %}
+    <button class="btn ghost small" data-action="restore" data-id="{{ s.id }}">Show it anyway</button>
+  </li>
+{% endfor %}
+</ul>
+{% endif %}
 {% endblock %}
