@@ -221,13 +221,15 @@ def learn(
     known = {d.get("suggestion_id") for d in dismissals}
     out: list[Preference] = []
     seen: set[str] = set()
-    for entry in entries[:MAX_PREFERENCES]:
+    for entry in entries:
         if not isinstance(entry, dict):
             continue
         rule = clean_model_text(entry.get("rule"), limit=200)
-        cited = [c for c in (entry.get("from") or []) if c in known]
+        cited = _citations(entry.get("from"), known)
         # One dismissal is not a pattern; generalising from it just widens
-        # that single mute without the user asking for it.
+        # that single mute without the user asking for it.  Counted over
+        # *distinct* ids, because the same dismissal named twice is still one
+        # dismissal and would otherwise clear this bar on its own.
         if not rule or len(cited) < 2:
             continue
         preference = Preference(rule=rule, evidence=cited)
@@ -235,7 +237,28 @@ def learn(
             continue
         seen.add(preference.id)
         out.append(preference)
+        # Sliced after validation, not before: taking the first eight entries
+        # and then discarding the invalid ones silently threw away good
+        # preferences further down the list.
+        if len(out) >= MAX_PREFERENCES:
+            break
     return out, None
+
+
+def _citations(raw: object, known: set) -> list[str]:
+    """The real dismissal ids an entry cites, deduplicated and in order.
+
+    Everything here is model output, so a citation may be any JSON value at
+    all: a bare number where a list was asked for, or a nested object whose
+    membership test would raise on an unhashable type.
+    """
+    if not isinstance(raw, list):
+        return []
+    cited: list[str] = []
+    for item in raw:
+        if isinstance(item, str) and item in known and item not in cited:
+            cited.append(item)
+    return cited
 
 
 def apply_preferences(
@@ -285,9 +308,15 @@ def apply_preferences(
         preference_id = match.get("preference")
         if not isinstance(candidate_id, str) or candidate_id not in by_id:
             if isinstance(candidate_id, str):
-                result.unknown_ids.append(candidate_id)
+                # Capped like every other piece of model text here: this is
+                # persisted into the run report, and an id is a short string
+                # or it is not an id.
+                result.unknown_ids.append(clean_model_text(candidate_id, limit=100))
             continue
-        if preference_id not in known_preferences:
+        # The isinstance check is not decoration: a non-string here is any
+        # JSON value the model felt like sending, and an unhashable one turns
+        # the membership test below into a TypeError.
+        if not isinstance(preference_id, str) or preference_id not in known_preferences:
             # A suppression has to name a preference the user can read and
             # switch off, or it is an unaccountable disappearance.
             result.unsupported += 1

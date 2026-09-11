@@ -114,6 +114,98 @@ structure the feature exists to read. Every entity it places is flagged as
 inferred and reads "(guessed)" wherever it is shown, including in the prompts
 built from it.
 
+## Found by review, before release
+
+An adversarial review of the four features above, partitioned across the
+preference module, the store, the pipeline, scenes, explanations, the web layer
+and the tests themselves. Every fix below is pinned by a test that was confirmed
+to fail without it.
+
+**Things that could hide or lose a suggestion**
+
+- Undoing a preference read the hidden suggestions back a page at a time,
+  ordered by score, across *every* preference - so a preference hiding
+  low-scored suggestions could have all of them left behind because other
+  preferences were hiding higher-scored ones. Those rows then stayed hidden with
+  nothing pointing at them. It is now one statement scoped to the preference,
+  with no limit.
+- A run decides what to hide from a snapshot of the preferences taken minutes
+  earlier. If the user switched that preference off in between, the write landed
+  behind the undo. The suppression is now conditional on the preference still
+  being active, decided inside the write.
+- A provider timeout made `learn` return an empty list, which
+  `save_preferences` read as "the model withdrew every preference" - deleting
+  every learned preference the user had, silently. Only a successful call may
+  now rewrite the stored set, and a failed one is reported as a degradation.
+- A dismissed scene was rebuilt with the same id every run and kept being
+  counted as surfaced. Scenes are built after the dismissal filter runs, so they
+  are now filtered on their own.
+- Applying an AI result - area inferences, scenes, explanations - ran outside
+  the isolation that wraps the model call, so a bug there ended the whole run
+  and discarded every mined and backtested candidate. All three are isolated.
+
+**Things a model could say that got through**
+
+- A preference citing the same dismissal twice cleared the "at least two
+  dismissals" bar on the strength of one.
+- A citation list that was a bare number, or contained a nested object, crashed
+  `learn`; an unhashable `preference` value crashed the matcher. Both claim
+  never to raise.
+- The `MAX_PREFERENCES` cap counted proposals rather than valid ones, silently
+  discarding good preferences further down the list.
+- An explanation could state a number that is real for one field while asserting
+  it about another - quoting the window length as the number of occurrences,
+  say. "N of M" is now checked as a pair. A raw ratio no longer permits its own
+  rounding, which had been putting "1" into the allowed set for almost every
+  card. Numbers written as words are refused rather than waved through, negative
+  numbers no longer pass on the strength of their magnitude, and a correct
+  figure written with a thousands separator is no longer rejected.
+- The evidence sent for an explanation is now an allowlist. Popping `samples`
+  was not enough: `extra` carries raw epoch timestamps of its own for some
+  miners, and the window bounds are exact timestamps too.
+- Two scene members calling the same service on the same entity with different
+  data - `light.turn_on` at brightness 30 and at 255 - were not a conflict, and
+  both survived into one scene that fired them back to back. Services with no
+  binary state, like `climate.set_temperature`, were invisible here for the same
+  reason. `toggle` alongside anything else on the same entity now counts too.
+- Two groupings could consolidate to the identical rule and be stored under one
+  id, the second silently erasing the first's name.
+- Two areas whose names differ only in case were collapsed, so a guess could be
+  written to whichever of them survived. Neither is offered now.
+
+**Things that were measured wrong**
+
+- Scene members were compared along a number line, so 23:58 and 00:02 looked
+  nearly a day apart and every routine that straddles midnight was refused - the
+  module's own motivating example. Distances are measured around the clock now.
+- A shared condition was dropped whenever two members spelled it differently:
+  `weekday` is built in whatever order it was read, and `source` records which
+  miner found it. Conditions are compared on meaning now.
+- A sun-triggered grouping was built, sent through the gate and rejected there,
+  because the backtester cannot simulate a sun trigger. It is refused up front
+  and reported as what it is.
+
+**Things that blocked or leaked**
+
+- Building the provider for the wording helper ran on the event loop. The Ollama
+  provider probes several candidate hosts with synchronous HTTP at a two-second
+  timeout each, so every click froze the whole UI - `/health` included - for up
+  to fourteen seconds whenever Ollama was not running. The original test could
+  not see this: it replaced `build_provider`, which is the call that blocked.
+- The count of suggestions an undo restored was computed and discarded. It is
+  what the UI now tells the user.
+- `area_inferred_reason` was collected and readable by nothing.
+
+**Tests that were not holding the line**
+
+- "A hidden suggestion is not announced" passed because the suggestion had been
+  seen twice, not because it was hidden - removing the status filter entirely
+  left it green. It now suppresses on a first sighting.
+- The isolation test for scenes never reached the step it was breaking, because
+  the stub proposed no grouping to apply.
+- Several assertions checked a method's return type rather than the state that
+  changed, and broke on a legitimate refactor while the guarantee held.
+
 **Also**
 
 - `prune_suggestions` now sweeps hidden suggestions on the same terms as new

@@ -158,3 +158,36 @@ def test_applying_twice_places_nothing_new():
     areas_mod.apply_inferences(resolver, result)
     areas_mod.apply_inferences(resolver, result)
     assert result.applied == 1
+
+
+def test_two_areas_with_the_same_name_are_not_guessed_between():
+    """The model sees one name; writing it to an arbitrary one of the two is a guess."""
+    resolver = resolver_with_areas()
+    resolver.registries.areas["area_kitchen_2"] = RegistryArea(
+        id="area_kitchen_2", name="kitchen "
+    )
+    llm = StubLLM({"placements": [placement()]})
+    result = areas_mod.infer(resolver, llm)
+    import json as _json
+
+    assert _json.loads(llm.prompts[0])["areas"] == ["Bedroom"]
+    assert result.placements == {} and result.rejected_unknown_area == 1
+
+
+def test_the_reason_a_guess_was_made_is_readable():
+    resolver, _llm, result = _infer(placement(reason="The entity id says kitchen."))
+    areas_mod.apply_inferences(resolver, result)
+    info = resolver.get("light.hue_kitchen_1")
+    assert info.as_dict()["area_inferred_reason"] == "The entity id says kitchen."
+
+
+def test_applying_a_placement_for_an_already_placed_entity_is_refused():
+    """The guard inside `apply_inferences` is its own line of defence, so test it directly."""
+    resolver = resolver_with_areas()
+    result = areas_mod.AreaResult()
+    result.placements["light.bed_lamp"] = {
+        "area_id": "area_kitchen", "area_name": "Kitchen", "reason": "wrong",
+    }
+    areas_mod.apply_inferences(resolver, result)
+    lamp = resolver.get("light.bed_lamp")
+    assert (lamp.area_name, lamp.area_inferred, result.applied) == ("Bedroom", False, 0)

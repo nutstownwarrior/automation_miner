@@ -563,14 +563,20 @@ class Store:
         # wording, and a rule the user has just disagreed with is not a rule to
         # keep hiding things by.  They come back, and the amended preference
         # applies from the next run like any other.
-        self._unhide(preference_id)
-        return self.get_preference(preference_id)
+        preference = self.get_preference(preference_id)
+        if preference is not None:
+            preference["restored"] = self._unhide(preference_id)
+        return preference
 
-    def delete_preference(self, preference_id: str) -> bool:
-        """Forget a preference entirely and bring back everything it hid."""
-        self._unhide(preference_id)
+    def delete_preference(self, preference_id: str) -> int | None:
+        """Forget a preference entirely and bring back everything it hid.
+
+        Returns how many suggestions came back, or ``None`` if there was no such
+        preference.
+        """
+        restored = self._unhide(preference_id)
         cursor = self._execute("DELETE FROM preferences WHERE id = ?", (preference_id,))
-        return bool(cursor.rowcount)
+        return restored if cursor.rowcount else None
 
     def activate_preference(self, preference_id: str) -> bool:
         cursor = self._execute(
@@ -579,18 +585,53 @@ class Store:
         return bool(cursor.rowcount)
 
     def _unhide(self, preference_id: str) -> int:
-        """Restore every suggestion this preference is currently hiding."""
-        restored = 0
-        for suggestion in self.list_suggestions(status=STATUS_SUPPRESSED):
-            extra = (suggestion.get("payload") or {}).get("extra") or {}
-            hidden_by = extra.get("suppressed_by") or {}
-            if hidden_by.get("preference") == preference_id:
-                self.set_status(suggestion["id"], STATUS_NEW)
-                restored += 1
-        return restored
+        """Restore every suggestion this preference is hiding.  Returns how many.
 
-    def deactivate_preference(self, preference_id: str) -> bool:
+        One statement, scoped to the preference, with no limit.  Reading the
+        suppressed rows into Python first was wrong twice over: it went through
+        :meth:`list_suggestions`, which caps at 200 rows *ordered by score*, and
+        it fetched suppressed rows for every preference rather than this one -
+        so a preference hiding low-scored suggestions could have all of them
+        left behind simply because other preferences were hiding higher-scored
+        ones.  Those rows then stayed hidden with nothing pointing at them.
+
+        ``json_valid`` guards the extract: payloads are written as JSON, but
+        ``json_extract`` raises on a malformed one and would take the whole undo
+        with it.
+        """
+        cursor = self._execute(
+            "UPDATE suggestions SET status = ? WHERE status = ? AND json_valid(payload)"
+            " AND json_extract(payload, '$.extra.suppressed_by.preference') = ?",
+            (STATUS_NEW, STATUS_SUPPRESSED, preference_id),
+        )
+        return cursor.rowcount or 0
+
+    def suppress_if_active(self, suggestion_id: str, preference_id: str) -> bool:
+        """Hide a suggestion, but only if the preference is still switched on.
+
+        A run decides what to hide from a snapshot of the preferences taken
+        minutes earlier, and persists it at the end.  If the user switches that
+        preference off in between, the undo has already swept the table and this
+        write would land behind it - leaving a suggestion hidden by a preference
+        that is off, which nothing would ever look at again.  Deciding it here,
+        in one statement, means the write simply does not happen.
+
+        The status check is in the same statement for the same reason: a rule
+        the user accepted, dismissed or shadow-tested mid-run is theirs.
+        """
+        cursor = self._execute(
+            "UPDATE suggestions SET status = ? WHERE id = ? AND status = ?"
+            " AND EXISTS (SELECT 1 FROM preferences WHERE id = ? AND active = 1)",
+            (STATUS_SUPPRESSED, suggestion_id, STATUS_NEW, preference_id),
+        )
+        return bool(cursor.rowcount)
+
+    def deactivate_preference(self, preference_id: str) -> int | None:
         """Switch a preference off and bring back everything it hid.
+
+        Returns how many suggestions came back, or ``None`` if there was no such
+        preference - the count is what the UI tells the user, so it is not a
+        number worth computing and dropping.
 
         Switching it off without unhiding would leave the suggestions it
         suppressed invisible until the next run, with nothing on screen to say
@@ -600,9 +641,8 @@ class Store:
             "UPDATE preferences SET active = 0 WHERE id = ?", (preference_id,)
         )
         if not cursor.rowcount:
-            return False
-        self._unhide(preference_id)
-        return True
+            return None
+        return self._unhide(preference_id)
 
     def dismissed_signatures(self) -> set[str]:
         return {

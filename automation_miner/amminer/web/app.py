@@ -291,13 +291,19 @@ def create_app(
                 detail="turn on llm_preferences to use the wording helper",
             )
 
-        provider = build_provider(options)
-        # The provider call has a timeout measured in minutes, so it must not
+        def _draft():
+            # `build_provider` is inside the offloaded call, not outside it.
+            # Constructing the Ollama provider probes several candidate hosts
+            # with synchronous HTTP at a two-second timeout each, so leaving it
+            # on the event loop froze every other request for up to ~14 seconds
+            # whenever Ollama was simply not running - which is the state
+            # auto-discovery exists to detect.
+            return llm_preferences.draft(instruction, current, build_provider(options))
+
+        # The model call has a timeout measured in minutes, so none of this may
         # run on the event loop: one of these would otherwise freeze every other
         # request, /health included.
-        proposal, error = await run_in_threadpool(
-            llm_preferences.draft, instruction, current, provider
-        )
+        proposal, error = await run_in_threadpool(_draft)
         if error:
             raise HTTPException(status_code=503, detail=error)
         if not proposal:
@@ -316,13 +322,20 @@ def create_app(
             if store.get_preference(preference_id) is None:
                 raise HTTPException(status_code=404, detail="unknown preference")
             raise HTTPException(status_code=400, detail="a preference needs a rule")
-        return {"status": "updated", "preference": preference}
+        return {
+            "status": "updated",
+            "preference": preference,
+            "restored": preference.get("restored", 0),
+        }
 
     @api.post("/preferences/{preference_id}/delete")
     def delete_preference(preference_id: str):
-        if not store.delete_preference(preference_id):
+        # `None` means no such preference; 0 means it hid nothing, which is a
+        # perfectly good outcome and must not read as "not found".
+        restored = store.delete_preference(preference_id)
+        if restored is None:
             raise HTTPException(status_code=404, detail="unknown preference")
-        return {"status": "deleted", "id": preference_id}
+        return {"status": "deleted", "id": preference_id, "restored": restored}
 
     @api.post("/preferences/{preference_id}/on")
     def preference_on(preference_id: str):
@@ -333,9 +346,10 @@ def create_app(
     @api.post("/preferences/{preference_id}/off")
     def preference_off(preference_id: str):
         """Switch a preference off and bring back what it hid."""
-        if not store.deactivate_preference(preference_id):
+        restored = store.deactivate_preference(preference_id)
+        if restored is None:
             raise HTTPException(status_code=404, detail="unknown preference")
-        return {"status": "off", "id": preference_id}
+        return {"status": "off", "id": preference_id, "restored": restored}
 
     @api.post("/suggestions/{suggestion_id}/shadow")
     def shadow(suggestion_id: str):

@@ -102,6 +102,7 @@ class SceneResult:
     rejected_incompatible: int = 0
     rejected_contradictory: int = 0
     rejected_by_backtest: int = 0
+    rejected_duplicate: int = 0
     error: str | None = None
 
     @property
@@ -116,6 +117,7 @@ class SceneResult:
             "rejected_incompatible": self.rejected_incompatible,
             "rejected_contradictory": self.rejected_contradictory,
             "rejected_by_backtest": self.rejected_by_backtest,
+            "rejected_duplicate": self.rejected_duplicate,
             "scenes": [s.as_dict() for s in self.scenes],
             "error": self.error,
         }
@@ -158,13 +160,11 @@ def shared_trigger(
         seconds = [_trigger_seconds(t) for t in firsts]
         if any(s is None for s in seconds):
             return None
-        values = sorted(float(s) for s in seconds)  # type: ignore[arg-type]
-        if values[-1] - values[0] > tolerance_seconds:
+        values = [float(s) for s in seconds]  # type: ignore[arg-type]
+        anchor = _tight_anchor(values, tolerance_seconds)
+        if anchor is None:
             return None
-        # The median, not the mean: one outlier inside the tolerance should not
-        # drag the shared moment away from where most of them actually happen.
-        middle = values[len(values) // 2]
-        return Trigger(kind="time", at=_format_seconds(middle))
+        return Trigger(kind="time", at=_format_seconds(anchor))
 
     if kind == "state":
         entities = {t.entity_id for t in firsts}
@@ -181,15 +181,45 @@ def shared_trigger(
             for_seconds=max((h for h in holds if h), default=None),
         )
 
-    if kind == "sun":
-        events = {t.event for t in firsts}
-        offsets = {t.offset for t in firsts}
-        if len(events) != 1 or len(offsets) != 1:
-            return None
-        return Trigger(kind="sun", event=events.pop(), offset=offsets.pop())
-
-    # numeric_state and time_pattern have no defensible single stand-in.
+    # Sun, numeric_state and time_pattern have no usable single stand-in.  Sun
+    # is the interesting one: the members really do share a moment, but
+    # :mod:`amminer.backtest` cannot simulate a sun trigger, so every sun
+    # grouping was built, sent through the gate and rejected there with an
+    # internal-sounding reason.  Refusing it here costs nothing and reports it
+    # as what it is - a grouping this feature cannot measure yet.
     return None
+
+
+DAY = 86400.0
+
+
+def _tight_anchor(values: list[float], tolerance_seconds: float) -> float | None:
+    """One time-of-day that stands in for all of *values*, or ``None``.
+
+    Distances are measured around the clock, not along a number line.  22:58 and
+    00:02 are four minutes apart; subtracting seconds-since-midnight makes them
+    look like nearly a full day, so every routine that straddles midnight - the
+    exact "going to bed" case this feature exists for - was refused.
+    """
+    if not values:
+        return None
+    best: tuple[float, float] | None = None
+    for anchor in values:
+        offsets = [((value - anchor + DAY / 2) % DAY) - DAY / 2 for value in values]
+        span = max(offsets) - min(offsets)
+        if span > tolerance_seconds:
+            continue
+        # Rank by span so the tightest framing wins, and break ties on the
+        # anchor itself so the result does not depend on member order.
+        if best is None or (span, anchor) < best:
+            best = (span, anchor)
+    if best is None:
+        return None
+    anchor = best[1]
+    offsets = sorted(((value - anchor + DAY / 2) % DAY) - DAY / 2 for value in values)
+    # The median, not the mean: one outlier inside the tolerance should not drag
+    # the shared moment away from where most of them actually happen.
+    return (anchor + offsets[len(offsets) // 2]) % DAY
 
 
 def _format_seconds(total: float) -> str:
@@ -197,18 +227,73 @@ def _format_seconds(total: float) -> str:
     return f"{total // 3600:02d}:{total % 3600 // 60:02d}:{total % 60:02d}"
 
 
+#: Services whose effect depends on what the entity was already doing, so two
+#: members naming one of these on the same entity can always undo each other.
+_REVERSIBLE = ("toggle",)
+
+
 def contradictory_actions(candidates: Sequence[Candidate]) -> bool:
-    """True if two members would fight over the same entity."""
+    """True if two members would fight over the same entity.
+
+    Opposite target states are the obvious case and the only one that used to be
+    checked, which missed the commoner one: two members calling the *same*
+    service on the same entity with *different* data.  ``light.turn_on`` at
+    brightness 30 and at brightness 255 map to the same target state, survive
+    the action de-duplication because their payloads differ, and end up in one
+    scene firing both back to back in whatever order the model happened to list
+    them.  Services with no binary state at all - ``climate.set_temperature``,
+    ``fan.set_percentage`` - were invisible here for the same reason.
+    """
     wanted: dict[str, set[str]] = {}
+    payloads: dict[tuple[str, str], set[str]] = {}
+    toggled: set[str] = set()
+    touched: dict[str, int] = {}
     for candidate in candidates:
         for action in candidate.actions:
             if not action.entity_id:
                 continue
+            touched[action.entity_id] = touched.get(action.entity_id, 0) + 1
+            if action.service.split(".", 1)[-1] in _REVERSIBLE:
+                toggled.add(action.entity_id)
             state = action.target_state
-            if state is None:
-                continue
-            wanted.setdefault(action.entity_id, set()).add(state)
-    return any(len(states) > 1 for states in wanted.values())
+            if state is not None:
+                wanted.setdefault(action.entity_id, set()).add(state)
+            key = (action.entity_id, action.service)
+            payloads.setdefault(key, set()).add(
+                json.dumps(action.data or {}, sort_keys=True, default=str)
+            )
+    if any(len(states) > 1 for states in wanted.values()):
+        return True
+    if any(len(bodies) > 1 for bodies in payloads.values()):
+        return True
+    # A toggle alongside anything else on the same entity can undo it.
+    return any(touched.get(entity_id, 0) > 1 for entity_id in toggled)
+
+
+def _condition_key(condition) -> str:
+    """What makes two conditions the same condition.
+
+    Compared on meaning, not on the serialised dict.  ``source`` is free text
+    recording which miner produced the condition, and ``weekday`` is built in
+    whatever order it was read in - so two members carrying the genuinely same
+    constraint could compare unequal, and the shared constraint would be dropped
+    from the scene, which then fires more widely than any member's own evidence
+    supports.
+    """
+    return json.dumps(
+        {
+            "kind": condition.kind,
+            "entity_id": condition.entity_id,
+            "state": condition.state,
+            "above": condition.above,
+            "below": condition.below,
+            "weekday": sorted(condition.weekday or []),
+            "after": condition.after,
+            "before": condition.before,
+        },
+        sort_keys=True,
+        default=str,
+    )
 
 
 def _consolidate(name: str, reason: str, members: Sequence[Candidate],
@@ -224,8 +309,8 @@ def _consolidate(name: str, reason: str, members: Sequence[Candidate],
     shared_conditions = []
     first, *rest = members
     for condition in first.conditions:
-        serialised = condition.as_dict()
-        if all(any(c.as_dict() == serialised for c in other.conditions) for other in rest):
+        key = _condition_key(condition)
+        if all(any(_condition_key(c) == key for c in other.conditions) for other in rest):
             shared_conditions.append(condition)
 
     actions: list[Any] = []
@@ -306,6 +391,7 @@ def propose_and_verify(
 
     tolerance = float(options.backtest_match_tolerance_seconds)
     used: set[str] = set()
+    built: set[str] = set()
     for proposal in proposals[:MAX_SCENES]:
         if not isinstance(proposal, dict):
             continue
@@ -353,10 +439,20 @@ def propose_and_verify(
         scene.backtest = consolidated.backtest
         scene.accepted = outcome.passed
         scene.candidate = consolidated
+        if consolidated.id in built:
+            # Two groupings can consolidate to the same rule - the action list
+            # is de-duplicated, so a group and a superset of it whose extra
+            # member adds nothing new produce identical triggers, conditions and
+            # actions, and `Candidate.id` hashes exactly those.  Both would be
+            # persisted under one id, and the second would silently overwrite
+            # the first's name and members.
+            result.rejected_duplicate += 1
+            continue
         result.scenes.append(scene)
         if not outcome.passed:
             result.rejected_by_backtest += 1
             continue
+        built.add(consolidated.id)
         used.update(member_ids)
     return result
 

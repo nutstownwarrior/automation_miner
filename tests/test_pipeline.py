@@ -640,10 +640,16 @@ def test_a_crash_in_any_of_the_four_only_makes_the_run_partial(
 
 
 def test_a_hidden_suggestion_is_not_announced(ha_config_dir, store, fake_client, monkeypatch):
-    """Hiding it on the page and still pushing it to a phone would be worse than not hiding it."""
+    """Hiding it on the page and still pushing it to a phone would be worse than not hiding it.
+
+    One run, with the preference already in place, so the suppression lands on a
+    suggestion the store is seeing for the very first time.  Suppressing on a
+    *second* run proves nothing: `suggestions_first_seen_in` filters on
+    `seen_count = 1` as well, and that clause alone would exclude it however the
+    status filter behaved.
+    """
     _use_stub(monkeypatch, _Stub())
-    run(ha_config_dir, store, fake_client)
-    _dismiss_housekeeping(store)
+    store.add_preference("Never automate the hallway.")
 
     report, _candidates = run(
         ha_config_dir, store, fake_client, llm_provider="ollama", llm_preferences=True,
@@ -651,9 +657,11 @@ def test_a_hidden_suggestion_is_not_announced(ha_config_dir, store, fake_client,
     )
     hidden = store.list_suggestions(status="suppressed")
     assert hidden, "this test needs something to have been hidden"
+    assert all(s["seen_count"] == 1 for s in hidden), "must be a first sighting"
+
     last_run = store.last_run()
-    announced = {s["title"] for s in store.suggestions_first_seen_in(last_run["id"])}
-    assert not ({s["title"] for s in hidden} & announced)
+    announced = {s["id"] for s in store.suggestions_first_seen_in(last_run["id"])}
+    assert not ({s["id"] for s in hidden} & announced)
     assert report.notified["new"] == len(announced)
 
 
@@ -693,3 +701,102 @@ def test_a_preference_written_by_hand_is_applied_without_any_dismissals(
     matching = [p for p in stub.prompts if '"suggestions"' in p and '"preferences"' in p]
     assert matching, "a hand-written preference must be applied on its own"
     assert "Nothing in the bathroom, ever." in matching[-1]
+
+
+def _accepting_scene(monkeypatch):
+    """Make the scene step actually produce something to apply.
+
+    Without this the stub proposes no grouping, `grouped.accepted` is empty and
+    the apply step never runs at all - so a test that breaks it proves nothing.
+    """
+    import amminer.llm.scenes as llm_scenes
+    from amminer.miners.base import Action, Candidate, Trigger
+
+    scene = Candidate(
+        miner="scene", title="Bedtime",
+        triggers=[Trigger(kind="time", at="22:00:00")],
+        actions=[Action(service="light.turn_off", entity_id="light.kitchen")],
+        score=0.8,
+    )
+    scene.backtest = {"passed": True, "precision": 1.0}
+
+    def fake_propose(*args, **kwargs):
+        result = llm_scenes.SceneResult(proposed=1)
+        result.scenes.append(
+            llm_scenes.Scene(name="Bedtime", reason="r", members=[],
+                             candidate=scene, accepted=True)
+        )
+        return result
+
+    monkeypatch.setattr(llm_scenes, "propose_and_verify", fake_propose)
+    return scene
+
+
+@pytest.mark.parametrize(
+    ("module_name", "attribute"),
+    [
+        ("amminer.llm.areas", "apply_inferences"),
+        ("amminer.llm.scenes", "apply_scenes"),
+        ("amminer.llm.explain", "apply_explanations"),
+    ],
+)
+def test_a_crash_while_applying_an_ai_result_does_not_end_the_run(
+    ha_config_dir, store, fake_client, monkeypatch, module_name, attribute
+):
+    """`run_ai` wraps the model call; the step that applies its result needs it too."""
+    import importlib
+
+    _accepting_scene(monkeypatch)
+    module = importlib.import_module(module_name)
+
+    def explode(*args, **kwargs):
+        raise RuntimeError(f"a bug in {attribute}")
+
+    monkeypatch.setattr(module, attribute, explode)
+    _use_stub(monkeypatch, _Stub())
+    report, _candidates = run(
+        ha_config_dir, store, fake_client, llm_provider="ollama",
+        llm_areas=True, llm_scenes=True, llm_explain=True,
+    )
+    assert report.status != "error"
+    assert report.surfaced > 0, "the deterministic miners must still deliver"
+    assert store.list_suggestions(status="new")
+
+
+def test_a_model_that_is_down_does_not_wipe_the_preferences_you_have(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    """`learn` reports a timeout as an empty list, and empty means 'withdraw them all'."""
+    _use_stub(monkeypatch, _Stub())
+    run(ha_config_dir, store, fake_client)
+    _dismiss_housekeeping(store)
+    run(ha_config_dir, store, fake_client, llm_provider="ollama", llm_preferences=True)
+    assert store.list_preferences(), "this test needs a preference to have been learned"
+
+    _use_stub(monkeypatch, _Stub(raises=True))
+    report, _candidates = run(
+        ha_config_dir, store, fake_client, llm_provider="ollama", llm_preferences=True,
+    )
+    assert store.list_preferences(), "a bad night must not delete what was learned"
+    assert any("could not be refreshed" in d for d in report.degradations)
+
+
+def test_a_dismissed_scene_is_not_surfaced_again(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    """A scene's id is a hash of its parts, so it comes back identical every run.
+
+    Mined candidates are filtered against the dismissal list before backtesting;
+    scenes are built afterwards, so without their own filter a dismissed scene
+    kept being counted as surfaced for ever.
+    """
+    scene = _accepting_scene(monkeypatch)
+    _use_stub(monkeypatch, _Stub())
+
+    first, _ = run(ha_config_dir, store, fake_client, llm_provider="ollama", llm_scenes=True)
+    assert store.get_suggestion(scene.id) is not None, "the scene must reach the store"
+    store.dismiss(scene.id, "not a routine I have")
+
+    second, _ = run(ha_config_dir, store, fake_client, llm_provider="ollama", llm_scenes=True)
+    assert scene.id not in {s["id"] for s in store.list_suggestions(status="new")}
+    assert second.surfaced == first.surfaced - 1

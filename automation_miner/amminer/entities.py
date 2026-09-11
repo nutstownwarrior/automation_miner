@@ -102,6 +102,10 @@ class EntityInfo:
             "name": self.name,
             "area": self.area_name,
             "area_inferred": self.area_inferred,
+            # Why it was guessed, so the guess can be argued with rather than
+            # only flagged.  Collected since the feature was added and, until
+            # now, readable by nothing.
+            "area_inferred_reason": self.area_inferred_reason,
             "floor": self.floor_name,
             "device": self.device_name,
             "manufacturer": self.manufacturer,

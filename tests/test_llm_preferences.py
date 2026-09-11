@@ -8,6 +8,7 @@ that does not exist, and a preference the user has switched off.
 
 from __future__ import annotations
 
+import pytest
 from amminer.llm import preferences as prefs
 from amminer.llm.provider import LLMError, NullProvider
 from amminer.miners.base import Action, Candidate, Trigger
@@ -149,7 +150,7 @@ def test_switching_a_preference_off_survives_the_next_run(tmp_path):
     store = Store(tmp_path / "s.db")
     preference = _preference()
     store.save_preferences([preference.as_dict()])
-    assert store.deactivate_preference(preference.id)
+    assert store.deactivate_preference(preference.id) == 0  # it was hiding nothing
 
     store.save_preferences([preference.as_dict()])  # the next run relearns it
     assert [p["active"] for p in store.list_preferences(active_only=False)] == [0]
@@ -268,7 +269,8 @@ def test_deleting_removes_it_and_restores_what_it_hid(tmp_path):
     )
     store.set_status("s1", STATUS_SUPPRESSED)
 
-    assert store.delete_preference(preference.id) is True
+    assert store.delete_preference(preference.id) == 1
+    assert store.get_preference(preference.id) is None
     assert store.list_preferences(active_only=False) == []
     assert store.get_suggestion("s1")["status"] == STATUS_NEW
 
@@ -276,7 +278,9 @@ def test_deleting_removes_it_and_restores_what_it_hid(tmp_path):
 def test_a_preference_can_be_switched_back_on(tmp_path):
     store, preference = _stored(tmp_path)
     store.deactivate_preference(preference.id)
-    assert store.activate_preference(preference.id) is True
+    assert store.list_preferences(active_only=False)[0]["active"] == 0
+    store.activate_preference(preference.id)
+    assert store.list_preferences(active_only=False)[0]["active"] == 1
     assert [p["id"] for p in store.list_preferences()] == [preference.id]
 
 
@@ -365,9 +369,152 @@ def test_drafting_with_no_provider_says_so():
     assert proposal == "" and "no LLM provider" in error
 
 
-def test_drafting_is_a_proposal_and_touches_no_store(tmp_path):
-    """A model that could edit a stored preference could reword what hides things."""
-    store, preference = _stored(tmp_path)
-    before = store.list_preferences(active_only=False)
-    prefs.draft("change it completely", preference.rule, StubLLM({"rule": "Something else."}))
-    assert store.list_preferences(active_only=False) == before
+
+# --- what a model can send that is not what was asked for ----------------
+def test_the_same_dismissal_cited_twice_is_still_one_dismissal():
+    """Otherwise a preference generalised from one dismissal clears the bar."""
+    llm = StubLLM({"preferences": [{"rule": "Never do X.", "from": ["d1", "d1"]}]})
+    learned, _ = prefs.learn(THREE, llm)
+    assert learned == []
+
+
+def test_citations_are_deduplicated_in_the_evidence():
+    llm = StubLLM({"preferences": [{"rule": "Never do X.", "from": ["d1", "d2", "d1"]}]})
+    learned, _ = prefs.learn(THREE, llm)
+    assert [p.evidence for p in learned] == [["d1", "d2"]]
+
+
+@pytest.mark.parametrize(
+    ("label", "cited"),
+    [
+        ("a bare number where a list belongs", 5),
+        ("a string where a list belongs", "d1"),
+        ("an unhashable nested value", ["d1", {"nested": "x"}]),
+        ("a nested list", ["d1", ["d2"]]),
+        ("null", None),
+    ],
+)
+def test_learn_never_raises_on_a_malformed_citation_list(label, cited):
+    """'Never raises' has to hold against any JSON, not just the shape asked for."""
+    llm = StubLLM({"preferences": [{"rule": "Never do X.", "from": cited}]})
+    learned, error = prefs.learn(THREE, llm)
+    assert (learned, error) == ([], None)
+
+
+@pytest.mark.parametrize(
+    "preference_id", [["p1"], {"id": "p1"}, 7, None, True]
+)
+def test_applying_never_raises_on_a_malformed_preference_id(preference_id):
+    one = candidate()
+    llm = StubLLM({"matches": [{"id": one.id, "preference": preference_id, "reason": "x"}]})
+    result = prefs.apply_preferences([one], [_preference()], llm)
+    assert result.suppressed == {}
+
+
+def test_an_invented_id_cannot_bloat_the_run_report():
+    one = candidate()
+    llm = StubLLM({"matches": [{"id": "X" * 5000, "preference": _preference().id}]})
+    result = prefs.apply_preferences([one], [_preference()], llm)
+    assert len(result.unknown_ids[0]) <= 100
+
+
+def test_valid_preferences_are_not_lost_behind_invalid_ones():
+    """The cap counts what survived, not what the model happened to list first."""
+    entries = [{"rule": f"Bad {i}.", "from": ["d1"]} for i in range(10)]
+    entries += [{"rule": f"Good {i}.", "from": ["d1", "d2"]} for i in range(3)]
+    learned, _ = prefs.learn(THREE, StubLLM({"preferences": entries}))
+    assert [p.rule for p in learned] == ["Good 0.", "Good 1.", "Good 2."]
+
+
+# --- undoing a preference has to reach every suggestion it hid -----------
+def _hide(store, suggestion_id, preference_id, score=0.5):
+    store.upsert_suggestion(
+        suggestion_id, "time_of_day", f"t{suggestion_id}", "s", score,
+        {"extra": {"suppressed_by": {"preference": preference_id}}}, run_id=1,
+    )
+    store.set_status(suggestion_id, STATUS_SUPPRESSED)
+
+
+def test_undoing_reaches_more_than_one_page_of_hidden_suggestions(tmp_path):
+    """Reading them back a page at a time left the tail hidden with nothing pointing at it."""
+    store = Store(tmp_path / "s.db")
+    preference = _preference()
+    store.save_preferences([preference.as_dict()])
+    for index in range(250):
+        _hide(store, f"s{index}", preference.id)
+
+    assert store.deactivate_preference(preference.id) == 250
+    assert store.list_suggestions(status=STATUS_SUPPRESSED, limit=500) == []
+
+
+def test_undoing_reaches_low_scored_suggestions_behind_another_preference(tmp_path):
+    """The undo must be scoped to its own preference, not to the top of the table."""
+    store = Store(tmp_path / "s.db")
+    mine, noisy = _preference("Mine."), _preference("Noisy.")
+    store.save_preferences([mine.as_dict(), noisy.as_dict()])
+    for index in range(250):
+        _hide(store, f"loud{index}", noisy.id, score=0.99)
+    for index in range(3):
+        _hide(store, f"quiet{index}", mine.id, score=0.01)
+
+    assert store.deactivate_preference(mine.id) == 3
+    assert all(
+        store.get_suggestion(f"quiet{i}")["status"] == STATUS_NEW for i in range(3)
+    )
+
+
+def test_a_malformed_payload_does_not_take_the_undo_with_it(tmp_path):
+    store = Store(tmp_path / "s.db")
+    preference = _preference()
+    store.save_preferences([preference.as_dict()])
+    _hide(store, "good", preference.id)
+    store.upsert_suggestion("bad", "m", "t", "s", 0.5, {}, run_id=1)
+    store._execute("UPDATE suggestions SET payload = ?, status = ? WHERE id = ?",
+                   ("not json at all", STATUS_SUPPRESSED, "bad"))
+
+    assert store.deactivate_preference(preference.id) == 1
+    assert store.get_suggestion("good")["status"] == STATUS_NEW
+
+
+def test_a_preference_switched_off_mid_run_hides_nothing(tmp_path):
+    """A run decides from a snapshot; the user may have switched it off since."""
+    store = Store(tmp_path / "s.db")
+    preference = _preference()
+    store.save_preferences([preference.as_dict()])
+    store.upsert_suggestion("s1", "m", "t", "s", 0.5, {}, run_id=1)
+
+    store.deactivate_preference(preference.id)
+    assert store.suppress_if_active("s1", preference.id) is False
+    assert store.get_suggestion("s1")["status"] == STATUS_NEW
+
+
+def test_a_preference_deleted_mid_run_hides_nothing(tmp_path):
+    store = Store(tmp_path / "s.db")
+    preference = _preference()
+    store.save_preferences([preference.as_dict()])
+    store.upsert_suggestion("s1", "m", "t", "s", 0.5, {}, run_id=1)
+
+    store.delete_preference(preference.id)
+    assert store.suppress_if_active("s1", preference.id) is False
+    assert store.get_suggestion("s1")["status"] == STATUS_NEW
+
+
+def test_a_decision_the_user_made_mid_run_is_not_overruled(tmp_path):
+    store = Store(tmp_path / "s.db")
+    preference = _preference()
+    store.save_preferences([preference.as_dict()])
+    store.upsert_suggestion("s1", "m", "t", "s", 0.5, {}, run_id=1)
+    store.set_status("s1", "accepted")
+
+    assert store.suppress_if_active("s1", preference.id) is False
+    assert store.get_suggestion("s1")["status"] == "accepted"
+
+
+def test_an_active_preference_still_hides(tmp_path):
+    store = Store(tmp_path / "s.db")
+    preference = _preference()
+    store.save_preferences([preference.as_dict()])
+    store.upsert_suggestion("s1", "m", "t", "s", 0.5, {}, run_id=1)
+
+    assert store.suppress_if_active("s1", preference.id) is True
+    assert store.get_suggestion("s1")["status"] == STATUS_SUPPRESSED

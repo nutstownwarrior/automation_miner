@@ -58,50 +58,83 @@ Shape:
                    "text": "You switched this on at about 06:30 on 30 of the 34 weekdays in the window."}]}
 """
 
-#: Numbers in the sentence must come from here.
-_NUMBER = re.compile(r"\d+(?:\.\d+)?")
+#: Numbers in the sentence must come from here.  A leading minus is part of the
+#: token: none of these quantities is ever negative, so "-30" must not pass on
+#: the strength of "30".
+_NUMBER = re.compile(r"-?\d+(?:\.\d+)?")
+
+#: A digit-group separator inside a number, so "1,234" is read as one figure
+#: instead of as "1" and "234" - which rejected a perfectly correct sentence.
+_THOUSANDS = re.compile(r"(?<=\d),(?=\d{3}(?!\d))")
+
+#: "30 of 34" / "30 out of the 34".  These two numbers are a *pair* and have to
+#: be checked as one, because each of them can be individually permitted while
+#: the pair says something the evidence never said.
+_PAIR = re.compile(
+    r"(-?\d+(?:\.\d+)?)\s+(?:of|out of)\s+(?:the\s+)?(-?\d+(?:\.\d+)?)", re.IGNORECASE
+)
+
+#: Written-out numbers sidestep every check above, so a sentence containing one
+#: is dropped rather than waved through: unverifiable is not the same as
+#: correct, and this feature's whole job is to refuse the difference.
+_NUMBER_WORDS = frozenset(
+    """zero one two three four five six seven eight nine ten eleven twelve
+    thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty thirty
+    forty fifty sixty seventy eighty ninety hundred thousand half twice double
+    dozen""".split()
+)
+_WORD = re.compile(r"[a-z]+")
+
+
+def _forms(number: float, ratio: bool) -> set[str]:
+    """Every way a permitted quantity may reasonably be written.
+
+    Rounded forms are deliberately withheld from a raw 0-1 ratio.  Adding them
+    put "1" (and often "0") into the allowed set for almost every candidate -
+    ``f"{0.88:.0f}"`` is ``"1"`` - which let the single most common invented
+    figure in a sentence like "this happened only 1 time" through unchallenged.
+    A ratio belongs in a sentence as a percentage or as itself, never rounded to
+    a bare integer.
+    """
+    forms = {f"{number:g}"}
+    if ratio:
+        return forms
+    forms.update({f"{number:.0f}", f"{number:.1f}", f"{number:.2f}"})
+    forms.add(str(int(number)) if number == int(number) else f"{number}")
+    return forms
 
 
 def _permitted_numbers(candidate: Candidate) -> set[str]:
     """Every number a sentence about this candidate is allowed to contain."""
     evidence = candidate.evidence
-    values: list[Any] = [
-        evidence.occurrences,
-        evidence.opportunities,
-        evidence.window_days,
-        evidence.spread_minutes,
+    values: list[tuple[Any, bool]] = [
+        (evidence.occurrences, False),
+        (evidence.opportunities, False),
+        (evidence.window_days, False),
+        (evidence.spread_minutes, False),
     ]
     for ratio in (evidence.consistency, evidence.support, evidence.confidence):
         if ratio is not None:
-            values.extend([ratio, ratio * 100])
+            values.extend([(ratio, True), (ratio * 100, False)])
     if evidence.lift is not None:
-        values.append(evidence.lift)
+        values.append((evidence.lift, False))
     if candidate.backtest:
         for key in ("true_fires", "false_fires", "missed", "total_fires", "window_days"):
-            values.append(candidate.backtest.get(key))
+            values.append((candidate.backtest.get(key), False))
         for key in ("precision", "recall"):
             ratio = candidate.backtest.get(key)
-            if isinstance(ratio, (int, float)):
-                values.extend([ratio, ratio * 100])
+            if isinstance(ratio, (int, float)) and not isinstance(ratio, bool):
+                values.extend([(ratio, True), (ratio * 100, False)])
 
     allowed: set[str] = set()
-    for value in values:
+    for value, ratio in values:
         if value is None or isinstance(value, bool):
             continue
         try:
             number = float(value)
         except (TypeError, ValueError):
             continue
-        # Accept the value however it is reasonably written.
-        allowed.update(
-            {
-                f"{number:g}",
-                f"{number:.0f}",
-                f"{number:.1f}",
-                f"{number:.2f}",
-                str(int(number)) if number == int(number) else f"{number}",
-            }
-        )
+        allowed.update(_forms(number, ratio))
     # Times of day and small ordinals in the rule itself are fair game.
     for trigger in candidate.triggers:
         for part in _NUMBER.findall(str(trigger.at or "")):
@@ -110,18 +143,60 @@ def _permitted_numbers(candidate: Candidate) -> set[str]:
     return allowed
 
 
+def _permitted_pairs(candidate: Candidate) -> set[tuple[str, str]]:
+    """The "N of M" figures the evidence actually supports, as pairs."""
+    pairs: list[tuple[Any, Any]] = [
+        (candidate.evidence.occurrences, candidate.evidence.opportunities)
+    ]
+    if candidate.backtest:
+        pairs.append(
+            (candidate.backtest.get("true_fires"), candidate.backtest.get("total_fires"))
+        )
+    out: set[tuple[str, str]] = set()
+    for left, right in pairs:
+        if left is None or right is None:
+            continue
+        try:
+            out.add((f"{float(left):g}", f"{float(right):g}"))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _normalise(token: str) -> str:
+    try:
+        return f"{float(token):g}"
+    except ValueError:
+        return token
+
+
 def invented_numbers(text: str, candidate: Candidate) -> list[str]:
-    """Numbers in *text* that the evidence does not support."""
+    """Numbers in *text* that the evidence does not support.
+
+    Three separate ways a sentence can be wrong about a number, all of which
+    drop the sentence: a figure that appears nowhere in the evidence, a figure
+    that appears but is written as a word so it cannot be checked, and a pair of
+    individually-permitted figures asserted about each other.
+    """
+    text = _THOUSANDS.sub("", text)
     allowed = _permitted_numbers(candidate)
     out: list[str] = []
+
     for raw in _NUMBER.findall(text):
-        normalised = {raw, raw.lstrip("0") or "0"}
-        try:
-            normalised.add(f"{float(raw):g}")
-        except ValueError:
-            pass
+        normalised = {raw, raw.lstrip("0") or "0", _normalise(raw)}
         if not (normalised & allowed):
             out.append(raw)
+
+    # "30 of 34" is a claim about a ratio, not two independent numbers.  Both
+    # halves can be permitted and the pair still assert something the evidence
+    # never said - quoting the window length as the number of occurrences, say.
+    pairs = _permitted_pairs(candidate)
+    for left, right in _PAIR.findall(text):
+        if (_normalise(left), _normalise(right)) not in pairs:
+            out.extend(part for part in (left, right) if part not in out)
+
+    words = set(_WORD.findall(text.lower()))
+    out.extend(sorted(words & _NUMBER_WORDS))
     return out
 
 
@@ -146,9 +221,29 @@ class ExplanationResult:
         }
 
 
+#: The evidence fields a model may see.  An allowlist, not a blocklist: popping
+#: ``samples`` was not enough, because ``extra`` carries raw epoch timestamps of
+#: its own for some miners (a motif's ``start_ts``, a stale automation's
+#: ``last_triggered``), and the window bounds are exact timestamps too.  A
+#: blocklist here has to be updated every time a miner adds a field, and is
+#: wrong in the meantime.
+EVIDENCE_FIELDS = (
+    "occurrences",
+    "opportunities",
+    "consistency",
+    "support",
+    "confidence",
+    "lift",
+    "spread_minutes",
+    "window_days",
+    "notes",
+    "summary",
+)
+
+
 def _describe(candidate: Candidate, resolver=None) -> dict[str, Any]:
-    evidence = candidate.evidence.as_dict()
-    evidence.pop("samples", None)  # raw timestamps never leave this process
+    full = candidate.evidence.as_dict()
+    evidence = {key: full[key] for key in EVIDENCE_FIELDS if key in full}
     return {
         "id": candidate.id,
         "title": candidate.title,

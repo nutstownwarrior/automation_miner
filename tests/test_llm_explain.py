@@ -126,3 +126,55 @@ def test_a_dropped_sentence_leaves_the_card_as_it_was():
     llm = StubLLM({"explanations": [{"id": one.id, "text": "This happened 999 times."}]})
     explain_mod.apply_explanations([one], explain_mod.explain([one], llm))
     assert "explanation" not in one.extra
+
+
+# --- ways a number can be wrong that set membership alone misses ---------
+def test_a_permitted_number_asserted_about_the_wrong_field_is_caught():
+    """28 is a real figure here - the window length, not the occurrence count."""
+    one, result = _explain("This fired 28 of the 34 times it could have.")
+    assert result.texts == {}
+
+
+def test_the_real_pair_still_passes():
+    one, result = _explain("This fired 30 of the 34 times it could have.")
+    assert one.id in result.texts
+
+
+def test_a_ratio_is_not_permitted_rounded_to_a_bare_integer():
+    """f"{0.88:.0f}" is "1", which let the commonest invented figure through."""
+    one, result = _explain("This happened only 1 time this week.")
+    assert result.texts == {}
+
+
+def test_a_number_written_as_a_word_is_not_a_number_that_was_checked():
+    one, result = _explain("You did this on thirty-four of the thirty-eight mornings.")
+    assert result.texts == {}
+
+
+def test_a_negative_number_does_not_pass_on_the_strength_of_its_magnitude():
+    one, result = _explain("It happened -30 times in the window.")
+    assert result.texts == {}
+
+
+def test_a_correct_figure_with_a_thousands_separator_is_kept():
+    """Splitting on the comma rejected a sentence that was exactly right."""
+    one = candidate(occurrences=1234, opportunities=1300, consistency=None)
+    _, result = _explain("This happened 1,234 times.", one)
+    assert one.id in result.texts
+
+
+def test_no_evidence_field_leaks_a_raw_timestamp():
+    """A blocklist that pops `samples` misses the timestamps inside `extra`."""
+    one = candidate()
+    one.evidence.window_start_ts = 1699999000.0
+    one.evidence.window_end_ts = 1700000000.0
+    one.evidence.extra["motifs"] = [{"start_ts": 1699999999.123, "length": 4}]
+    one.backtest = {
+        "true_fires": 5, "total_fires": 6, "precision": 0.83,
+        "fire_samples": [1699999111.0], "false_fire_samples": [1699999222.0],
+    }
+    llm = StubLLM({"explanations": []})
+    explain_mod.explain([one], llm)
+    prompt = llm.prompts[0]
+    for leaked in ("1699999999", "1699999000", "1700000000", "1699999111", "1699999222"):
+        assert leaked not in prompt, f"{leaked} reached the model"

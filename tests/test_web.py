@@ -435,7 +435,10 @@ def test_deleting_and_re_enabling_a_preference(wired):
     assert store.list_preferences() == []
     assert client.post("/api/preferences/pguest/on").status_code == 200
     assert len(store.list_preferences()) == 1
-    assert client.post("/api/preferences/pguest/delete").status_code == 200
+    deleted = client.post("/api/preferences/pguest/delete")
+    assert deleted.status_code == 200
+    # A preference that hid nothing still deletes: 0 restored is not "not found".
+    assert deleted.json()["restored"] == 0
     assert store.list_preferences(active_only=False) == []
     assert client.post("/api/preferences/pguest/delete").status_code == 404
 
@@ -616,3 +619,69 @@ def test_a_slow_model_does_not_freeze_the_rest_of_the_ui(
     assert (health_status, draft_status) == (200, 200)
     assert answered_while_waiting, "/health only answered once the model call had finished"
     assert elapsed < 0.5, f"/health waited {elapsed:.2f}s behind a model call"
+
+
+def test_building_the_provider_does_not_freeze_the_ui_either(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    """Constructing the provider is I/O too, and it was left on the event loop.
+
+    The Ollama provider probes several candidate hosts with synchronous HTTP at
+    a two-second timeout each while it is being built, so every click of the
+    wording helper stalled the whole UI for seconds whenever Ollama was simply
+    not running. The other timing test cannot see this: it replaces
+    `build_provider` outright, which is precisely the call that blocked.
+    """
+    import asyncio
+
+    import amminer.llm.provider as provider_mod
+
+    def slow_discovery(*args, **kwargs):
+        time.sleep(1.0)  # what probing unreachable hosts actually costs
+        return None, []
+
+    monkeypatch.setattr(provider_mod, "discover_ollama", slow_discovery)
+    options = Options(
+        ha_config_dir=str(ha_config_dir), state_dir=str(ha_config_dir),
+        llm_provider="ollama", llm_preferences=True,
+    )
+    runner = Runner(options, store, fake_client)
+    runner.ha_config = HAConfig(ha_config_dir)
+    app = create_app(options, store, runner=runner, client=fake_client, ingress_only=False)
+
+    async def call(method, path, body=b""):
+        sent = []
+        scope = {
+            "type": "http", "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": "1.1", "method": method, "scheme": "http",
+            "path": path, "raw_path": path.encode(), "query_string": b"",
+            "root_path": "", "client": ("172.30.32.2", 5000),
+            "server": ("testserver", 80),
+            "headers": [(b"host", b"testserver"), (b"content-type", b"application/json")],
+        }
+
+        async def receive():
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        async def send(message):
+            sent.append(message)
+
+        await app(scope, receive, send)
+        return next(m["status"] for m in sent if m["type"] == "http.response.start")
+
+    async def both():
+        started = time.monotonic()
+        slow = asyncio.create_task(
+            call("POST", "/api/preferences/draft", b'{"instruction": "narrow it"}')
+        )
+        await asyncio.sleep(0.1)
+        health = await call("GET", "/api/health")
+        elapsed = time.monotonic() - started
+        answered_while_waiting = not slow.done()
+        await slow
+        return health, elapsed, answered_while_waiting
+
+    health_status, elapsed, answered_while_waiting = asyncio.run(both())
+    assert health_status == 200
+    assert answered_while_waiting, "/health waited for the provider to be built"
+    assert elapsed < 0.5, f"/health waited {elapsed:.2f}s while a provider was built"

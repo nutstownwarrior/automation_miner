@@ -102,12 +102,27 @@ def unplaced(resolver) -> list[Any]:
 
 
 def _area_index(resolver) -> dict[str, tuple[str, str]]:
-    """Lower-cased area name -> ``(area_id, canonical name)``."""
+    """Lower-cased area name -> ``(area_id, canonical name)``.
+
+    A name shared by two areas is dropped rather than resolved to whichever one
+    happened to be last: the model is shown one name and its answer would be
+    written to an arbitrary one of the two rooms.  Guessing between them is
+    exactly what this feature must not do, so it declines to guess at all.
+    """
     index: dict[str, tuple[str, str]] = {}
+    ambiguous: set[str] = set()
     for area_id, area in resolver.registries.areas.items():
         name = (area.name or "").strip()
-        if name:
-            index[name.lower()] = (area_id, name)
+        if not name:
+            continue
+        key = name.lower()
+        if key in index:
+            ambiguous.add(key)
+            continue
+        index[key] = (area_id, name)
+    for key in ambiguous:
+        _LOGGER.info("Two areas are both called %r; neither is offered as a guess", key)
+        index.pop(key, None)
     return index
 
 

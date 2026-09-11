@@ -263,3 +263,125 @@ def test_a_malformed_reply_groups_nothing(bedtime):
         members, changes, store, options, WINDOW, StubLLM({"scenes": "nope"})
     )
     assert result.accepted == []
+
+
+# --- ways a grouping can be wrong that the first pass let through --------
+def test_two_members_setting_the_same_entity_differently_is_a_conflict():
+    """Same service, same entity, different payload: the scene would fire both."""
+    pair = [
+        at(22, 0, "light.x", service="light.turn_on"),
+        at(22, 2, "light.x", service="light.turn_on"),
+    ]
+    pair[0].actions[0].data = {"brightness": 30}
+    pair[1].actions[0].data = {"brightness": 255}
+    assert scenes_mod.contradictory_actions(pair) is True
+
+
+def test_two_setpoints_on_one_thermostat_is_a_conflict():
+    """climate.set_temperature has no target state, so nothing used to see this."""
+    pair = [at(22, 0, "climate.hall", service="climate.set_temperature"),
+            at(22, 2, "climate.hall", service="climate.set_temperature")]
+    pair[0].actions[0].data = {"temperature": 18}
+    pair[1].actions[0].data = {"temperature": 23}
+    assert scenes_mod.contradictory_actions(pair) is True
+
+
+def test_a_toggle_alongside_another_action_on_the_same_entity_is_a_conflict():
+    pair = [at(22, 0, "light.x", service="light.toggle"),
+            at(22, 2, "light.x", service="light.turn_off")]
+    assert scenes_mod.contradictory_actions(pair) is True
+
+
+def test_identical_actions_are_still_not_a_conflict():
+    pair = [at(22, 0, "light.x", service="light.turn_off"),
+            at(22, 2, "light.y", service="light.turn_off")]
+    assert scenes_mod.contradictory_actions(pair) is False
+
+
+def test_a_routine_that_straddles_midnight_can_still_be_one_scene():
+    """The motivating example in the module's own docstring is going to bed."""
+    members = [at(23, 58, "light.a"), at(0, 2, "light.b")]
+    trigger = scenes_mod.shared_trigger(members, 900)
+    assert trigger is not None and trigger.kind == "time"
+
+
+def test_times_genuinely_far_apart_are_still_refused_across_midnight():
+    members = [at(23, 58, "light.a"), at(6, 2, "light.b")]
+    assert scenes_mod.shared_trigger(members, 900) is None
+
+
+def test_a_shared_condition_survives_a_different_weekday_order():
+    shared_a = Condition(kind="time", weekday=["mon", "tue"])
+    shared_b = Condition(kind="time", weekday=["tue", "mon"])
+    pair = [at(22, 0, "light.a", conditions=[shared_a]),
+            at(22, 2, "light.b", conditions=[shared_b])]
+    scene = scenes_mod._consolidate(
+        "S", "r", pair, scenes_mod.shared_trigger(pair, 900)
+    )
+    assert len(scene.conditions) == 1
+
+
+def test_a_shared_condition_survives_a_different_provenance_note():
+    """`source` records which miner found it, and is not part of the meaning."""
+    pair = [
+        at(22, 0, "light.a", conditions=[
+            Condition(kind="state", entity_id="person.alex", state="home",
+                      source="day-of-week clustering")]),
+        at(22, 2, "light.b", conditions=[
+            Condition(kind="state", entity_id="person.alex", state="home",
+                      source="LLM hypothesis")]),
+    ]
+    scene = scenes_mod._consolidate(
+        "S", "r", pair, scenes_mod.shared_trigger(pair, 900)
+    )
+    assert len(scene.conditions) == 1
+
+
+def test_a_sun_grouping_is_refused_rather_than_measured_and_rejected(bedtime):
+    """The backtester cannot simulate a sun trigger, so the gate said nothing useful."""
+    changes, store, options, _ = bedtime
+    pair = [
+        Candidate(miner="m", title="a", triggers=[Trigger(kind="sun", event="sunset")],
+                  actions=[Action(service="light.turn_on", entity_id="light.a")]),
+        Candidate(miner="m", title="b", triggers=[Trigger(kind="sun", event="sunset")],
+                  actions=[Action(service="light.turn_on", entity_id="light.b")]),
+    ]
+    assert scenes_mod.shared_trigger(pair, 900) is None
+    result = scenes_mod.propose_and_verify(
+        pair, changes, store, options, WINDOW,
+        StubLLM({"scenes": [{"name": "Sundown", "members": [c.id for c in pair],
+                             "reason": "r"}]}),
+    )
+    assert result.rejected_incompatible == 1 and result.rejected_by_backtest == 0
+
+
+def test_two_groupings_that_consolidate_to_one_rule_do_not_overwrite_each_other(bedtime):
+    """Both would be stored under one id, and the second would erase the first.
+
+    The members differ, so nothing earlier in the pipeline catches it; the
+    actions de-duplicate to the same list, and a candidate's id is a hash of
+    exactly its triggers, conditions and actions.
+    """
+    changes, store, options, _ = bedtime
+    # Four distinct members - the miner name is part of a candidate's id - that
+    # describe the same single action at the same moment.
+    quartet = [
+        at(22, 0, "light.kitchen", title=f"member {i}") for i in range(4)
+    ]
+    for index, member in enumerate(quartet):
+        member.miner = f"miner_{index}"
+    assert len({c.id for c in quartet}) == 4
+
+    ids = [c.id for c in quartet]
+    result = scenes_mod.propose_and_verify(
+        quartet, changes, store, options, WINDOW,
+        StubLLM({"scenes": [
+            {"name": "Bedtime", "members": ids[:2], "reason": "r"},
+            {"name": "Wind down", "members": ids[2:], "reason": "r"},
+        ]}),
+    )
+    accepted_ids = [c.id for c in result.accepted]
+    assert len(accepted_ids) == len(set(accepted_ids))
+    assert result.rejected_duplicate == 1
+    # And the one that survived kept its own name rather than being overwritten.
+    assert [c.title for c in result.accepted] == ["Bedtime"]
