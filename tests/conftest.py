@@ -326,6 +326,10 @@ class FakeHAClient:
         self.last_error = None
         self.written: dict[str, dict] = {}
         self.reloaded = False
+        #: Every service call, so tests can assert what reached Home Assistant.
+        self.service_calls: list[tuple[str, dict]] = []
+        #: When set, every service call fails the way the real client reports it.
+        self.service_fails = False
 
     def get_states(self):
         return list(self._states)
@@ -340,7 +344,18 @@ class FakeHAClient:
         self.written[automation_id] = config
         return True
 
+    def call_service(self, domain, service, data=None):
+        self.service_calls.append((f"{domain}.{service}", dict(data or {})))
+        if self.service_fails:
+            self.last_error = "service unavailable"
+            return None
+        return []
+
     def reload_automations(self):
+        # Through call_service, as the real client does, so a test watching
+        # service calls sees this one too.
+        if self.call_service("automation", "reload") is None:
+            return False
         self.reloaded = True
         return True
 

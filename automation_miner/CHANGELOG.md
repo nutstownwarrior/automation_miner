@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.3.0
+
+**Added: you no longer have to go and look**
+
+Suggestions lived in this add-on's own database, so the only way to learn a
+nightly run had found anything was to open its page. A nightly analysis nobody
+is told about is a nightly analysis nobody reads.
+
+- **`notify_on_new_suggestions`** (default `true`) posts a notification in Home
+  Assistant when a run finds something, listing the first few titles and linking
+  to the add-on. It replaces its own previous notification rather than stacking
+  a new one beside it, and it says plainly that nothing has been applied.
+- **`notify_service`** (default empty) additionally calls a notify service you
+  name, e.g. `notify.mobile_app_your_phone`, so it reaches your phone without
+  you writing an automation.
+
+Only genuinely new suggestions are announced. A run re-surfaces every rule that
+still holds, so announcing "what this run produced" would announce the same
+rules every night — which is the fastest way to make a notification something
+people switch off. A suggestion you have dismissed is never announced again.
+
+Announcing is the last thing a run does and the least important thing it does:
+it happens after everything is persisted, so a notification can only ever
+describe suggestions that are really there to read, and every failure in it is
+reported as a degradation and swallowed. An unreachable Home Assistant, a
+notify service that does not exist, or a malformed `notify_service` value costs
+you the message and nothing else — never a suggestion, never the run.
+
 ## 0.2.1
 
 **Fixed**

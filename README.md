@@ -66,6 +66,13 @@ proposed at all unless you turn on `allow_security_actions`: a correlation is
 never a reason to unlock a door, and there is no precision at which it becomes
 one.
 
+**It tells you when it finds something.** Suggestions would otherwise sit in the
+add-on's own database until you went looking. A run posts a Home Assistant
+notification, and optionally calls a notify service of your choosing, for
+*genuinely new* findings only — a run re-surfaces every rule that still holds,
+and repeating those nightly is how a notification becomes something you turn
+off. Dismissed suggestions are never announced again.
+
 **It checks for conflicts.** Before surfacing a rule it looks for value
 inconsistencies, dependency loops, redundancy with an existing automation, and
 races between entities on the same physical device. A conflicting rule is never
@@ -283,6 +290,8 @@ without touching any of it.
 | `backtest_min_true_fires` | `4` | times a rule must have been right before its percentages count |
 | `backtest_max_false_fires_per_week` | `3` | nuisance budget |
 | `backtest_max_nuisance_fires` | `0` | unwanted fires allowed where you previously overrode an automation |
+| `notify_on_new_suggestions` | `true` | post a Home Assistant notification when a run finds something new |
+| `notify_service` | `""` | also call a notify service, e.g. `notify.mobile_app_your_phone` |
 | `allow_security_actions` | `false` | let suggestions unlock, open or disarm things |
 | `excluded_domains` / `excluded_entities` / `excluded_users` | `[]` | added to sensible built-in exclusions; entities accept globs |
 | `llm_provider` | `none` | `none`, `ollama`, or a cloud provider (opt-in) |

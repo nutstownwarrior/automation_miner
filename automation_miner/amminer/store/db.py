@@ -291,6 +291,22 @@ class Store:
             self._conn.commit()
         return status
 
+    def suggestions_first_seen_in(self, run_id: int) -> list[dict[str, Any]]:
+        """Suggestions this run saw for the first time, best first.
+
+        ``seen_count`` is 1 only on the insert, and a suggestion that was
+        already dismissed keeps its status and is counted again - so this is
+        genuinely "new", not "surfaced again".  Announcing anything looser would
+        re-announce the same rules every night, which is the fastest way to make
+        a notification something people turn off.
+        """
+        rows = self._query(
+            "SELECT * FROM suggestions WHERE run_id = ? AND seen_count = 1"
+            " AND status = ? ORDER BY score DESC",
+            (run_id, STATUS_NEW),
+        )
+        return [self._row_to_suggestion(row) for row in rows]
+
     def get_suggestion(self, suggestion_id: str) -> dict[str, Any] | None:
         rows = self._query("SELECT * FROM suggestions WHERE id = ?", (suggestion_id,))
         return self._row_to_suggestion(rows[0]) if rows else None
