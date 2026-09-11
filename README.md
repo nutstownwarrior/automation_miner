@@ -217,6 +217,7 @@ suggestion.
 |---|---|---|
 | `llm_entity_classification` | Labels signal roles the pattern matcher misses — a price sensor called `sensor.stroomprijs`, a dishwasher called `switch.geschirr`. Cached until your entities change. | Remove a role the deterministic detector found. It is additive only. |
 | `llm_hypotheses` | For rules the backtest **rejected**, proposes conditions that might explain when the action really happens — "only when it's cold out", "only on workdays". Each proposal is then re-backtested. | Surface anything. Only proposals that clear the same precision and nuisance thresholds are shown, and they carry a note saying the condition was suggested and then verified. |
+| `llm_audit` | For findings about your **existing** automations, judges whether a flagged pair is a real conflict — given both rules in full, conditions included. | Raise a severity or invent a finding. It can only hide or soften what the deterministic audit already produced, and the before/after counts are reported. |
 | `llm_triage` | Flags rules that are statistically real but semantically absurd — two things that merely happen at the same time of day. | Promote or hide anything. It can lower a score and attach a visible reason; the evidence and backtest stay exactly as they were. |
 
 `llm_hypotheses` is the one that changes what the tool can *find*: the built-in

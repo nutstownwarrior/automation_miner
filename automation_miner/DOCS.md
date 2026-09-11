@@ -121,6 +121,21 @@ Unwanted fires allowed at moments where you have previously reached over and
 undone an automation on the same entity. These are not merely unnecessary - they
 land exactly where you have already said no - so the default is `0`.
 
+### `llm_audit`
+Off by default. Lets the model review the audit's findings about your existing
+automations and say whether each is a real conflict.
+
+The audit itself already refuses to report a pair whose conditions provably
+cannot both hold — "when I am home" against "when I am out", "below 20 lux"
+against "above 500". This is for the rest: two rules conditioned on different
+entities, where whether they ever coincide depends on what those entities mean
+in your house.
+
+It can only **hide** a finding or **lower** its severity. It can never raise one
+and never invent one — a warning the deterministic audit did not produce is
+never shown. The Status page reports how many findings there were before and
+after, so nothing can be hidden quietly.
+
 ### `notify_on_new_suggestions`
 On by default. Posts a notification in Home Assistant when a run finds something
 new, listing the first few and linking back here.

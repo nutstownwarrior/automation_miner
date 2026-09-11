@@ -194,6 +194,9 @@ class Options:
     # Let the model flag statistically real but semantically absurd rules.
     # Advisory only: it can demote and annotate, never promote or remove.
     llm_triage: bool = False
+    #: Let the model review audit findings about your existing automations.
+    #: It can dismiss or soften one, never raise a severity or invent a finding.
+    llm_audit: bool = False
     llm_triage_penalty: float = 0.5
 
     # --- paths (overridable for tests) ---
@@ -258,6 +261,7 @@ class Options:
             "entity_classification": bool(self.llm_entity_classification),
             "hypotheses": bool(self.llm_hypotheses),
             "triage": bool(self.llm_triage),
+            "audit_review": bool(self.llm_audit),
         }
 
     @property
