@@ -31,9 +31,19 @@ class GapSuggestion:
     gap: str
     recommendation: str
     benefit: str
+    #: What has to be true about the user's life for this to be worth doing.
+    #:
+    #: Every gap here is inferred from entities, and entities cannot see a
+    #: contract, a roof, or a commute.  "Add a dynamic price sensor" is sound
+    #: advice for someone on a variable tariff and useless for someone on a
+    #: fixed one, and the suggestion has no way to tell which.  Saying so is the
+    #: difference between a recommendation and a guess presented as one.
+    requires: str = ""
     evidence: list[str] = field(default_factory=list)
     links: list[dict[str, str]] = field(default_factory=list)
     score: float = 0.5
+    #: Set when a model proposed this rather than a detector rule.
+    source: str = "detector"
 
     @property
     def id(self) -> str:
@@ -47,13 +57,15 @@ class GapSuggestion:
             "gap": self.gap,
             "recommendation": self.recommendation,
             "benefit": self.benefit,
+            "requires": self.requires,
             "evidence": self.evidence,
             "links": self.links,
             "score": round(self.score, 3),
+            "source": self.source,
         }
 
 
-def _human_actions_by_domain(changes: Sequence[StateChange]) -> dict[str, int]:
+def human_actions_by_domain(changes: Sequence[StateChange]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for change in changes:
         if change.cause is Cause.HUMAN and change.is_transition:
@@ -70,7 +82,7 @@ def suggest(
 ) -> list[GapSuggestion]:
     """Derive every applicable gap suggestion for this instance."""
     out: list[GapSuggestion] = []
-    actions = _human_actions_by_domain(changes)
+    actions = human_actions_by_domain(changes)
     light_actions = actions.get("light", 0) + actions.get("switch", 0)
 
     # --- room presence -------------------------------------------------
@@ -141,6 +153,11 @@ def suggest(
                     "Automation Miner can then propose costed load-shifting rules, and EMHASS "
                     "becomes an option for full optimisation."
                 ),
+                requires=(
+                    "an electricity contract whose price actually varies through the day - "
+                    "a spot, hourly or time-of-use tariff. On a fixed-price contract there is "
+                    "nothing to shift loads towards and this is not worth doing."
+                ),
                 evidence=[f"Deferrable loads detected: {', '.join(deferrable[:6])}."],
                 score=0.7,
             )
@@ -161,6 +178,10 @@ def suggest(
                         "install EMHASS for whole-home optimisation against price and solar."
                     ),
                     benefit="Direct bill reduction with no change in comfort for deferrable loads.",
+                    requires=(
+                        "that the price sensor reflects what you are actually billed. If it "
+                        "tracks a market you are not exposed to, shifting saves nothing."
+                    ),
                     evidence=[
                         f"Price signal: {', '.join((signals.energy_price + signals.price_level)[:3])}.",
                         f"Deferrable loads: {', '.join(deferrable[:4])}.",
@@ -188,6 +209,10 @@ def suggest(
                     "reacting only to current production."
                 ),
                 evidence=[f"Solar production entities: {', '.join(signals.solar_production[:4])}."],
+                requires=(
+                    "solar panels on this property. The forecast is a prediction of what your "
+                    "own array will produce; without one there is nothing to forecast."
+                ),
                 score=0.6,
             )
         )
@@ -235,6 +260,10 @@ def suggest(
                     "one, a Local Calendar or CalDAV calendar for holidays."
                 ),
                 benefit="Weekday rules stop firing on public holidays and booked leave.",
+                requires=(
+                    "a schedule that follows public holidays - shift work, retirement or an "
+                    "irregular week make a workday sensor say the wrong thing."
+                ),
                 evidence=[f"Weekday-conditioned rules: {len(weekday_rules)}."],
                 score=0.55,
             )
@@ -253,6 +282,11 @@ def suggest(
                     "every 30 s - then create a person for each household member."
                 ),
                 benefit="Unlocks arrive/leave automations, which are usually the highest-value ones.",
+                requires=(
+                    "that everyone whose arrival should matter carries a phone with the "
+                    "companion app, or a tracked device. Presence is only as good as what it "
+                    "can see leave the house."
+                ),
                 evidence=["No person.* or device_tracker.* entities found."],
                 score=0.85,
             )
@@ -270,6 +304,11 @@ def suggest(
                     "sensor.electricity_maps_carbon_intensity in gCO2eq/kWh."
                 ),
                 benefit="Lets the same deferrable loads also run when the grid is cleanest.",
+                requires=(
+                    "that running loads on cleaner grid power is something you want to "
+                    "optimise for. It is a preference, not a saving - the cleanest hour and "
+                    "the cheapest hour are often different ones."
+                ),
                 evidence=[f"Deferrable loads: {', '.join(deferrable[:4])}."],
                 score=0.4,
             )

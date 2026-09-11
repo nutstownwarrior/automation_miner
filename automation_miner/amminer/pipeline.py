@@ -31,6 +31,7 @@ from .entities import build_resolver
 from .ha_api import HAClient
 from .llm import audit as llm_audit
 from .llm import classify as llm_classify
+from .llm import gaps as llm_gap_proposals
 from .llm import hypothesis as llm_hypothesis
 from .llm import triage as llm_triage
 from .llm.provider import build_provider
@@ -551,6 +552,22 @@ def run_analysis(
             gap_suggestions = gap_analysis.suggest(
                 resolver, signals, changes, passed, recorder.info
             )
+            # Additive only, and after the detector: a proposal from world
+            # knowledge is a weaker signal than a detected gap, and can never
+            # replace, reword or reorder one.
+            if provider is not None and options.llm_gaps:
+                proposals = run_ai(
+                    "gap_proposals",
+                    llm_gap_proposals.propose,
+                    signals,
+                    gap_analysis.human_actions_by_domain(changes),
+                    gap_suggestions,
+                    provider,
+                    set(resolver.known_entity_ids()),
+                )
+                if proposals is not None:
+                    gap_suggestions = list(gap_suggestions) + list(proposals.accepted)
+                    report.ai["gap_proposals"].update(proposals.as_dict())
             for gap in gap_suggestions:
                 store.upsert_gap(gap.id, gap.kind, gap.title, gap.as_dict())
             return len(gap_suggestions)

@@ -332,3 +332,48 @@ def test_but_a_real_prefix_still_matches():
     signals = detect_signals(resolver)
     assert signals.ev_charger == ["sensor.go_echarger_power"]
     assert signals.solar_production == ["sensor.sma_inverter_pv_power"]
+
+
+# --- gap preconditions ---------------------------------------------------
+def test_the_pricing_gap_names_the_contract_it_depends_on():
+    """Reported: recommended to someone on a fixed-price contract, with no caveat.
+
+    Nothing this add-on can see reveals a tariff, so the advice has to say what
+    it assumes rather than presenting a guess as a recommendation.
+    """
+    from amminer.enrich.detect import SignalSet
+    from amminer.gaps import suggest
+
+    signals = SignalSet()
+    signals.deferrable_loads = ["switch.dishwasher"]
+    resolver = EntityResolver()
+    gaps = suggest(resolver, signals, [], [], None)
+
+    pricing = [g for g in gaps if "price sensor" in g.title]
+    assert pricing, "the pricing gap should still be produced"
+    requires = pricing[0].requires
+    assert requires, "it must state its precondition"
+    assert "fixed" in requires.lower(), "it must name the case where it is useless"
+    assert pricing[0].as_dict()["requires"] == requires
+
+
+def test_a_gap_with_no_real_precondition_does_not_invent_one():
+    """Filler would make the field meaningless on the ones that matter."""
+    from amminer.enrich.detect import SignalSet
+    from amminer.gaps import suggest
+
+    signals = SignalSet()
+    signals.motion = ["binary_sensor.hall"]
+    resolver = EntityResolver()
+    changes = [
+        StateChange(entity_id="light.kitchen", state="on" if i % 2 else "off",
+                    ts=float(i), old_state="off" if i % 2 else "on", last_changed_ts=float(i))
+        for i in range(40)
+    ]
+    for change in changes:
+        change.cause = Cause.HUMAN
+
+    gaps = suggest(resolver, signals, changes, [], None)
+    presence = [g for g in gaps if "mmWave" in g.title]
+    assert presence, "the presence gap should be produced"
+    assert presence[0].requires == ""
