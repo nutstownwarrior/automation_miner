@@ -247,6 +247,35 @@ class _Stub:
                 {"id": rule["id"], "verdict": "plausible", "reason": "fine"}
                 for rule in payload["rules"]
             ]}
+        if "standing preferences" in system and "generalise" in system:
+            payload = json.loads(user)
+            ids = [d["id"] for d in payload["dismissals"]][:2]
+            return {"preferences": [
+                {"rule": "Never automate the hallway.", "from": ids},
+            ]}
+        if "apply a person's standing preferences" in system:
+            payload = json.loads(user)
+            preference = payload["preferences"][0]["id"]
+            return {"matches": [
+                {"id": payload["suggestions"][0]["id"], "preference": preference,
+                 "reason": "This is the hallway."},
+            ]}
+        if "one plain\nsentence" in system:
+            payload = json.loads(user)
+            return {"explanations": [
+                {"id": s["id"], "text": "You have done this most days."}
+                for s in payload["suggestions"]
+            ]}
+        if "really ONE routine" in system:
+            return {"scenes": []}
+        if "assign home-automation entities" in system:
+            payload = json.loads(user)
+            if not payload["areas"] or not payload["entities"]:
+                return {"placements": []}
+            return {"placements": [
+                {"entity_id": payload["entities"][0]["entity_id"],
+                 "area": payload["areas"][0], "reason": "the id says so"},
+            ]}
         return {}
 
 
@@ -507,3 +536,120 @@ def test_an_unfinished_run_is_closed_on_the_next_start(store):
     assert closed["finished_ts"] is not None
     # Nothing left to close the second time.
     assert store.close_interrupted_runs() == 0
+
+
+# --- the four later AI features, end to end -----------------------------
+def _dismiss_housekeeping(store):
+    """Leave the preference learner something to read.
+
+    These are dismissals of suggestions from an earlier era of the database,
+    which is what makes them usable here: dismissing one of *this* run's
+    suggestions would also remove it from the next run, and the fixture has few
+    enough candidates that doing it three times leaves nothing to group.
+    """
+    for index in range(3):
+        store.dismiss(f"gone-{index}", "nothing in the hallway, please")
+def test_all_four_later_features_run_and_are_reported(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    _use_stub(monkeypatch, _Stub())
+    # Dismissal reasons are what preferences are learned from, so there have
+    # to be some before the feature has anything to read.
+    run(ha_config_dir, store, fake_client)
+    _dismiss_housekeeping(store)
+
+    report, _candidates = run(
+        ha_config_dir, store, fake_client, llm_provider="ollama",
+        llm_preferences=True, llm_explain=True, llm_scenes=True, llm_areas=True,
+    )
+    assert report.status == "ok"
+    assert set(report.ai) >= {"preferences", "explanations", "scenes", "area_inference"}
+    assert all(info["ran"] for info in report.ai.values())
+
+
+def test_a_suppressed_suggestion_is_stored_hidden_and_not_counted(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    from amminer.store import STATUS_SUPPRESSED
+
+    _use_stub(monkeypatch, _Stub())
+    run(ha_config_dir, store, fake_client)
+    _dismiss_housekeeping(store)
+
+    report, _candidates = run(
+        ha_config_dir, store, fake_client, llm_provider="ollama", llm_preferences=True,
+    )
+    hidden = store.list_suggestions(status=STATUS_SUPPRESSED)
+    assert report.suppressed == 1
+    assert len(hidden) == 1
+    # Hidden, but accountable: the rule that hid it travels with it.
+    by = hidden[0]["payload"]["extra"]["suppressed_by"]
+    assert by["rule"] == "Never automate the hallway."
+    # And "surfaced" counts what the user can actually see.
+    assert report.surfaced == len(store.list_suggestions(status="new")) - len(
+        [s for s in store.list_suggestions(status="new")
+         if s["miner"] in ("stale_automation", "unused_entity")]
+    )
+
+
+def test_a_preference_never_overrules_a_decision_the_user_made(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    """Accepted, dismissed and shadow-tested are the user's calls, not a model's."""
+    from amminer.store import STATUS_SHADOW
+
+    _use_stub(monkeypatch, _Stub())
+    run(ha_config_dir, store, fake_client)
+    _dismiss_housekeeping(store)
+    # Whatever the stub picks first, the user has already asked to shadow-test.
+    for suggestion in store.list_suggestions(status="new"):
+        store.set_status(suggestion["id"], STATUS_SHADOW)
+
+    run(ha_config_dir, store, fake_client, llm_provider="ollama", llm_preferences=True)
+    assert store.list_suggestions(status="suppressed") == []
+
+
+def test_explanations_reach_the_card(ha_config_dir, store, fake_client, monkeypatch):
+    _use_stub(monkeypatch, _Stub())
+    run(ha_config_dir, store, fake_client, llm_provider="ollama", llm_explain=True)
+    explained = [
+        s for s in store.list_suggestions(status="new")
+        if s["payload"].get("extra", {}).get("explanation")
+    ]
+    assert explained, "the sentence has to land where the UI reads it"
+
+
+def test_a_crash_in_any_of_the_four_only_makes_the_run_partial(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    import amminer.llm.scenes as llm_scenes
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("a bug in the scene feature itself")
+
+    monkeypatch.setattr(llm_scenes, "propose_and_verify", explode)
+    _use_stub(monkeypatch, _Stub())
+    report, _candidates = run(
+        ha_config_dir, store, fake_client, llm_provider="ollama", llm_scenes=True,
+    )
+    assert report.status == "partial"
+    assert "scenes" in report.ai_errors
+    assert report.surfaced > 0
+
+
+def test_a_hidden_suggestion_is_not_announced(ha_config_dir, store, fake_client, monkeypatch):
+    """Hiding it on the page and still pushing it to a phone would be worse than not hiding it."""
+    _use_stub(monkeypatch, _Stub())
+    run(ha_config_dir, store, fake_client)
+    _dismiss_housekeeping(store)
+
+    report, _candidates = run(
+        ha_config_dir, store, fake_client, llm_provider="ollama", llm_preferences=True,
+        notify_on_new_suggestions=True,
+    )
+    hidden = store.list_suggestions(status="suppressed")
+    assert hidden, "this test needs something to have been hidden"
+    last_run = store.last_run()
+    announced = {s["title"] for s in store.suggestions_first_seen_in(last_run["id"])}
+    assert not ({s["title"] for s in hidden} & announced)
+    assert report.notified["new"] == len(announced)

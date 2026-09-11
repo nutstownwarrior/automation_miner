@@ -33,6 +33,10 @@ class EntityInfo:
     friendly_name: str | None = None
     area_id: str | None = None
     area_name: str | None = None
+    #: True when the area above was guessed rather than read from the registry.
+    #: Nothing may display or export the area without also saying this.
+    area_inferred: bool = False
+    area_inferred_reason: str = ""
     floor_id: str | None = None
     floor_name: str | None = None
     device_id: str | None = None
@@ -79,7 +83,12 @@ class EntityInfo:
         """One-line human description used in UI text and LLM prompts."""
         parts = [self.name]
         if self.area_name:
-            parts.append(f"in {self.area_name}")
+            # A guess is labelled everywhere it is shown, including in the
+            # prompts built from this, so nothing downstream can mistake an
+            # inference for something the user actually configured.
+            parts.append(
+                f"in {self.area_name}" + (" (guessed)" if self.area_inferred else "")
+            )
         if self.device_name and self.device_name != self.name:
             parts.append(f"on {self.device_name}")
         if self.label_names:
@@ -92,6 +101,7 @@ class EntityInfo:
             "domain": self.domain,
             "name": self.name,
             "area": self.area_name,
+            "area_inferred": self.area_inferred,
             "floor": self.floor_name,
             "device": self.device_name,
             "manufacturer": self.manufacturer,

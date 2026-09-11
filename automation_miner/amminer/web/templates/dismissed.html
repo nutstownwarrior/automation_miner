@@ -16,4 +16,42 @@
   </li>
 {% endfor %}
 </ul>
+
+{% if preferences %}
+<h2>What you have told it, in your own words</h2>
+<p class="muted">These were generalised from the reasons you gave when dismissing things.
+They can only <strong>hide</strong> a suggestion &mdash; never rank one up, and never change
+any evidence. Switch one off and everything it was hiding comes straight back.</p>
+<ul class="plain findings">
+{% for pref in preferences %}
+  <li class="{{ '' if pref.active else 'muted' }}">
+    <span class="tag status">{{ 'on' if pref.active else 'off' }}</span>
+    <strong>{{ pref.rule }}</strong>
+    <span class="muted small">learned from {{ pref.evidence | length }} dismissal(s)</span>
+    {% if pref.active %}
+    <button class="btn ghost small" data-action="preference-off" data-id="{{ pref.id }}">Switch off</button>
+    {% endif %}
+  </li>
+{% endfor %}
+</ul>
+{% endif %}
+
+{% if hidden %}
+<h2>Hidden by a preference <span class="count">{{ hidden | length }}</span></h2>
+<p class="muted">Each of these passed every gate and would have been suggested. It is
+here, and not gone, because hiding something without saying so is not something this
+add-on does.</p>
+<ul class="plain findings">
+{% for s in hidden %}
+  {% set by = ((s.payload or {}).get('extra') or {}).get('suppressed_by') or {} %}
+  <li>
+    <strong>{{ s.title }}</strong>
+    <span class="muted small">{{ s.summary }}</span>
+    {% if by.rule %}<div class="small warn">Hidden by: {{ by.rule }}</div>{% endif %}
+    {% if by.reason %}<div class="small muted">{{ by.reason }}</div>{% endif %}
+    <button class="btn ghost small" data-action="restore" data-id="{{ s.id }}">Show it anyway</button>
+  </li>
+{% endfor %}
+</ul>
+{% endif %}
 {% endblock %}

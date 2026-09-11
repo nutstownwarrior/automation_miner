@@ -5,6 +5,7 @@ from .db import (
     STATUS_DISMISSED,
     STATUS_NEW,
     STATUS_SHADOW,
+    STATUS_SUPPRESSED,
     Store,
 )
 
@@ -13,5 +14,6 @@ __all__ = [
     "STATUS_DISMISSED",
     "STATUS_NEW",
     "STATUS_SHADOW",
+    "STATUS_SUPPRESSED",
     "Store",
 ]

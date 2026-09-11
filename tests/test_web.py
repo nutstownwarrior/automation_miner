@@ -8,6 +8,7 @@ from amminer.discovery.ha_config import HAConfig
 from amminer.runner import Runner, candidate_from_payload
 from amminer.web.app import create_app
 from fastapi.testclient import TestClient
+from markupsafe import escape
 
 
 @pytest.fixture
@@ -300,3 +301,88 @@ def test_restore_is_not_undone_by_the_next_run(wired):
 def test_restoring_an_unknown_suggestion_is_404(wired):
     client, _store, _runner, _ha = wired
     assert client.post("/api/suggestions/nope/restore").status_code == 404
+
+
+# --- what the optional AI features put on screen ------------------------
+def test_a_hidden_suggestion_is_shown_with_the_rule_that_hid_it(wired):
+    """Hiding something without saying so is not something this add-on does."""
+    from amminer.store import STATUS_SUPPRESSED
+
+    client, store, _runner, _ha = wired
+    store.save_preferences([
+        {"id": "pguest", "rule": "Never automate the guest room.", "evidence": ["d1", "d2"]}
+    ])
+    suggestion = store.list_suggestions(status="new")[0]
+    payload = dict(suggestion["payload"])
+    payload["extra"] = {
+        "suppressed_by": {"preference": "pguest", "rule": "Never automate the guest room.",
+                          "reason": "This is the guest room."}
+    }
+    store.upsert_suggestion(
+        suggestion["id"], suggestion["miner"], suggestion["title"], suggestion["summary"],
+        suggestion["score"], payload,
+    )
+    store.set_status(suggestion["id"], STATUS_SUPPRESSED)
+
+    title = str(escape(suggestion["title"]))
+    page = client.get("/dismissed").text
+    assert "Hidden by a preference" in page
+    assert "Never automate the guest room." in page
+    assert title in page
+    # And it is not on the suggestions page it was hidden from.
+    assert title not in client.get("/").text
+
+
+def test_switching_a_preference_off_restores_what_it_hid(wired):
+    from amminer.store import STATUS_NEW, STATUS_SUPPRESSED
+
+    client, store, _runner, _ha = wired
+    store.save_preferences([{"id": "pguest", "rule": "No guest room.", "evidence": ["d1"]}])
+    suggestion = store.list_suggestions(status="new")[0]
+    payload = dict(suggestion["payload"])
+    payload["extra"] = {"suppressed_by": {"preference": "pguest", "rule": "No guest room."}}
+    store.upsert_suggestion(
+        suggestion["id"], suggestion["miner"], suggestion["title"], suggestion["summary"],
+        suggestion["score"], payload,
+    )
+    store.set_status(suggestion["id"], STATUS_SUPPRESSED)
+
+    assert client.post("/api/preferences/pguest/off").status_code == 200
+    assert store.get_suggestion(suggestion["id"])["status"] == STATUS_NEW
+    assert store.list_preferences() == []
+
+
+def test_switching_off_an_unknown_preference_is_404(wired):
+    client, _store, _runner, _ha = wired
+    assert client.post("/api/preferences/nope/off").status_code == 404
+
+
+def test_a_plain_language_explanation_is_rendered(wired):
+    client, store, _runner, _ha = wired
+    suggestion = store.list_suggestions(status="new")[0]
+    payload = dict(suggestion["payload"])
+    payload["extra"] = {"explanation": "You did this on 30 of the 34 weekday mornings."}
+    store.upsert_suggestion(
+        suggestion["id"], suggestion["miner"], suggestion["title"], suggestion["summary"],
+        suggestion["score"], payload,
+    )
+    page = client.get("/").text
+    assert "You did this on 30 of the 34 weekday mornings." in page
+    # The figures it paraphrases are still there underneath.
+    assert "Evidence:" in page
+
+
+def test_a_scene_card_says_it_was_measured_as_one_rule(wired):
+    client, store, _runner, _ha = wired
+    suggestion = store.list_suggestions(status="new")[0]
+    payload = dict(suggestion["payload"])
+    payload["extra"] = {"scene": {"name": "Bedtime", "reason": "The house shuts down.",
+                                  "members": ["a", "b"],
+                                  "member_titles": ["Kitchen off", "Hall off"]}}
+    store.upsert_suggestion(
+        suggestion["id"], suggestion["miner"], suggestion["title"], suggestion["summary"],
+        suggestion["score"], payload,
+    )
+    page = client.get("/").text
+    assert "backtested as a single rule" in page
+    assert "Kitchen off" in page

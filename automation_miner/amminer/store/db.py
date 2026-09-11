@@ -24,6 +24,8 @@ STATUS_NEW = "new"
 STATUS_DISMISSED = "dismissed"
 STATUS_ACCEPTED = "accepted"
 STATUS_SHADOW = "shadow"
+#: Hidden because it matches something the user has said before.
+STATUS_SUPPRESSED = "suppressed"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -54,6 +56,14 @@ CREATE TABLE IF NOT EXISTS dismissals (
     signature     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_dismissals_signature ON dismissals(signature);
+
+CREATE TABLE IF NOT EXISTS preferences (
+    id       TEXT PRIMARY KEY,
+    ts       REAL NOT NULL,
+    rule     TEXT NOT NULL,
+    evidence TEXT,
+    active   INTEGER NOT NULL DEFAULT 1
+);
 
 CREATE TABLE IF NOT EXISTS feedback (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -355,10 +365,15 @@ class Store:
         self._execute("UPDATE suggestions SET status = ? WHERE id = ?", (status, suggestion_id))
 
     def prune_suggestions(self, run_id: int) -> int:
-        """Drop untouched ``new`` suggestions from earlier runs."""
+        """Drop untouched ``new`` and ``suppressed`` suggestions from earlier runs.
+
+        Suppressed rows prune on the same terms as new ones: they are hidden,
+        not decided, so a stale one is as much litter as a stale new one.
+        Leaving them out of the sweep would grow the table forever.
+        """
         cursor = self._execute(
-            "DELETE FROM suggestions WHERE status = ? AND (run_id IS NULL OR run_id < ?)",
-            (STATUS_NEW, run_id),
+            "DELETE FROM suggestions WHERE status IN (?, ?) AND (run_id IS NULL OR run_id < ?)",
+            (STATUS_NEW, STATUS_SUPPRESSED, run_id),
         )
         return cursor.rowcount or 0
 
@@ -404,6 +419,96 @@ class Store:
             rows = self._query("SELECT 1 FROM dismissals WHERE signature = ?", (signature,))
             return bool(rows)
         return False
+
+    def dismissals_with_reasons(self, limit: int = 200) -> list[dict[str, Any]]:
+        """Dismissals the user gave a reason for, newest first.
+
+        The reason column has been written since the first release and read by
+        nothing.  It is the only place a person says, in their own words, why a
+        suggestion was wrong for them - which is exactly what a per-rule mute
+        cannot generalise from.
+        """
+        rows = self._query(
+            "SELECT d.suggestion_id, d.ts, d.reason, s.title, s.miner, s.payload"
+            " FROM dismissals d LEFT JOIN suggestions s ON s.id = d.suggestion_id"
+            " WHERE d.reason IS NOT NULL AND TRIM(d.reason) != ''"
+            " ORDER BY d.ts DESC LIMIT ?",
+            (limit,),
+        )
+        out = []
+        for row in rows:
+            entry = dict(row)
+            try:
+                entry["payload"] = json.loads(entry["payload"]) if entry.get("payload") else {}
+            except (json.JSONDecodeError, TypeError):
+                entry["payload"] = {}
+            out.append(entry)
+        return out
+
+    # --- learned preferences -----------------------------------------
+    def save_preferences(self, preferences: Sequence[dict[str, Any]]) -> None:
+        """Refresh the learned set, keeping every switch the user has flipped.
+
+        Preferences are derived and so are rebuilt each run, but ``active`` is
+        not derived - it is the one thing here the *user* decided.  Replacing
+        the table wholesale would silently re-enable a preference they switched
+        off, which is the one bug that would make turning one off pointless.
+        """
+        with self._lock:
+            keep = {p["id"] for p in preferences}
+            known = {
+                row["id"] for row in self._conn.execute("SELECT id FROM preferences")
+            }
+            for preference_id in known - keep:
+                self._conn.execute("DELETE FROM preferences WHERE id = ?", (preference_id,))
+            for preference in preferences:
+                # The conflict clause deliberately does not touch `active`: a
+                # preference already in the table keeps whatever the user set it
+                # to, and only a genuinely new one starts switched on.
+                self._conn.execute(
+                    "INSERT INTO preferences(id, ts, rule, evidence, active) VALUES(?,?,?,?,1)"
+                    " ON CONFLICT(id) DO UPDATE SET ts=excluded.ts, rule=excluded.rule,"
+                    " evidence=excluded.evidence",
+                    (
+                        preference["id"],
+                        time.time(),
+                        preference["rule"],
+                        _json(preference.get("evidence") or []),
+                    ),
+                )
+            self._conn.commit()
+
+    def list_preferences(self, active_only: bool = True) -> list[dict[str, Any]]:
+        clause = " WHERE active = 1" if active_only else ""
+        rows = self._query(f"SELECT * FROM preferences{clause} ORDER BY ts DESC")
+        out = []
+        for row in rows:
+            entry = dict(row)
+            try:
+                entry["evidence"] = json.loads(entry["evidence"] or "[]")
+            except (json.JSONDecodeError, TypeError):
+                entry["evidence"] = []
+            out.append(entry)
+        return out
+
+    def deactivate_preference(self, preference_id: str) -> bool:
+        """Switch a preference off and bring back everything it hid.
+
+        Switching it off without unhiding would leave the suggestions it
+        suppressed invisible until the next run, with nothing on screen to say
+        why - so the undo is one action, not two.
+        """
+        cursor = self._execute(
+            "UPDATE preferences SET active = 0 WHERE id = ?", (preference_id,)
+        )
+        if not cursor.rowcount:
+            return False
+        for suggestion in self.list_suggestions(status=STATUS_SUPPRESSED):
+            extra = (suggestion.get("payload") or {}).get("extra") or {}
+            hidden_by = extra.get("suppressed_by") or {}
+            if hidden_by.get("preference") == preference_id:
+                self.set_status(suggestion["id"], STATUS_NEW)
+        return True
 
     def dismissed_signatures(self) -> set[str]:
         return {
@@ -623,6 +728,7 @@ class Store:
             "shadow_events",
             "runs",
             "generations",
+            "preferences",
             "gap_suggestions",
         ):
             rows = self._query(f"SELECT COUNT(*) AS c FROM {table}")

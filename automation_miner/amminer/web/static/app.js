@@ -86,6 +86,12 @@
         notify((result.errors || ["Apply failed"]).join(" "), true);
       });
     },
+    "preference-off": function (id) {
+      return post("/api/preferences/" + id + "/off").then(function () {
+        notify("Preference switched off. Anything it was hiding is back.");
+        window.location.reload();
+      });
+    },
     "dismiss-gap": function (id) {
       return post("/api/gaps/" + id + "/dismiss").then(function () {
         notify("Hidden.");

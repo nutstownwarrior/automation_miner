@@ -81,15 +81,47 @@
       {% elif name == 'triage' %}
         reviewed {{ info.reviewed or 0 }}; demoted {{ info.demoted or 0 }} as implausible
         {%- if info.invalid_verdicts %}; ignored {{ info.invalid_verdicts }} invalid verdict(s){% endif %}
+      {% elif name == 'audit_review' %}
+        reviewed {{ info.reviewed or 0 }} finding(s); dismissed {{ info.dismissed or 0 }},
+        softened {{ info.softened or 0 }}
+      {% elif name == 'gap_proposals' %}
+        proposed {{ info.proposed or 0 }}; kept <strong>{{ info.accepted or 0 }}</strong>
+        {%- if info.rejected_no_precondition %}; dropped {{ info.rejected_no_precondition }}
+        that did not say what they depend on{% endif %}
+      {% elif name == 'scenes' %}
+        proposed {{ info.proposed or 0 }} grouping(s);
+        <strong>{{ info.accepted or 0 }}</strong> passed the backtest as one rule
+        {%- if info.rejected_incompatible %}; {{ info.rejected_incompatible }} had no
+        shared trigger{% endif %}
+        {%- if info.rejected_by_backtest %}; {{ info.rejected_by_backtest }} failed the
+        gate{% endif %}
+      {% elif name == 'explanations' %}
+        rewrote {{ info.explained or 0 }} of {{ info.asked_for or 0 }} in plain language
+        {%- if info.rejected_invented_numbers %}; dropped
+        {{ info.rejected_invented_numbers }} sentence(s) that stated a number the
+        evidence does not support{% endif %}
+      {% elif name == 'preferences' %}
+        applied {{ info.learned | length }} standing preference(s) to
+        {{ info.considered or 0 }} suggestion(s); hid {{ info.suppressed or 0 }}
+        {%- if info.rejected_unsupported %}; refused {{ info.rejected_unsupported }}
+        that named no preference{% endif %}
+      {% elif name == 'area_inference' %}
+        placed {{ info.applied or 0 }} of {{ info.unplaced_entities or 0 }} entities the
+        registry left without an area
+        {%- if info.rejected_unknown_area %}; refused {{ info.rejected_unknown_area }}
+        invented room(s){% endif %}
       {% endif %}
       {% if info.error %}<span class="warn">({{ info.error }})</span>{% endif %}
     </li>
     {% endfor %}
   </ul>
   <p class="muted small">
-    Assistance never bypasses a gate: classification only adds signals, hypotheses
-    are backtested like any other rule, and triage can lower a score but never
-    raise one or hide a suggestion.
+    Assistance never bypasses a gate: classification only adds signals; hypotheses
+    and scenes are backtested like any other rule; triage can lower a score but
+    never raise one; explanations cannot state a number the evidence does not
+    support; area inference only fills in an area the registry left blank, and
+    marks it as a guess. Only preferences can hide a suggestion, and every one it
+    hides is listed in the archive with the rule that hid it and a way to undo it.
   </p>
   {% else %}
   <p class="muted small">

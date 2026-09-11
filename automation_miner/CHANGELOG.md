@@ -1,5 +1,93 @@
 # Changelog
 
+## 0.6.0
+
+Four more optional AI features, all `false` by default and all requiring
+`llm_provider`. As before, none of them can put a suggestion in front of you
+that has not passed the same deterministic gates as every other suggestion.
+
+**Added: `llm_preferences` — learning from the reasons you already gave**
+
+`dismissals.reason` has been written since the first release and read by
+nothing. Dismissing was therefore a mute keyed to one exact rule: reword the
+rule and it came back, and the sentence you typed explaining *why* — the only
+place you say anything about your own home in your own words — was stored and
+ignored.
+
+Those sentences are now read back and generalised into standing preferences
+("nothing in the guest room"), which hide new suggestions that match one. This
+is the only optional feature that can make a suggestion disappear, so it is the
+most constrained one here:
+
+- a preference needs at least **two** of your own dismissals behind it, cited by
+  the model and checked against the real ones; a citation that does not exist
+  does not count;
+- a suppression must name a preference you can read, or it is refused;
+- everything hidden is listed under **Archive** with the rule that hid it and a
+  button to show it anyway;
+- switching a preference off brings back everything it hid immediately, and it
+  stays off even though preferences are relearned every run;
+- a suggestion you have already accepted, dismissed or asked to shadow-test is
+  never touched.
+
+Only the titles you dismissed and the reasons you gave are sent — never history.
+
+**Added: `llm_explain` — the evidence as a sentence**
+
+A card's evidence line read `30 of 34, consistency 88%, confidence 100%, lift
+2.00, ±6 min`. Worse, as `amminer.miners.base` documents, `confidence` and
+`consistency` carry *different quantities* depending on which miner filled them
+in, so the numbers were not even comparable between two cards on the same page.
+
+The model now writes the "why" in plain language. It cannot change a score, a
+verdict, a backtest or any evidence value, and the original figures stay on the
+card underneath. A sentence containing a number the evidence does not support is
+**dropped, not corrected**: a wrong figure in the sentence explaining why to
+trust something is the one error that cannot be tolerated here.
+
+**Added: `llm_scenes` — several suggestions that are really one routine**
+
+Six cards that all say "at about 22:40" are one habit split six ways, and no
+miner has a vocabulary for that. The model proposes the grouping and names it;
+everything it claims is then checked by something that is not the model:
+
+- the members must exist, and one member cannot be spent on two scenes;
+- they must share a trigger the **backtester would still credit each member's own
+  action against** — the compatibility window is
+  `backtest_match_tolerance_seconds` itself, so a scene can never be measured
+  against a moment its parts never happened at;
+- a group whose members fight over the same entity is refused;
+- only conditions *every* member carries survive into the consolidated rule;
+- the consolidated rule is backtested **as a unit, from a score of zero**. It
+  inherits nothing from its parts, because firing all of those actions together
+  is a different rule from any one of them.
+
+A scene that fails the gate is not surfaced. A scene that passes is added
+alongside its members and never replaces them.
+
+**Added: `llm_areas` — a room for entities the registry never placed**
+
+Area is the only structural fact this add-on has about a home, and it is the one
+most often left half-filled. The room is usually right there in the entity id or
+the device name, which is a reading task: `sensor.hue_motion_kitchen_2` is the
+kitchen, `binary_sensor.0x00158d` is nothing.
+
+The model is shown **only entities whose area is unset** — an area you assigned
+is never sent, never questioned and never overwritten — and may only answer with
+a room that already exists in your registry. If you have no areas at all it says
+so and does nothing, because proposing a set of rooms would be inventing the
+structure the feature exists to read. Every entity it places is flagged as
+inferred and reads "(guessed)" wherever it is shown, including in the prompts
+built from it.
+
+**Also**
+
+- `prune_suggestions` now sweeps hidden suggestions on the same terms as new
+  ones. Hidden is not decided, so a stale hidden row was as much litter as a
+  stale new one — and it would have accumulated forever.
+- The Status page now describes what `llm_audit` and `llm_gaps` did. Both had
+  been reported as a bare feature name with no summary since they were added.
+
 ## 0.5.0
 
 **Fixed: gap suggestions that assumed things about your life**

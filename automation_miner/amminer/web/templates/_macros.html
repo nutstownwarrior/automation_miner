@@ -53,6 +53,39 @@
   {% endif %}
 {% endmacro %}
 
+{% macro explanation_block(extra) %}
+  {# Rendering only.  The figures it paraphrases stay on the card underneath,
+     and a sentence containing a number the evidence does not support was
+     dropped before it ever reached here. #}
+  {% set explanation = (extra or {}).get('explanation') %}
+  {% if explanation %}
+  <p class="sentence explanation">{{ explanation }}</p>
+  {% endif %}
+{% endmacro %}
+
+{% macro scene_block(extra) %}
+  {% set scene = (extra or {}).get('scene') %}
+  {% set member_of = (extra or {}).get('part_of_scene') %}
+  {% if scene %}
+  <div class="assist">
+    <p class="small">
+      <span class="tag miner">scene</span>
+      One routine assembled from {{ scene.members | length }} suggestions, and
+      <strong>backtested as a single rule</strong> &mdash; it was not given
+      their scores. <em>{{ scene.reason }}</em>
+    </p>
+    <ul class="small">
+      {% for title in scene.member_titles or [] %}<li>{{ title }}</li>{% endfor %}
+    </ul>
+  </div>
+  {% elif member_of %}
+  <p class="small muted">
+    Also proposed as part of the <strong>{{ member_of.name }}</strong> scene.
+    This suggestion stands on its own either way.
+  </p>
+  {% endif %}
+{% endmacro %}
+
 {% macro assist_block(extra) %}
   {% set triage = (extra or {}).get('triage') %}
   {% set hypothesis = (extra or {}).get('hypothesis') %}

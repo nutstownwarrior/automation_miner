@@ -201,6 +201,22 @@ class Options:
     #: for.  Every proposal must state the real-world precondition that makes it
     #: worth doing, or it is rejected.
     llm_gaps: bool = False
+    #: Let the model generalise the reasons you gave when dismissing things into
+    #: standing preferences, and hide new suggestions that match one.  Every
+    #: suppression names the preference that caused it and can be undone.
+    llm_preferences: bool = False
+    #: Let the model rewrite the evidence behind a suggestion as one plain
+    #: sentence.  Rendering only: a sentence containing a number the evidence
+    #: does not support is dropped, and the original figures stay on the card.
+    llm_explain: bool = False
+    #: Let the model propose that several suggestions are really one scene.
+    #: The consolidated rule is backtested as a unit and surfaced only if it
+    #: passes; its members are never removed.
+    llm_scenes: bool = False
+    #: Let the model work out which room an entity is in when the registry does
+    #: not say.  Only entities with no area are considered, only areas that
+    #: already exist may be used, and every guess is marked as one.
+    llm_areas: bool = False
     llm_triage_penalty: float = 0.5
 
     # --- paths (overridable for tests) ---
@@ -267,6 +283,10 @@ class Options:
             "triage": bool(self.llm_triage),
             "audit_review": bool(self.llm_audit),
             "gap_proposals": bool(self.llm_gaps),
+            "preferences": bool(self.llm_preferences),
+            "explanations": bool(self.llm_explain),
+            "scenes": bool(self.llm_scenes),
+            "area_inference": bool(self.llm_areas),
         }
 
     @property

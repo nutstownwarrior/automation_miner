@@ -28,7 +28,13 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from ..config import Options
 from ..llm.provider import build_provider
 from ..store import Store
-from ..store.db import STATUS_ACCEPTED, STATUS_DISMISSED, STATUS_NEW, STATUS_SHADOW
+from ..store.db import (
+    STATUS_ACCEPTED,
+    STATUS_DISMISSED,
+    STATUS_NEW,
+    STATUS_SHADOW,
+    STATUS_SUPPRESSED,
+)
 from ..version import __version__
 
 _LOGGER = logging.getLogger(__name__)
@@ -175,7 +181,13 @@ def create_app(
         return templates.TemplateResponse(
             request=request,
             name="dismissed.html",
-            context=context(request, suggestions=store.list_suggestions(status=[STATUS_DISMISSED, STATUS_ACCEPTED])),
+            context=context(
+                request,
+                suggestions=store.list_suggestions(status=[STATUS_DISMISSED, STATUS_ACCEPTED]),
+                # Nothing hides without a place to see it and switch it off.
+                hidden=store.list_suggestions(status=STATUS_SUPPRESSED),
+                preferences=store.list_preferences(active_only=False),
+            ),
         )
 
     @app.get("/status", response_class=HTMLResponse)
@@ -225,6 +237,13 @@ def create_app(
         if not store.restore(suggestion_id):
             raise HTTPException(status_code=404, detail="unknown suggestion")
         return {"status": "restored", "id": suggestion_id}
+
+    @api.post("/preferences/{preference_id}/off")
+    def preference_off(preference_id: str):
+        """Switch a learned preference off and bring back what it hid."""
+        if not store.deactivate_preference(preference_id):
+            raise HTTPException(status_code=404, detail="unknown preference")
+        return {"status": "off", "id": preference_id}
 
     @api.post("/suggestions/{suggestion_id}/shadow")
     def shadow(suggestion_id: str):

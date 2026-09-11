@@ -192,7 +192,9 @@ and `openrouter` are opt-in and need `llm_api_key`.
 
 ### `llm_entity_classification`, `llm_hypotheses`, `llm_triage`
 Three optional AI features, all `false` by default and all requiring
-`llm_provider` to be set to something other than `none`.
+`llm_provider` to be set to something other than `none`.  (`llm_gaps`,
+`llm_audit`, `llm_preferences`, `llm_explain`, `llm_scenes` and `llm_areas`
+are described in their own sections.)
 
 - **`llm_entity_classification`** — lets the model read your entity inventory
   (names, areas, device models, units — never states or history) and label
@@ -214,6 +216,66 @@ Tuning: `llm_classification_batch` (entities per call, default 60),
 `llm_hypothesis_candidates` (rejected rules to attempt, default 10),
 `llm_hypotheses_per_candidate` (default 3), `llm_triage_penalty` (score
 multiplier for an implausible verdict, default 0.5).
+
+### `llm_preferences`
+Off by default. Lets the model read the reasons you typed when dismissing
+suggestions and generalise them into standing preferences — "nothing in the
+guest room", "never touch the bedroom lights before we are awake" — then hide
+new suggestions that match one.
+
+Dismissing today is a mute keyed to one exact rule: reword the rule and it comes
+back, and the sentence you typed explaining why is stored and read by nothing.
+This is the only optional feature that can make a suggestion disappear, so it is
+the most constrained:
+
+- a preference needs at least **two** of your own dismissals behind it, cited by
+  the model and checked against the real ones,
+- a suppression must name a preference you can read, or it is refused,
+- everything hidden is listed under **Archive**, with the rule that hid it and a
+  button to show it anyway,
+- switching a preference off brings back everything it hid, immediately, and it
+  stays off even though preferences are relearned every run,
+- a suggestion you have already accepted, dismissed or asked to shadow-test is
+  never touched: those are your decisions, not the model's.
+
+Only the titles you dismissed and the reasons you gave are sent — never history.
+
+### `llm_explain`
+Off by default. Rewrites the evidence behind a suggestion as one plain sentence:
+"you switched this on at about 06:30 on 30 of the 34 weekdays" instead of
+"30 of 34, consistency 88%, confidence 100%, lift 2.00".
+
+This is rendering, not judgement. It cannot change a score, a verdict, a
+backtest or any evidence value, and the original figures stay on the card
+underneath. A sentence containing a number the evidence does not support is
+**dropped, not corrected** — a wrong figure in the sentence explaining why to
+trust something is the one error that cannot be tolerated here.
+
+### `llm_scenes`
+Off by default. Six cards that all say "at about 22:40" are one habit split six
+ways, and the miners have no vocabulary for that. This lets the model propose the
+grouping and name it — Bedtime, Leaving the house, Movie night.
+
+Every claim it makes is then checked by something that is not the model. The
+members must exist; they must share a trigger the backtester would still credit
+each member's own action against, which is decided by comparing the triggers, not
+by the model saying so; the group must not contain two actions that fight over
+the same entity; and the consolidated rule is **backtested as a unit**, from a
+score of zero, against the same gate as every mined suggestion. A scene that
+fails the gate is not shown. A scene that passes appears alongside its members
+and never replaces them.
+
+### `llm_areas`
+Off by default. Works out which room an entity is in when the registry does not
+say. The room is usually right there in the entity id or the device name, which
+is a reading task — `sensor.hue_motion_kitchen_2` is the kitchen and
+`binary_sensor.0x00158d` is nothing.
+
+It is only shown entities whose area is **unset**; an area you assigned is never
+sent and never overwritten. It may only answer with a room that already exists in
+your registry, so it cannot invent one — if you have no areas at all it says so
+and does nothing. Every entity it places is marked as a guess wherever it is
+shown, and nothing it says changes a score, a rule, or what is surfaced.
 
 ### `llm_model`, `llm_base_url`, `llm_api_key`
 Optional overrides. With Ollama, leaving `llm_model` empty picks the best
