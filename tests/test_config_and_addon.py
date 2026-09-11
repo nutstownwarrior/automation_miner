@@ -159,6 +159,34 @@ def test_version_matches_the_package(addon_config):
     assert addon_config["version"] == __version__
 
 
+def test_every_file_carrying_a_version_agrees(addon_config):
+    """A half-applied bump ships behaviour changes the Supervisor never offers.
+
+    Home Assistant decides an update is available from `version:` in config.yaml
+    alone, so that one being stale is the difference between a release existing
+    and reaching anybody.
+    """
+    import tomllib
+
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    assert pyproject["project"]["version"] == __version__
+    assert addon_config["version"] == __version__
+
+
+def test_the_changelog_documents_the_current_version():
+    """A version nobody can read the changes for is not a release."""
+    changelog = (ADDON_DIR / "CHANGELOG.md").read_text()
+    assert f"## {__version__}" in changelog, (
+        f"CHANGELOG.md has no section for {__version__}; bumping the version "
+        "without saying what changed leaves users no way to find out"
+    )
+    # And it must be the newest section, not one buried in the history.
+    headings = [
+        line[3:].strip() for line in changelog.splitlines() if line.startswith("## ")
+    ]
+    assert headings[0] == __version__, f"newest changelog section is {headings[0]!r}"
+
+
 def test_every_option_has_a_schema_entry(addon_config):
     options = set(addon_config["options"])
     schema = set(addon_config["schema"])
