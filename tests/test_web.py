@@ -386,3 +386,61 @@ def test_a_scene_card_says_it_was_measured_as_one_rule(wired):
     page = client.get("/").text
     assert "backtested as a single rule" in page
     assert "Kitchen off" in page
+
+
+def test_the_preferences_panel_is_editable(wired):
+    """A guess about what someone meant has to be correctable in the UI."""
+    client, store, _runner, _ha = wired
+    store.save_preferences([
+        {"id": "pguest", "rule": "Never automate the guest room.", "evidence": ["d1", "d2"]}
+    ])
+    page = client.get("/dismissed").text
+    assert 'value="Never automate the guest room."' in page
+    assert 'data-action="preference-save"' in page
+    assert 'data-action="preference-delete"' in page
+    assert 'data-action="preference-add"' in page
+
+
+def test_editing_a_preference_through_the_ui_sticks(wired):
+    client, store, _runner, _ha = wired
+    store.save_preferences([{"id": "pguest", "rule": "Wrong.", "evidence": ["d1", "d2"]}])
+
+    response = client.post("/api/preferences/pguest", json={"rule": "Right, actually."})
+    assert response.status_code == 200
+    assert store.list_preferences()[0]["rule"] == "Right, actually."
+    # And the next run cannot put the model's wording back.
+    store.save_preferences([{"id": "pguest", "rule": "Wrong.", "evidence": ["d1", "d2"]}])
+    assert store.list_preferences()[0]["rule"] == "Right, actually."
+
+
+def test_editing_a_preference_to_nothing_is_refused(wired):
+    client, store, _runner, _ha = wired
+    store.save_preferences([{"id": "pguest", "rule": "A rule.", "evidence": ["d1"]}])
+    assert client.post("/api/preferences/pguest", json={"rule": "  "}).status_code == 400
+    assert store.list_preferences()[0]["rule"] == "A rule."
+
+
+def test_editing_an_unknown_preference_is_404(wired):
+    client, _store, _runner, _ha = wired
+    assert client.post("/api/preferences/nope", json={"rule": "x"}).status_code == 404
+
+
+def test_deleting_and_re_enabling_a_preference(wired):
+    client, store, _runner, _ha = wired
+    store.save_preferences([{"id": "pguest", "rule": "A rule.", "evidence": ["d1"]}])
+
+    assert client.post("/api/preferences/pguest/off").status_code == 200
+    assert store.list_preferences() == []
+    assert client.post("/api/preferences/pguest/on").status_code == 200
+    assert len(store.list_preferences()) == 1
+    assert client.post("/api/preferences/pguest/delete").status_code == 200
+    assert store.list_preferences(active_only=False) == []
+    assert client.post("/api/preferences/pguest/delete").status_code == 404
+
+
+def test_a_preference_can_be_written_by_hand(wired):
+    client, store, _runner, _ha = wired
+    response = client.post("/api/preferences", json={"rule": "Nothing in the bathroom."})
+    assert response.status_code == 200
+    assert response.json()["preference"]["source"] == "user"
+    assert client.post("/api/preferences", json={"rule": ""}).status_code == 400

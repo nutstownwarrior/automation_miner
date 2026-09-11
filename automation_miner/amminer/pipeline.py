@@ -533,11 +533,15 @@ def run_analysis(
                     store.dismissals_with_reasons(), provider
                 )
                 store.save_preferences([p.as_dict() for p in found])
-                # Only the ones still switched on may hide anything; a
-                # preference the user turned off stays stored so it is not
-                # silently relearned into an active one on the next run.
-                active = {row["id"] for row in store.list_preferences(active_only=True)}
-                return [p for p in found if p.id in active], why
+                # Read back rather than using what the model just said: the
+                # stored row is the one the user can switch off, rewrite or
+                # delete, and it is that text - not the model's - that decides
+                # what gets hidden.  Preferences the user wrote by hand are in
+                # here too, and apply whether or not anything was learned.
+                return [
+                    llm_preferences.Preference.from_row(row)
+                    for row in store.list_preferences(active_only=True)
+                ], why
 
             usable, learn_error = run_stage("learning preferences", _learn) or ([], None)
             matched = run_ai(

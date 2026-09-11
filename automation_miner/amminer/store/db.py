@@ -7,6 +7,7 @@ feedback, override history, backtests, shadow-mode logs and run metadata.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import sqlite3
@@ -62,7 +63,13 @@ CREATE TABLE IF NOT EXISTS preferences (
     ts       REAL NOT NULL,
     rule     TEXT NOT NULL,
     evidence TEXT,
-    active   INTEGER NOT NULL DEFAULT 1
+    active   INTEGER NOT NULL DEFAULT 1,
+    -- 'learned' (generalised from dismissal reasons) or 'user' (written by
+    -- hand).  A user's own preference is never removed by relearning.
+    source   TEXT NOT NULL DEFAULT 'learned',
+    -- Set once the user has rewritten the rule.  From then on the text is
+    -- theirs and relearning refreshes everything about the row except that.
+    edited   INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS feedback (
@@ -158,9 +165,26 @@ class Store:
         self._migrate()
 
     # ------------------------------------------------------------------
+    #: Columns added to an existing table after it first shipped.  CREATE TABLE
+    #: IF NOT EXISTS does nothing to a table that already exists, so a column
+    #: added later has to be applied by hand.
+    _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+        ("preferences", "source", "TEXT NOT NULL DEFAULT 'learned'"),
+        ("preferences", "edited", "INTEGER NOT NULL DEFAULT 0"),
+    )
+
     def _migrate(self) -> None:
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            for table, column, definition in self._ADDED_COLUMNS:
+                present = {
+                    row["name"]
+                    for row in self._conn.execute(f"PRAGMA table_info({table})")
+                }
+                if column not in present:
+                    self._conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+                    )
             self._conn.execute(
                 "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -456,18 +480,27 @@ class Store:
         """
         with self._lock:
             keep = {p["id"] for p in preferences}
-            known = {
-                row["id"] for row in self._conn.execute("SELECT id FROM preferences")
-            }
-            for preference_id in known - keep:
-                self._conn.execute("DELETE FROM preferences WHERE id = ?", (preference_id,))
+            rows = list(
+                self._conn.execute("SELECT id, source, edited FROM preferences")
+            )
+            for row in rows:
+                # Only a purely learned row is the model's to withdraw.  A
+                # preference the user wrote or rewrote is theirs, and it goes
+                # when they delete it and not before.
+                if row["id"] in keep or row["source"] != "learned" or row["edited"]:
+                    continue
+                self._conn.execute("DELETE FROM preferences WHERE id = ?", (row["id"],))
             for preference in preferences:
-                # The conflict clause deliberately does not touch `active`: a
-                # preference already in the table keeps whatever the user set it
-                # to, and only a genuinely new one starts switched on.
+                # The conflict clause deliberately does not touch `active`,
+                # `source` or `edited`, and updates `rule` only where the user
+                # has not rewritten it: relearning refreshes what the model
+                # knows, never what the user decided.
                 self._conn.execute(
-                    "INSERT INTO preferences(id, ts, rule, evidence, active) VALUES(?,?,?,?,1)"
-                    " ON CONFLICT(id) DO UPDATE SET ts=excluded.ts, rule=excluded.rule,"
+                    "INSERT INTO preferences(id, ts, rule, evidence, active, source, edited)"
+                    " VALUES(?,?,?,?,1,'learned',0)"
+                    " ON CONFLICT(id) DO UPDATE SET ts=excluded.ts,"
+                    " rule=CASE WHEN preferences.edited THEN preferences.rule"
+                    "           ELSE excluded.rule END,"
                     " evidence=excluded.evidence",
                     (
                         preference["id"],
@@ -481,15 +514,80 @@ class Store:
     def list_preferences(self, active_only: bool = True) -> list[dict[str, Any]]:
         clause = " WHERE active = 1" if active_only else ""
         rows = self._query(f"SELECT * FROM preferences{clause} ORDER BY ts DESC")
-        out = []
-        for row in rows:
-            entry = dict(row)
-            try:
-                entry["evidence"] = json.loads(entry["evidence"] or "[]")
-            except (json.JSONDecodeError, TypeError):
-                entry["evidence"] = []
-            out.append(entry)
-        return out
+        return [self._row_to_preference(row) for row in rows]
+
+    @staticmethod
+    def _row_to_preference(row: sqlite3.Row) -> dict[str, Any]:
+        entry = dict(row)
+        try:
+            entry["evidence"] = json.loads(entry["evidence"] or "[]")
+        except (json.JSONDecodeError, TypeError):
+            entry["evidence"] = []
+        return entry
+
+    def add_preference(self, rule: str) -> dict[str, Any] | None:
+        """Store a preference the user wrote themselves."""
+        rule = " ".join(str(rule or "").split())[:200]
+        if not rule:
+            return None
+        preference_id = "u" + hashlib.sha1(rule.encode()).hexdigest()[:10]
+        self._execute(
+            "INSERT INTO preferences(id, ts, rule, evidence, active, source, edited)"
+            " VALUES(?,?,?,'[]',1,'user',0)"
+            " ON CONFLICT(id) DO UPDATE SET ts=excluded.ts, active=1",
+            (preference_id, time.time(), rule),
+        )
+        return self.get_preference(preference_id)
+
+    def get_preference(self, preference_id: str) -> dict[str, Any] | None:
+        rows = self._query("SELECT * FROM preferences WHERE id = ?", (preference_id,))
+        return self._row_to_preference(rows[0]) if rows else None
+
+    def update_preference(self, preference_id: str, rule: str) -> dict[str, Any] | None:
+        """Rewrite a preference's rule.  The text becomes the user's from now on.
+
+        ``edited`` is what stops the next run's relearning from quietly putting
+        the model's wording back: without it an amendment would last until the
+        following night and no longer.
+        """
+        rule = " ".join(str(rule or "").split())[:200]
+        if not rule:
+            return None
+        cursor = self._execute(
+            "UPDATE preferences SET rule = ?, edited = 1, ts = ? WHERE id = ?",
+            (rule, time.time(), preference_id),
+        )
+        if not cursor.rowcount:
+            return None
+        # The suggestions this preference is already hiding quote the old
+        # wording, and a rule the user has just disagreed with is not a rule to
+        # keep hiding things by.  They come back, and the amended preference
+        # applies from the next run like any other.
+        self._unhide(preference_id)
+        return self.get_preference(preference_id)
+
+    def delete_preference(self, preference_id: str) -> bool:
+        """Forget a preference entirely and bring back everything it hid."""
+        self._unhide(preference_id)
+        cursor = self._execute("DELETE FROM preferences WHERE id = ?", (preference_id,))
+        return bool(cursor.rowcount)
+
+    def activate_preference(self, preference_id: str) -> bool:
+        cursor = self._execute(
+            "UPDATE preferences SET active = 1 WHERE id = ?", (preference_id,)
+        )
+        return bool(cursor.rowcount)
+
+    def _unhide(self, preference_id: str) -> int:
+        """Restore every suggestion this preference is currently hiding."""
+        restored = 0
+        for suggestion in self.list_suggestions(status=STATUS_SUPPRESSED):
+            extra = (suggestion.get("payload") or {}).get("extra") or {}
+            hidden_by = extra.get("suppressed_by") or {}
+            if hidden_by.get("preference") == preference_id:
+                self.set_status(suggestion["id"], STATUS_NEW)
+                restored += 1
+        return restored
 
     def deactivate_preference(self, preference_id: str) -> bool:
         """Switch a preference off and bring back everything it hid.
@@ -503,11 +601,7 @@ class Store:
         )
         if not cursor.rowcount:
             return False
-        for suggestion in self.list_suggestions(status=STATUS_SUPPRESSED):
-            extra = (suggestion.get("payload") or {}).get("extra") or {}
-            hidden_by = extra.get("suppressed_by") or {}
-            if hidden_by.get("preference") == preference_id:
-                self.set_status(suggestion["id"], STATUS_NEW)
+        self._unhide(preference_id)
         return True
 
     def dismissed_signatures(self) -> set[str]:

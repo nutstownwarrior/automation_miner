@@ -93,10 +93,21 @@ Shape:
 class Preference:
     rule: str
     evidence: list[str] = field(default_factory=list)
+    #: Left empty when the model has just proposed the rule, and derived from
+    #: its text.  Carried explicitly for one already in the store, because a
+    #: rule the user has since rewritten no longer hashes to its own id - and
+    #: the id is what the suggestions it hid point at.
+    id: str = ""
 
-    @property
-    def id(self) -> str:
-        return "p" + hashlib.sha1(self.rule.encode()).hexdigest()[:10]
+    def __post_init__(self) -> None:
+        if not self.id:
+            self.id = "p" + hashlib.sha1(self.rule.encode()).hexdigest()[:10]
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any]) -> Preference:
+        return cls(
+            rule=row["rule"], evidence=list(row.get("evidence") or []), id=row["id"]
+        )
 
     def as_dict(self) -> dict[str, Any]:
         return {"id": self.id, "rule": self.rule, "evidence": self.evidence}

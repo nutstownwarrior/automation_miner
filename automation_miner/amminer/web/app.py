@@ -207,6 +207,13 @@ def create_app(
     # --- actions ------------------------------------------------------
     api = APIRouter(prefix="/api")
 
+    async def _rule_from(request: Request) -> str:
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            return ""
+        return str(body.get("rule") or "") if isinstance(body, dict) else ""
+
     @api.post("/run")
     async def trigger_run():
         if runner is None:
@@ -238,9 +245,43 @@ def create_app(
             raise HTTPException(status_code=404, detail="unknown suggestion")
         return {"status": "restored", "id": suggestion_id}
 
+    # A learned preference is a guess about what someone meant, made from
+    # sentences they typed in a hurry.  It is therefore theirs to correct, and
+    # these five endpoints are what stop a bad generalisation from being
+    # permanent.
+    @api.post("/preferences")
+    async def add_preference(request: Request):
+        """Write a standing preference by hand, with no dismissals behind it."""
+        preference = store.add_preference(await _rule_from(request))
+        if preference is None:
+            raise HTTPException(status_code=400, detail="a preference needs a rule")
+        return {"status": "added", "preference": preference}
+
+    @api.post("/preferences/{preference_id}")
+    async def edit_preference(request: Request, preference_id: str):
+        """Rewrite a preference.  The wording becomes the user's from here on."""
+        preference = store.update_preference(preference_id, await _rule_from(request))
+        if preference is None:
+            if store.get_preference(preference_id) is None:
+                raise HTTPException(status_code=404, detail="unknown preference")
+            raise HTTPException(status_code=400, detail="a preference needs a rule")
+        return {"status": "updated", "preference": preference}
+
+    @api.post("/preferences/{preference_id}/delete")
+    def delete_preference(preference_id: str):
+        if not store.delete_preference(preference_id):
+            raise HTTPException(status_code=404, detail="unknown preference")
+        return {"status": "deleted", "id": preference_id}
+
+    @api.post("/preferences/{preference_id}/on")
+    def preference_on(preference_id: str):
+        if not store.activate_preference(preference_id):
+            raise HTTPException(status_code=404, detail="unknown preference")
+        return {"status": "on", "id": preference_id}
+
     @api.post("/preferences/{preference_id}/off")
     def preference_off(preference_id: str):
-        """Switch a learned preference off and bring back what it hid."""
+        """Switch a preference off and bring back what it hid."""
         if not store.deactivate_preference(preference_id):
             raise HTTPException(status_code=404, detail="unknown preference")
         return {"status": "off", "id": preference_id}

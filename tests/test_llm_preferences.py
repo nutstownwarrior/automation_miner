@@ -199,3 +199,122 @@ def test_hidden_suggestions_are_pruned_like_new_ones(tmp_path):
     store.set_status("s1", STATUS_SUPPRESSED)
     store.prune_suggestions(2)
     assert store.get_suggestion("s1") is None
+
+
+# --- the user's own hands on it -----------------------------------------
+def _stored(tmp_path, rule="Never automate the guest room."):
+    store = Store(tmp_path / "s.db")
+    preference = _preference(rule)
+    store.save_preferences([preference.as_dict()])
+    return store, preference
+
+
+def test_a_rewritten_rule_survives_the_next_run(tmp_path):
+    """Otherwise an amendment lasts until the next night and no longer."""
+    store, preference = _stored(tmp_path)
+    store.update_preference(preference.id, "Never automate the guest room LAMP.")
+
+    store.save_preferences([preference.as_dict()])  # the model says it again
+    assert [p["rule"] for p in store.list_preferences()] == [
+        "Never automate the guest room LAMP."
+    ]
+
+
+def test_a_rewritten_rule_keeps_the_id_the_hidden_suggestions_point_at(tmp_path):
+    store, preference = _stored(tmp_path)
+    updated = store.update_preference(preference.id, "Something quite different.")
+    assert updated["id"] == preference.id
+    assert updated["edited"] == 1
+
+
+def test_rewriting_brings_back_what_the_old_wording_hid(tmp_path):
+    """A rule the user has just disagreed with is not one to keep hiding by."""
+    store, preference = _stored(tmp_path)
+    store.upsert_suggestion(
+        "s1", "m", "t", "s", 0.5,
+        {"extra": {"suppressed_by": {"preference": preference.id, "rule": preference.rule}}},
+        run_id=1,
+    )
+    store.set_status("s1", STATUS_SUPPRESSED)
+
+    store.update_preference(preference.id, "Only the guest room lamp, not the room.")
+    assert store.get_suggestion("s1")["status"] == STATUS_NEW
+
+
+def test_an_amended_preference_is_never_withdrawn_by_relearning(tmp_path):
+    """Once the wording is the user's, the model does not get to retract it."""
+    store, preference = _stored(tmp_path)
+    store.update_preference(preference.id, "Mine now.")
+    store.save_preferences([])  # the model no longer proposes anything
+    assert [p["rule"] for p in store.list_preferences()] == ["Mine now."]
+
+
+def test_an_empty_rewrite_changes_nothing(tmp_path):
+    store, preference = _stored(tmp_path)
+    assert store.update_preference(preference.id, "   ") is None
+    assert store.list_preferences()[0]["rule"] == preference.rule
+
+
+def test_rewriting_an_unknown_preference_does_nothing(tmp_path):
+    store, _preference = _stored(tmp_path)
+    assert store.update_preference("nope", "A rule.") is None
+
+
+def test_deleting_removes_it_and_restores_what_it_hid(tmp_path):
+    store, preference = _stored(tmp_path)
+    store.upsert_suggestion(
+        "s1", "m", "t", "s", 0.5,
+        {"extra": {"suppressed_by": {"preference": preference.id}}}, run_id=1,
+    )
+    store.set_status("s1", STATUS_SUPPRESSED)
+
+    assert store.delete_preference(preference.id) is True
+    assert store.list_preferences(active_only=False) == []
+    assert store.get_suggestion("s1")["status"] == STATUS_NEW
+
+
+def test_a_preference_can_be_switched_back_on(tmp_path):
+    store, preference = _stored(tmp_path)
+    store.deactivate_preference(preference.id)
+    assert store.activate_preference(preference.id) is True
+    assert [p["id"] for p in store.list_preferences()] == [preference.id]
+
+
+def test_a_preference_written_by_hand_needs_no_dismissals(tmp_path):
+    store = Store(tmp_path / "s.db")
+    written = store.add_preference("Never suggest anything for the bathroom.")
+    assert written["source"] == "user"
+    assert store.list_preferences()[0]["rule"] == "Never suggest anything for the bathroom."
+
+
+def test_a_preference_written_by_hand_is_never_withdrawn_by_relearning(tmp_path):
+    store = Store(tmp_path / "s.db")
+    store.add_preference("Never suggest anything for the bathroom.")
+    store.save_preferences([_preference().as_dict()])
+    assert len(store.list_preferences()) == 2
+    store.save_preferences([])
+    assert [p["source"] for p in store.list_preferences()] == ["user"]
+
+
+def test_an_empty_hand_written_preference_is_refused(tmp_path):
+    store = Store(tmp_path / "s.db")
+    assert store.add_preference("  ") is None
+    assert store.list_preferences() == []
+
+
+def test_a_preference_carries_its_stored_id_into_matching(tmp_path):
+    """An amended rule no longer hashes to its own id, and the id is the handle."""
+    store, preference = _stored(tmp_path)
+    store.update_preference(preference.id, "Quite different wording.")
+    row = store.list_preferences()[0]
+
+    rebuilt = prefs.Preference.from_row(row)
+    assert rebuilt.id == preference.id
+    assert rebuilt.rule == "Quite different wording."
+
+    one = candidate()
+    llm = StubLLM({"matches": [
+        {"id": one.id, "preference": rebuilt.id, "reason": "matches the amended rule"}
+    ]})
+    result = prefs.apply_preferences([one], [rebuilt], llm)
+    assert result.suppressed[one.id]["rule"] == "Quite different wording."

@@ -25,10 +25,32 @@ most constrained one here:
 - a suppression must name a preference you can read, or it is refused;
 - everything hidden is listed under **Archive** with the rule that hid it and a
   button to show it anyway;
-- switching a preference off brings back everything it hid immediately, and it
-  stays off even though preferences are relearned every run;
 - a suggestion you have already accepted, dismissed or asked to shadow-test is
   never touched.
+
+A learned preference is a guess about what someone meant, made from a sentence
+they typed in a hurry, so it is not allowed to be permanent. The Archive page
+lists preferences as **editable fields**, not as verdicts:
+
+- **rewriting** one makes the wording the user's. `edited` is what stops the
+  next run's relearning from quietly restoring the model's phrasing — without
+  it an amendment would have lasted until the following night and no longer —
+  and an amended preference is never withdrawn by relearning either. The row
+  keeps its id, because that is what the suggestions it hid point at;
+- **switching off** keeps it listed but inert, and survives relearning;
+- **deleting** forgets it. The UI says plainly that a learned one may be
+  generalised again from the same dismissals, and that switching it off is the
+  option that sticks;
+- **writing one by hand** needs no dismissals at all, and is never touched by
+  relearning.
+
+Switching off, rewriting or deleting brings back everything the preference was
+hiding, immediately. Rewriting does so because a rule the user has just
+disagreed with is not a rule to keep hiding things by.
+
+What the matcher is given is read back from the store rather than taken from
+what the model just said, so an amendment changes what is actually hidden and
+not merely what is displayed.
 
 Only the titles you dismissed and the reasons you gave are sent — never history.
 

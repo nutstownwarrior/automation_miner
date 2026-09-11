@@ -233,10 +233,28 @@ the most constrained:
 - a suppression must name a preference you can read, or it is refused,
 - everything hidden is listed under **Archive**, with the rule that hid it and a
   button to show it anyway,
-- switching a preference off brings back everything it hid, immediately, and it
-  stays off even though preferences are relearned every run,
 - a suggestion you have already accepted, dismissed or asked to shadow-test is
   never touched: those are your decisions, not the model's.
+
+**Every preference is yours to correct.** A learned preference is a guess about
+what you meant, made from a sentence you typed in a hurry, so the Archive page
+lists them as editable fields rather than as verdicts:
+
+- **Rewrite one** and the wording becomes yours. No later run puts the model's
+  version back, and the preference is never withdrawn again by relearning — it
+  is your text now, not a derived one.
+- **Switch one off** to keep it listed but inert. This survives relearning too,
+  so it is the option that sticks.
+- **Delete one** to forget it entirely. If it was learned and the dismissals
+  behind it are still on record, a later run may generalise something like it
+  again; switch it off instead if you want it gone for good.
+- **Write your own**, with no dismissals behind it at all — "never suggest
+  anything for the bathroom". It applies from the next analysis and is never
+  touched by relearning.
+
+Switching off, rewriting or deleting a preference brings back everything it was
+hiding immediately. Rewriting does so because a rule you have just disagreed with
+is not a rule to keep hiding things by.
 
 Only the titles you dismissed and the reasons you gave are sent — never history.
 

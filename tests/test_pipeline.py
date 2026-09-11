@@ -217,6 +217,7 @@ class _Stub:
     def __init__(self, raises: bool = False):
         self.raises = raises
         self.calls = 0
+        self.prompts: list[str] = []
 
     def status(self):
         from amminer.llm.provider import LLMStatus
@@ -227,6 +228,7 @@ class _Stub:
         from amminer.llm.provider import LLMError
 
         self.calls += 1
+        self.prompts.append(user)
         if self.raises:
             raise LLMError("stub is down")
         if "label Home Assistant entities" in system:
@@ -653,3 +655,41 @@ def test_a_hidden_suggestion_is_not_announced(ha_config_dir, store, fake_client,
     announced = {s["title"] for s in store.suggestions_first_seen_in(last_run["id"])}
     assert not ({s["title"] for s in hidden} & announced)
     assert report.notified["new"] == len(announced)
+
+
+def test_the_rule_the_user_amended_is_the_one_applied(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    """Editing a preference has to change what gets hidden, not just what is displayed."""
+    stub = _use_stub(monkeypatch, _Stub())
+    run(ha_config_dir, store, fake_client)
+    _dismiss_housekeeping(store)
+    run(ha_config_dir, store, fake_client, llm_provider="ollama", llm_preferences=True)
+
+    learned = store.list_preferences()[0]
+    assert learned["rule"] == "Never automate the hallway."
+    store.update_preference(learned["id"], "Only the hallway lamp, not the whole hallway.")
+
+    stub.prompts.clear()
+    run(ha_config_dir, store, fake_client, llm_provider="ollama", llm_preferences=True)
+
+    matching = [p for p in stub.prompts if '"suggestions"' in p and '"preferences"' in p]
+    assert matching, "the matcher must have been asked"
+    assert "Only the hallway lamp, not the whole hallway." in matching[-1]
+    assert "Never automate the hallway." not in matching[-1]
+    # And relearning did not quietly put the model's wording back.
+    assert store.list_preferences()[0]["rule"] == (
+        "Only the hallway lamp, not the whole hallway."
+    )
+
+
+def test_a_preference_written_by_hand_is_applied_without_any_dismissals(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    stub = _use_stub(monkeypatch, _Stub())
+    store.add_preference("Nothing in the bathroom, ever.")
+
+    run(ha_config_dir, store, fake_client, llm_provider="ollama", llm_preferences=True)
+    matching = [p for p in stub.prompts if '"suggestions"' in p and '"preferences"' in p]
+    assert matching, "a hand-written preference must be applied on its own"
+    assert "Nothing in the bathroom, ever." in matching[-1]

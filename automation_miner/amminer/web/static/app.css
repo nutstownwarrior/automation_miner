@@ -142,3 +142,15 @@ footer.muted { max-width: 1100px; margin: 0 auto; padding: 0 20px 40px; font-siz
 .assist { margin: 10px 0; padding: 8px 12px; border-left: 3px solid var(--accent); background: var(--bg); border-radius: 6px; }
 .assist p { margin: 4px 0; }
 .assist .tag { margin-right: 4px; }
+
+/* A preference is a guess about what someone meant, so the rule reads as an
+   editable field rather than as a verdict printed at them. */
+ul.preferences li { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+ul.preferences .actions { display: flex; gap: 6px; margin-left: auto; }
+.rule-input {
+  flex: 1 1 320px; min-width: 220px; font: inherit; font-size: 14px;
+  padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--bg); color: var(--ink);
+}
+.rule-input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+.preference-new { display: flex; gap: 8px; align-items: center; margin-top: 12px; flex-wrap: wrap; }
