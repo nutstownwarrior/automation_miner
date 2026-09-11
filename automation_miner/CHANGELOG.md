@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.2.1
+
+**Fixed**
+
+- A cloud endpoint typed or pasted into `llm_base_url` was used exactly as
+  given, so a stray space, a trailing newline, or a host with no `https://`
+  made every request fail with "Request URL is missing an 'http://' or
+  'https://' protocol". None of that was visible afterwards: the status page
+  renders the value into HTML, which collapses surrounding whitespace, so the
+  endpoint looked correct and the failure had no apparent cause. Endpoints are
+  now trimmed, given a scheme if they lack one, and stripped of a trailing
+  slash. The Ollama path had always done this; the cloud path never did.
+- A Google endpoint set to the bare host posted to the host and got a bare 404.
+  Google addresses the model in the path, so an endpoint without the `{model}`
+  placeholder is now completed with the standard
+  `/v1beta/models/{model}:generateContent` path rather than being sent as-is.
+- The model was substituted into a Google endpoint with `str.format()`, so any
+  other brace in a user-supplied URL raised `KeyError`. It is a plain
+  replacement now.
+- API keys and model names are trimmed, so a pasted key with a trailing newline
+  authenticates.
+- A failed cloud request reported the status and the URL and dropped the
+  response body — but the body is the half that says why. "404 Not Found" now
+  reads "404 Not Found - models/gemini-9 is not found for API version v1beta",
+  and "400 Bad Request" says "API key not valid". The key is still scrubbed
+  from all of it.
+
 ## 0.2.0
 
 An adversarial review of the whole codebase. Most of what follows is a
