@@ -74,6 +74,7 @@ def discover_ollama(timeout: float = 2.0, extra: str | None = None) -> tuple[str
     """Find a reachable Ollama server; returns ``(base_url, model names)``."""
     candidates: list[str] = []
     for value in (extra, os.environ.get("OLLAMA_HOST"), os.environ.get("AMMINER_OLLAMA_URL")):
+        value = (value or "").strip()
         if value:
             url = value if value.startswith("http") else f"http://{value}"
             candidates.append(url.rstrip("/"))
@@ -187,16 +188,43 @@ class OllamaProvider(BaseProvider):
         return _parse_json_object(content)
 
 
+def normalise_endpoint(value: str | None, provider: str = "") -> str | None:
+    """Make a hand-typed endpoint into one httpx will accept.
+
+    ``llm_base_url`` is typed or pasted into Home Assistant's add-on options, so
+    it arrives with whatever came along: a trailing newline, a leading space, a
+    host with no scheme.  None of that is visible afterwards - the status page
+    renders the value into HTML, which collapses surrounding whitespace - so the
+    only symptom was a request failing with "Request URL is missing an
+    'http://' or 'https://' protocol" and a configuration that looked correct.
+
+    The Ollama path has always done this; the cloud path never did.
+    """
+    if value is None:
+        return None
+    url = value.strip().rstrip("/")
+    if not url:
+        return None
+    if "://" not in url:
+        url = f"https://{url}"
+    if provider == "google" and "{model}" not in url:
+        # Google addresses the model in the path, so an endpoint without the
+        # placeholder is a host the user meant us to append the usual path to.
+        # Posting to the bare host just 404s with nothing to explain it.
+        url = f"{url}/v1beta/models/{{model}}:generateContent"
+    return url
+
+
 class CloudProvider(BaseProvider):
     """OpenAI-compatible, Anthropic and Google endpoints.  Opt-in only."""
 
     def __init__(self, provider: str, api_key: str, model: str | None = None,
                  base_url: str | None = None, timeout: float = 120.0):
         self.name = provider
-        self.api_key = api_key
+        self.api_key = (api_key or "").strip()
         endpoint, default_model = CLOUD_ENDPOINTS.get(provider, (None, None))
-        self.base_url = base_url or endpoint
-        self.model = model or default_model
+        self.base_url = normalise_endpoint(base_url, provider) or endpoint
+        self.model = (model or default_model or "").strip() or None
         self.timeout = timeout
 
     def status(self) -> LLMStatus:
@@ -217,6 +245,23 @@ class CloudProvider(BaseProvider):
         if self.api_key:
             text = text.replace(self.api_key, "***")
         return text
+
+    def _reason(self, response: Any) -> str:
+        """The provider's own explanation, if the error body carries one."""
+        try:
+            payload = response.json()
+        except (ValueError, AttributeError):
+            return ""
+        message = ""
+        if isinstance(payload, dict):
+            error = payload.get("error")
+            if isinstance(error, dict):
+                message = str(error.get("message") or "")
+            elif isinstance(error, str):
+                message = error
+        if not message:
+            return ""
+        return f" - {self._redact(message)[:300]}"
 
     def complete_json(self, system: str, user: str) -> dict[str, Any]:
         if not self.api_key or not self.base_url:
@@ -246,7 +291,9 @@ class CloudProvider(BaseProvider):
             # Google also accepts ?key=..., and an httpx error message quotes the
             # URL it failed on - which then travels into the run report, the UI
             # and the database.  A header does not appear in error text.
-            url = str(self.base_url).format(model=self.model)
+            # replace(), not format(): a stray brace anywhere else in a
+            # user-supplied endpoint would make format() raise KeyError.
+            url = str(self.base_url).replace("{model}", self.model or "")
             headers["x-goog-api-key"] = self.api_key
             payload = {
                 "systemInstruction": {"parts": [{"text": system}]},
@@ -271,6 +318,15 @@ class CloudProvider(BaseProvider):
             response = httpx.post(url, json=payload, headers=headers, timeout=self.timeout)
             response.raise_for_status()
             content = extract(response.json())
+        except httpx.HTTPStatusError as err:
+            # raise_for_status() reports the status and the URL and drops the
+            # body, but the body is the half that says *why*: "API key not
+            # valid", "models/gemini-9 is not found for API version v1beta".
+            # Without it a wrong model id and a wrong key look identical.
+            raise LLMError(
+                f"{self.name} request failed: {self._redact(err)}"
+                f"{self._reason(err.response)}"
+            ) from err
         except (httpx.HTTPError, KeyError, IndexError, json.JSONDecodeError) as err:
             raise LLMError(f"{self.name} request failed: {self._redact(err)}") from err
         return _parse_json_object(content)

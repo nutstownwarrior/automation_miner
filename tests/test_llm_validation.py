@@ -429,3 +429,106 @@ def test_google_authenticates_with_a_header_not_a_query_string():
         httpx.post = original
     assert "key=" not in captured["url"]
     assert captured["headers"]["x-goog-api-key"] == "k"
+
+
+# --- endpoint normalisation ---------------------------------------------
+# llm_base_url is typed or pasted into Home Assistant's add-on options, and
+# whatever comes along with it is invisible afterwards: the status page renders
+# the value into HTML, which collapses surrounding whitespace, so a stray space
+# showed a correct-looking endpoint and a request that failed for no visible
+# reason.
+GOOGLE_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
+
+@pytest.mark.parametrize(
+    "configured",
+    [
+        pytest.param(" https://generativelanguage.googleapis.com ", id="stray spaces"),
+        pytest.param("https://generativelanguage.googleapis.com\n", id="trailing newline"),
+        pytest.param("generativelanguage.googleapis.com", id="no scheme"),
+        pytest.param("https://generativelanguage.googleapis.com/", id="trailing slash"),
+        pytest.param(GOOGLE_ENDPOINT, id="already complete"),
+    ],
+)
+def test_a_hand_typed_google_endpoint_still_resolves(configured):
+    from amminer.llm.provider import CloudProvider
+
+    provider = CloudProvider("google", "k", model="gemini-2.0-flash", base_url=configured)
+    assert provider.base_url == GOOGLE_ENDPOINT
+
+
+def test_a_non_google_endpoint_is_not_given_a_google_path():
+    from amminer.llm.provider import normalise_endpoint
+
+    assert normalise_endpoint(" api.openai.com/v1/chat/completions ", "openai") == (
+        "https://api.openai.com/v1/chat/completions"
+    )
+
+
+def test_an_empty_endpoint_falls_back_to_the_built_in_one():
+    from amminer.llm.provider import CLOUD_ENDPOINTS, CloudProvider
+
+    for configured in (None, "", "   "):
+        provider = CloudProvider("openai", "k", base_url=configured)
+        assert provider.base_url == CLOUD_ENDPOINTS["openai"][0]
+
+
+def test_a_pasted_key_or_model_keeps_no_whitespace():
+    from amminer.llm.provider import CloudProvider
+
+    provider = CloudProvider("google", "  secret\n", model=" gemini-2.0-flash ")
+    assert provider.api_key == "secret"
+    assert provider.model == "gemini-2.0-flash"
+
+
+def test_a_stray_brace_in_an_endpoint_does_not_raise():
+    """format() would KeyError on it; the model is substituted, not formatted."""
+    from amminer.llm.provider import CloudProvider
+
+    provider = CloudProvider(
+        "google", "k", model="m", base_url="https://example.test/v1/{oops}/{model}"
+    )
+    captured = {}
+
+    def fake_post(url, json, headers, timeout):  # noqa: A002
+        captured["url"] = url
+        raise RuntimeError("stop here")
+
+    import httpx
+
+    original = httpx.post
+    httpx.post = fake_post
+    try:
+        with pytest.raises(RuntimeError):
+            provider.complete_json("system", "user")
+    finally:
+        httpx.post = original
+    assert captured["url"] == "https://example.test/v1/{oops}/m"
+
+
+def test_a_provider_error_says_why_and_still_hides_the_key():
+    """raise_for_status() keeps the status and drops the body that explains it."""
+    import httpx
+    from amminer.llm.provider import CloudProvider
+
+    secret = "AIzaSy-NOT-A-REAL-KEY-111111"
+    provider = CloudProvider("google", secret, model="gemini-9-imaginary")
+
+    def fake_post(url, json, headers, timeout):  # noqa: A002
+        return httpx.Response(
+            404,
+            request=httpx.Request("POST", f"https://example.test/?key={secret}"),
+            json={"error": {"message": f"models/gemini-9-imaginary is not found ({secret})"}},
+        )
+
+    original = httpx.post
+    httpx.post = fake_post
+    try:
+        with pytest.raises(LLMError) as raised:
+            provider.complete_json("system", "user")
+    finally:
+        httpx.post = original
+
+    message = str(raised.value)
+    assert "is not found" in message, "the body's explanation must survive"
+    assert secret not in message

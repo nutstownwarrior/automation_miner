@@ -1,6 +1,6 @@
 ---
 name: Automation Miner
-version: "0.2.0"
+version: "0.2.1"
 slug: automation_miner
 description: >-
   Mines your Home Assistant history for genuinely useful, explainable automation
