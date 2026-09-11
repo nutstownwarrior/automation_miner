@@ -121,6 +121,18 @@ Unwanted fires allowed at moments where you have previously reached over and
 undone an automation on the same entity. These are not merely unnecessary - they
 land exactly where you have already said no - so the default is `0`.
 
+### `llm_gaps`
+Off by default. Lets the model propose integrations or hardware the built-in
+detector has no rule for.
+
+Every proposal must name the real-world condition that makes it worth doing -
+the thing your devices cannot tell it. A proposal without one is discarded, not
+shown with a guess attached. It can only add to the list: it cannot change,
+reorder or remove anything the detector found, cannot repeat a detector
+suggestion under a new name, and cannot mention an entity you do not have.
+Proposals are marked **model-proposed** on the card and rank below detected
+gaps.
+
 ### `llm_audit`
 Off by default. Lets the model review the audit's findings about your existing
 automations and say whether each is a real conflict.

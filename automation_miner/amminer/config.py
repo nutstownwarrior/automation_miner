@@ -197,6 +197,10 @@ class Options:
     #: Let the model review audit findings about your existing automations.
     #: It can dismiss or soften one, never raise a severity or invent a finding.
     llm_audit: bool = False
+    #: Let the model propose integration/hardware gaps the detector has no rule
+    #: for.  Every proposal must state the real-world precondition that makes it
+    #: worth doing, or it is rejected.
+    llm_gaps: bool = False
     llm_triage_penalty: float = 0.5
 
     # --- paths (overridable for tests) ---
@@ -262,6 +266,7 @@ class Options:
             "hypotheses": bool(self.llm_hypotheses),
             "triage": bool(self.llm_triage),
             "audit_review": bool(self.llm_audit),
+            "gap_proposals": bool(self.llm_gaps),
         }
 
     @property

@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.5.0
+
+**Fixed: gap suggestions that assumed things about your life**
+
+Every gap is inferred from entities, and entities cannot see an electricity
+contract, a roof, a car or a job. "Add a dynamic electricity price sensor" was
+recommended to someone on a fixed-price tariff, where it saves exactly nothing -
+and the suggestion gave no hint that it depended on the tariff at all.
+
+`GapSuggestion` now carries a **`requires`** field naming the real-world
+condition that makes the suggestion worth acting on, shown on the card as
+*"Only worth it if"*. Six of the ten detector gaps state one:
+
+- the two energy-price gaps name the variable tariff they assume, and say
+  plainly that on a fixed-price contract there is nothing to shift loads
+  towards;
+- the solar forecast gap names the panels;
+- the workday sensor gap names a schedule that follows public holidays;
+- the presence gap names carrying a tracked device;
+- the carbon-intensity gap says outright that it is a preference rather than a
+  saving, because the cleanest hour and the cheapest hour are often different.
+
+The other four have no precondition beyond the evidence already on the card, and
+deliberately state none - filler would make the field meaningless on the ones
+that matter.
+
+**Added: `llm_gaps` (default off)**
+
+The detector's rules are a fixed list of named patterns. Noticing that someone
+with a heat pump and no energy dashboard might want one takes knowing what those
+things are for, which is world knowledge, so a model is asked - and held to the
+rule that prompted this release: **every proposal must state its precondition**,
+or it is rejected rather than patched up. "requires": "that you want cheaper
+electricity" is not a precondition; "an electricity contract whose price varies
+through the day" is.
+
+It is additive only. It cannot remove, reword or reorder anything the detector
+produced, cannot restate a detector gap under a new name, cannot cite an entity
+that does not exist, and cannot claim you *have* anything - it proposes, and
+names the condition under which the proposal applies. Everything it suggests is
+labelled **model-proposed** on the card and ranks below every detected gap. It
+is sent no raw history: only which signal roles were detected, how much manual
+activity there was per domain, and the titles the detector already used.
+
+The run report records every rejection reason, so a model producing unusable
+proposals is visible on the Status page rather than silently doing nothing.
+
 ## 0.4.0
 
 **Fixed: the audit read triggers and targets, and claimed to have read conditions**
