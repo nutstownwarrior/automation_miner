@@ -118,6 +118,33 @@ def test_any_other_source_is_refused(ha_config_dir, store, fake_client):
         assert status == 403, f"{host} must not reach the ingress port"
 
 
+def test_a_partially_failed_ai_step_is_not_shown_as_a_success(wired):
+    """A feature can return results AND an error, so `ran` alone is not success."""
+    client, _store, runner, _ha = wired
+    runner.last_report.ai = {
+        "entity_classification": {
+            "requested": True, "ran": True, "added_count": 2,
+            "error": "connection reset after the first batch",
+        },
+        "triage": {"requested": True, "ran": True, "reviewed": 4, "error": None},
+    }
+    import re
+
+    body = client.get("/status").text
+    assert "connection reset after the first batch" in body
+    section = body[body.index("AI assistance"):]
+    items = {}
+    for item in re.findall(r"<li>.*?</li>", section, re.S):
+        flat = " ".join(item.split())
+        match = re.search(r'<span class="tag (\w+)">([^<]+)</span>', flat)
+        if match:
+            items[match.group(2).strip()] = match.group(1)
+
+    # The step that errored must not wear a success tag; the clean one may.
+    assert items["entity classification"] == "warning"
+    assert items["triage"] == "ok"
+
+
 def test_health_endpoint(wired):
     client, _store, _runner, _ha = wired
     payload = client.get("/api/health").json()
@@ -223,3 +250,53 @@ def test_candidate_round_trips_through_the_store(wired):
     # The identity must survive serialisation, or dismissals would not stick.
     assert rebuilt.id == payload["id"]
     assert rebuilt.actions and rebuilt.triggers
+
+
+def test_apply_refuses_a_conflicting_rule_until_it_is_confirmed(wired):
+    """The conflict check was run, counted, and then not consulted by apply."""
+    client, store, _runner, ha = wired
+    actionable = [s for s in store.list_suggestions(status="new") if s["payload"].get("actions")]
+    suggestion_id = actionable[0]["id"]
+    stored = store.get_suggestion(suggestion_id)
+    payload = dict(stored["payload"])
+    payload["conflicts"] = [
+        {
+            "kind": "value_inconsistency",
+            "severity": "error",
+            "message": "'Bedtime dim' drives light.kitchen to 'off' at the same time.",
+        }
+    ]
+    store.upsert_suggestion(
+        suggestion_id, stored["miner"], stored["title"], stored.get("summary") or "",
+        stored.get("score") or 0.0, payload, stored.get("run_id"),
+    )
+
+    result = client.post(f"/api/suggestions/{suggestion_id}/apply").json()
+    assert result["ok"] is False
+    assert result["needs_confirmation"] is True
+    assert not ha.written
+    assert store.get_suggestion(suggestion_id)["status"] != "accepted"
+
+    confirmed = client.post(f"/api/suggestions/{suggestion_id}/apply?confirm=true").json()
+    assert confirmed["ok"] is True, confirmed
+    assert ha.written
+
+
+def test_restore_is_not_undone_by_the_next_run(wired):
+    client, store, runner, _ha = wired
+    suggestion_id = store.list_suggestions(status="new")[0]["id"]
+    client.post(f"/api/suggestions/{suggestion_id}/dismiss")
+    assert store.get_suggestion(suggestion_id)["status"] == "dismissed"
+
+    assert client.post(f"/api/suggestions/{suggestion_id}/restore").status_code == 200
+    assert store.is_dismissed(suggestion_id) is False
+
+    runner.run_now()
+    still_there = store.get_suggestion(suggestion_id)
+    assert still_there is not None
+    assert still_there["status"] == "new"
+
+
+def test_restoring_an_unknown_suggestion_is_404(wired):
+    client, _store, _runner, _ha = wired
+    assert client.post("/api/suggestions/nope/restore").status_code == 404

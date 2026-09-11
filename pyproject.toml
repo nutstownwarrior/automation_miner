@@ -22,8 +22,15 @@ testpaths = ["tests"]
 pythonpath = ["automation_miner"]
 addopts = "-q --strict-markers"
 filterwarnings = [
-  "ignore::DeprecationWarning",
-  "ignore::UserWarning",
+  # Not a blanket ignore.  This project cares a great deal about which wheels
+  # exist for musllinux, so an upstream deprecation is the early warning that a
+  # pinned dependency is about to move under it - silencing every one of them
+  # removes exactly the signal worth having.  Add a narrow entry per known,
+  # accepted warning instead.
+  "default::DeprecationWarning",
+  "default::UserWarning",
+  # mlxtend divides by a zero denominator computing a metric we do not use.
+  "ignore:invalid value encountered in divide:RuntimeWarning:mlxtend.*",
 ]
 markers = [
   "mariadb: needs a live MariaDB/MySQL server (set AMMINER_TEST_MYSQL_URL)",

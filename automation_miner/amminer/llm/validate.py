@@ -1,15 +1,27 @@
 """The validation gate.  Nothing reaches the user or HA without passing it.
 
-Three independent checks, all mandatory:
+Independent checks, all mandatory:
 
-1. **Existence** - every ``entity_id`` / ``device_id`` / ``area_id`` / service
+1. **Knowable targets** - what the automation will touch must be decidable
+   *now*, from the text.  A Jinja template or ``entity_id: all`` defers that
+   decision to runtime, where no gate can see it, so both are refused outright.
+   Nothing this add-on generates needs either.
+2. **Existence** - every ``entity_id`` / ``device_id`` / ``area_id`` / service
    the automation references must exist in the registry-union-states set.  This
    is what actually catches LLM hallucination; ``check_config`` does not.
-2. **Schema** - the YAML must parse and match Home Assistant's automation
+3. **Schema** - the YAML must parse and match Home Assistant's automation
    schema, mirrored here in voluptuous.
-3. **Core check** - ``POST /api/config/core/check_config`` must pass.  It misses
-   some semantic errors and quoting bugs, which is precisely why step 1 is not
+4. **Core check** - ``POST /api/config/core/check_config`` must pass.  It misses
+   some semantic errors and quoting bugs, which is precisely why step 2 is not
    optional.
+
+Every check fails *closed*.  When the live service index is unreachable the
+service check does not become a no-op: it falls back to the closed set of
+services this add-on is capable of emitting, so an unreachable Core cannot turn
+"we could not verify this" into "this is fine".
+
+:mod:`amminer.llm.equivalence` runs alongside these on LLM output, and answers
+the question none of them do: is this still the rule that was mined?
 """
 
 from __future__ import annotations
@@ -24,24 +36,11 @@ import yaml
 
 _LOGGER = logging.getLogger(__name__)
 
-ENTITY_ID_RE = r"^[a-z_0-9]+\.[a-z_0-9]+$"
+#: Jinja delimiters.  A value containing any of these is decided at runtime.
+TEMPLATE_MARKERS = ("{{", "{%", "{#")
 
-
-def _entity_id(value: Any) -> str:
-    text = str(value)
-    import re
-
-    if not re.match(ENTITY_ID_RE, text):
-        raise vol.Invalid(f"'{text}' is not a valid entity_id")
-    return text
-
-
-def _entity_ids(value: Any) -> list[str]:
-    if isinstance(value, str):
-        return [_entity_id(value)] if value not in ("all", "none") else [value]
-    if isinstance(value, list):
-        return [_entity_id(v) for v in value]
-    raise vol.Invalid("expected an entity_id or a list of entity_ids")
+#: Target keywords that mean "everything", i.e. a target we cannot enumerate.
+WILDCARD_TARGETS = ("all", "none")
 
 
 TARGET_SCHEMA = vol.Schema(
@@ -138,6 +137,15 @@ class ValidationReport:
     ok: bool = False
     schema_ok: bool = False
     references_ok: bool = False
+    #: Is what this automation touches decidable from the text alone?  False
+    #: means a template or a wildcard target deferred it to runtime.
+    targets_static: bool = True
+    #: Were service names checked against the *live* index, or only against the
+    #: closed set this add-on can emit?  False is a degradation, not a pass.
+    services_verified: bool = False
+    #: Does the automation still mean what the mined candidate meant?  Only
+    #: meaningful for LLM output; the deterministic renderer is the reference.
+    semantics_ok: bool | None = None
     check_config_ok: bool | None = None  # None == not run (Core unreachable)
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -150,6 +158,9 @@ class ValidationReport:
             "ok": self.ok,
             "schema_ok": self.schema_ok,
             "references_ok": self.references_ok,
+            "targets_static": self.targets_static,
+            "services_verified": self.services_verified,
+            "semantics_ok": self.semantics_ok,
             "check_config_ok": self.check_config_ok,
             "errors": self.errors,
             "warnings": self.warnings,
@@ -189,8 +200,81 @@ def _collect_references(config: dict[str, Any]) -> dict[str, set[str]]:
                 walk(item)
 
     walk(config)
-    found["entity_id"] = {e for e in found["entity_id"] if e not in ("all", "none")}
     return found
+
+
+def _leaf_key(path: str) -> str:
+    """The mapping key a path ends at, ignoring any list indices below it."""
+    return path.rsplit(".", 1)[-1].split("[", 1)[0]
+
+
+def validate_static_targets(config: dict[str, Any]) -> tuple[bool, list[str]]:
+    """Refuse anything whose effect is only decidable at runtime.
+
+    Two things get past a reference check by never naming a reference:
+
+    * a Jinja template - ``service: "{{ svc }}"`` names no service at all, and
+      ``entity_id: "{{ trigger.entity_id }}"`` names no entity, so there is
+      nothing for the existence check to reject.  Whatever they evaluate to is
+      chosen after every gate has run.
+    * ``entity_id: all`` - a legal, enumerable-only-at-runtime way to say
+      "every entity this service accepts".  ``light.turn_off`` with it is the
+      whole house.
+
+    Neither the deterministic renderer nor a permitted alias rewrite ever
+    produces these, so there is no cost to refusing them and no safe way to
+    check them.
+    """
+    errors: list[str] = []
+    # Free text cannot change what the automation does, and rejecting a
+    # description that happens to contain braces would cost a good rewrite for
+    # nothing.
+    prose = ("alias", "description")
+
+    def walk(node: Any, path: str) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key in prose:
+                    continue
+                walk(value, f"{path}.{key}" if path else str(key))
+        elif isinstance(node, list):
+            for index, item in enumerate(node):
+                walk(item, f"{path}[{index}]")
+        elif isinstance(node, str):
+            if any(marker in node for marker in TEMPLATE_MARKERS):
+                errors.append(
+                    f"{path or 'automation'} contains a template ({node!r}); what it "
+                    "would do is decided at runtime, so it cannot be checked here"
+                )
+            elif _leaf_key(path) == "entity_id" and node in WILDCARD_TARGETS:
+                errors.append(
+                    f"{path} is '{node}', which targets every matching entity "
+                    "rather than a named one"
+                )
+
+    walk(config, "")
+    return not errors, errors
+
+
+def emittable_services() -> set[str]:
+    """Every service this add-on is capable of proposing.
+
+    The miners reach services through one function, so the set is closed and
+    knowable without asking Core.  It is the floor the service check falls back
+    to when the live index is unavailable - narrower than the real instance, so
+    a legitimate service can be refused, but never the reverse.
+    """
+    from ..config import ACTIONABLE_DOMAINS
+    from ..miners.time_of_day import _SERVICE_MAP  # local: avoids an import cycle
+
+    services = set(_SERVICE_MAP.values())
+    services.update({"climate.set_hvac_mode", "climate.turn_off", "climate.set_temperature"})
+    services.update({"scene.turn_on", "script.turn_on"})
+    services.update({f"{domain}.select_option" for domain in ("input_select", "select")})
+    services.update({f"homeassistant.turn_{state}" for state in ("on", "off")})
+    services.update({f"{domain}.turn_{state}"
+                     for domain in ACTIONABLE_DOMAINS for state in ("on", "off")})
+    return services
 
 
 def validate_references(
@@ -216,11 +300,20 @@ def validate_references(
         if entity_id not in entities:
             unknown["entities"].append(entity_id)
             errors.append(f"entity_id '{entity_id}' does not exist on this instance")
-    if services:
-        for service in sorted(references["service"]):
-            if service not in services:
-                unknown["services"].append(service)
-                errors.append(f"service '{service}' is not available on this instance")
+    # No live index is a reason to check harder, not to stop checking: fall
+    # back to the closed set of services this add-on can emit.  Skipping the
+    # check here would let an unreachable Core wave a hallucinated service
+    # through, which is the one moment it matters most.
+    allowed_services = services or emittable_services()
+    for service in sorted(references["service"]):
+        if service not in allowed_services:
+            unknown["services"].append(service)
+            errors.append(
+                f"service '{service}' is not available on this instance"
+                if services
+                else f"service '{service}' is not one this add-on generates, and "
+                "Home Assistant is not reachable to confirm it exists"
+            )
     for device_id in sorted(references["device_id"]):
         if devices and device_id not in devices:
             unknown["targets"].append(device_id)
@@ -281,10 +374,22 @@ def validate_automation(
     report.schema_ok, schema_errors = validate_schema(config)
     report.errors.extend(schema_errors)
 
+    # Before asking whether the references exist, ask whether they *are*
+    # references.  A template names nothing, so an existence check on it always
+    # passes vacuously.
+    report.targets_static, target_errors = validate_static_targets(config)
+    report.errors.extend(target_errors)
+
     if resolver is not None:
         services = set(known_services) if known_services is not None else set()
         if not services and client is not None:
             services = client.service_index()
+        report.services_verified = bool(services)
+        if not report.services_verified:
+            report.warnings.append(
+                "Home Assistant's service list is unavailable; service names were "
+                "checked against the set this add-on generates instead."
+            )
         ok, errors, unknown = validate_references(
             config,
             resolver.known_entity_ids(),
@@ -318,6 +423,9 @@ def validate_automation(
             report.errors.append(f"check_config failed: {result.get('errors')}")
 
     report.ok = (
-        report.schema_ok and report.references_ok and report.check_config_ok is not False
+        report.schema_ok
+        and report.references_ok
+        and report.targets_static
+        and report.check_config_ok is not False
     )
     return report

@@ -160,22 +160,13 @@ class HAClient:
         result = self._request("GET", f"{self.core_base}/error_log")
         return result if isinstance(result, str) else ""
 
-    # --- Supervisor API ----------------------------------------------
-    def supervisor_info(self) -> dict[str, Any]:
-        result = self._request("GET", f"{self.supervisor_base}/info")
-        if isinstance(result, dict):
-            return result.get("data") or {}
-        return {}
-
-    def addons(self) -> list[dict[str, Any]]:
-        """Installed add-ons - used to auto-detect Ollama, MariaDB, ..."""
-        result = self._request("GET", f"{self.supervisor_base}/addons")
-        if isinstance(result, dict):
-            data = result.get("data") or {}
-            addons = data.get("addons")
-            if isinstance(addons, list):
-                return addons
-        return []
+    # There is deliberately no Supervisor API here.  These two methods used to
+    # wrap /info and /addons "to auto-detect Ollama, MariaDB, ..." and nothing
+    # ever called them - Ollama is found by probing its usual URLs and the
+    # recorder by reading configuration.yaml, neither of which needs the
+    # Supervisor.  Keeping them meant the add-on asked for hassio_api, an
+    # elevated privilege, for code that did not run.  supervisor_base stays
+    # because the Core API is proxied through it.
 
     # --- WebSocket ----------------------------------------------------
     def ws_registry_lists(self) -> dict[str, list[dict[str, Any]]] | None:

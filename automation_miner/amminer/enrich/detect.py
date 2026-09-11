@@ -12,13 +12,29 @@ import logging
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from functools import lru_cache
 
 _LOGGER = logging.getLogger(__name__)
 
 
+@lru_cache(maxsize=512)
+def _bounded(pattern: str) -> re.Pattern[str]:
+    """Compile *pattern* so it can only start at a word boundary.
+
+    These patterns are matched against entity ids and friendly names, where a
+    bare substring search finds a lot of things it did not mean: ``go_?e``
+    matches "man**go_e**thanol", ``sma_`` matches "pla**sma_**display", and
+    ``ev_?charg`` matches "pr**ev_charg**e".  A separator - anything that is not
+    a letter or a digit - must come first.  Nothing is added to the end, because
+    several of these are real prefixes of longer names (``go_echarger``).
+    """
+    prefix = r"(?<![a-z0-9])" if pattern[:1].isalnum() else ""
+    return re.compile(prefix + pattern)
+
+
 def _match_any(text: str, patterns: Iterable[str]) -> bool:
     lowered = text.lower()
-    return any(re.search(pattern, lowered) for pattern in patterns)
+    return any(_bounded(pattern).search(lowered) for pattern in patterns)
 
 
 @dataclass
@@ -124,7 +140,12 @@ def detect_signals(resolver) -> SignalSet:
         domain = info.domain
         device_class = (info.device_class or "").lower()
         platform = (info.platform or "").lower()
-        haystack = f"{entity_id} {info.friendly_name or ''} {platform} {info.model or ''}"
+        # Deliberately not the platform.  It says which integration produced
+        # the entity, not what the entity measures, and putting it here made
+        # every `template` sensor in a garden an outdoor thermometer, because
+        # "template" contains "temp".  Where a platform really does identify a
+        # signal (workday, dwd_weather_warnings) it is checked by name below.
+        haystack = f"{entity_id} {info.friendly_name or ''} {info.model or ''}"
 
         if domain == "sun":
             signals.sun.append(entity_id)
@@ -145,7 +166,7 @@ def detect_signals(resolver) -> SignalSet:
                 signals.occupancy.append(entity_id)
                 if _match_any(haystack, _MMWAVE_MODELS):
                     signals.room_presence.append(entity_id)
-            if device_class == "motion" or "motion" in haystack:
+            if device_class == "motion" or _match_any(haystack, (r"motion",)):
                 signals.motion.append(entity_id)
             if _match_any(haystack, _WORKDAY_PATTERNS) or platform == "workday":
                 signals.workday.append(entity_id)
@@ -156,9 +177,11 @@ def detect_signals(resolver) -> SignalSet:
             is_outdoor = _match_any(haystack, outdoor_words)
             # The device_class is authoritative, but it is unavailable when only
             # the recorder could be read - fall back to the name then.
-            if is_outdoor and (device_class == "temperature" or "temp" in haystack):
+            if is_outdoor and (
+                device_class == "temperature" or _match_any(haystack, (r"temp",))
+            ):
                 signals.outdoor_temperature.append(entity_id)
-            elif device_class == "illuminance" or "lux" in haystack:
+            elif device_class == "illuminance" or _match_any(haystack, (r"lux",)):
                 signals.illuminance.append(entity_id)
             elif device_class == "power":
                 signals.power.append(entity_id)

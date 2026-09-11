@@ -9,7 +9,7 @@ from amminer.backtest import backtest, backtest_all, ground_truth_actions, simul
 from amminer.config import Options
 from amminer.enrich.signals import SignalSeries, SignalStore
 from amminer.miners.base import Action, Candidate, Condition, Trigger
-from amminer.recorderdb.models import Cause, StateChange
+from amminer.recorderdb.models import Cause, OverrideEvent, StateChange
 from amminer.util.timeutil import local_tz
 
 TZ = local_tz()
@@ -171,6 +171,45 @@ def test_state_trigger_simulation_uses_a_tight_tolerance():
     assert result.passed is True
 
 
+def test_an_unevaluable_time_bound_fails_closed():
+    """A gate must never read a bound it cannot parse as 'no constraint'."""
+    from amminer.backtest import _condition_holds
+
+    moment = (START + dt.timedelta(days=1, hours=12)).timestamp()
+    assert _condition_holds(Condition(kind="time", after="06:00:00"), moment, SignalStore(), TZ)
+    for bogus in ("evening", "25:00", "12:70", "half past six"):
+        assert not _condition_holds(
+            Condition(kind="time", after=bogus), moment, SignalStore(), TZ
+        ), bogus
+        assert not _condition_holds(
+            Condition(kind="time", before=bogus), moment, SignalStore(), TZ
+        ), bogus
+
+
+def test_a_rule_with_an_unevaluable_condition_never_fires():
+    """The end-to-end consequence: it cannot be surfaced by accident."""
+    changes = [
+        human("light.kitchen", "on", (START + dt.timedelta(days=d, hours=6, minutes=30)).timestamp())
+        for d in range(DAYS)
+    ]
+    candidate = daily_candidate()
+    candidate.conditions = [Condition(kind="time", after="breakfast")]
+    result = backtest(candidate, changes, SignalStore(), Options(), WINDOW)
+    assert result.true_fires == 0
+    assert result.passed is False
+
+
+def test_time_of_day_parsing_is_strict():
+    from amminer.util.timeutil import parse_time_of_day, time_of_day_minutes
+
+    assert time_of_day_minutes("06:30") == 390
+    assert time_of_day_minutes("06:30:45") == 390
+    assert parse_time_of_day("6:5") == "06:05:00"
+    for bogus in ("evening", "25:00", "12:70", "6", "", None, 630, "06:30:99"):
+        assert time_of_day_minutes(bogus) is None, bogus
+        assert parse_time_of_day(bogus) is None, bogus
+
+
 def test_unsimulatable_trigger_is_rejected_not_crashed():
     candidate = daily_candidate()
     candidate.triggers = [Trigger(kind="webhook")]
@@ -264,3 +303,381 @@ def test_nuisance_fires_counted_against_overrides():
     )
     assert result.false_fires > 0
     assert result.nuisance_fires > 0
+
+
+# --- the evidence floor -------------------------------------------------
+def test_a_single_correct_fire_is_not_evidence():
+    """100% precision, zero nuisance, one observation."""
+    once = (START + dt.timedelta(days=3, hours=6, minutes=30)).timestamp()
+    candidate = Candidate(
+        miner="test",
+        title="one-off",
+        triggers=[Trigger(kind="state", entity_id="binary_sensor.door", to_state="on")],
+        actions=[Action(service="light.turn_on", entity_id="light.kitchen")],
+    )
+    store = SignalStore()
+    series = SignalSeries("binary_sensor.door")
+    series.add(once - 30, "on")
+    store.add(series)
+
+    result = backtest(candidate, [human("light.kitchen", "on", once)], store, Options(), WINDOW)
+
+    assert result.true_fires == 1
+    assert result.false_fires == 0
+    assert result.precision == 1.0
+    assert result.false_fires_per_week == 0.0
+    # Every ratio is perfect and there is still nothing here.
+    assert result.passed is False
+    assert "too little to judge" in result.reason
+
+
+def test_the_floor_is_cleared_by_a_habit_that_repeats():
+    candidate = Candidate(
+        miner="test",
+        title="repeats",
+        triggers=[Trigger(kind="state", entity_id="binary_sensor.door", to_state="on")],
+        actions=[Action(service="light.turn_on", entity_id="light.kitchen")],
+    )
+    store = SignalStore()
+    series = SignalSeries("binary_sensor.door")
+    changes = []
+    for day in range(10):
+        ts = (START + dt.timedelta(days=day, hours=18)).timestamp()
+        series.add(ts - 30, "on")
+        series.add(ts - 20, "off")
+        changes.append(human("light.kitchen", "on", ts))
+    store.add(series)
+
+    result = backtest(candidate, changes, store, Options(), WINDOW)
+
+    assert result.true_fires == 10
+    assert result.passed is True, result.reason
+    assert "right 10 times" in result.reason
+
+
+def test_a_precise_rule_that_covers_almost_nothing_is_rejected():
+    """Firing correctly 3 times out of 20 is precise and useless."""
+    candidate = Candidate(
+        miner="test",
+        title="rare",
+        triggers=[Trigger(kind="state", entity_id="binary_sensor.door", to_state="on")],
+        actions=[Action(service="light.turn_on", entity_id="light.kitchen")],
+    )
+    store = SignalStore()
+    series = SignalSeries("binary_sensor.door")
+    changes = []
+    for day in range(20):
+        ts = (START + dt.timedelta(days=day % 20, hours=18)).timestamp()
+        changes.append(human("light.kitchen", "on", ts))
+        if day < 3:  # the door only explains the first three
+            series.add(ts - 30, "on")
+            series.add(ts - 20, "off")
+    store.add(series)
+
+    result = backtest(candidate, changes, store, Options(), WINDOW)
+
+    assert result.precision == 1.0
+    assert result.recall == pytest.approx(0.15)
+    assert result.passed is False
+    assert "would only have covered" in result.reason
+
+
+def test_false_fires_next_to_an_override_are_disqualifying():
+    """Where the user has already reached over and undone an automation."""
+    candidate = Candidate(
+        miner="test",
+        title="unwanted",
+        triggers=[Trigger(kind="state", entity_id="binary_sensor.door", to_state="on")],
+        actions=[Action(service="light.turn_on", entity_id="light.kitchen")],
+    )
+    store = SignalStore()
+    series = SignalSeries("binary_sensor.door")
+    changes, overrides = [], []
+    for day in range(10):
+        ts = (START + dt.timedelta(days=day, hours=18)).timestamp()
+        series.add(ts - 30, "on")
+        series.add(ts - 20, "off")
+        changes.append(human("light.kitchen", "on", ts))
+    # One extra opening the user did not follow with the light, and did
+    # actively undo.
+    stray = (START + dt.timedelta(days=11, hours=3)).timestamp()
+    series.add(stray, "on")
+    series.add(stray + 10, "off")
+    store.add(series)
+    overrides.append(
+        OverrideEvent(
+            entity_id="light.kitchen",
+            ts=stray + 60,
+            automation_entity_id="automation.x",
+            automation_state="on",
+            human_state="off",
+            delay_seconds=60.0,
+        )
+    )
+
+    options = Options()
+    baseline = backtest(candidate, changes, store, options, WINDOW)
+    assert baseline.nuisance_fires == 0
+    assert baseline.passed is True, baseline.reason
+
+    result = backtest(candidate, changes, store, options, WINDOW, overrides=overrides)
+    assert result.nuisance_fires == 1
+    assert result.passed is False
+    assert "previously overridden" in result.reason
+
+
+def test_a_state_trigger_is_not_judged_by_the_clock_tolerance():
+    """A mixed-trigger rule must not borrow the loosest tolerance it has."""
+    door_ts = (START + dt.timedelta(days=1, hours=18)).timestamp()
+    candidate = Candidate(
+        miner="test",
+        title="mixed",
+        triggers=[
+            Trigger(kind="time", at="06:30:00"),
+            Trigger(kind="state", entity_id="binary_sensor.door", to_state="on"),
+        ],
+        actions=[Action(service="light.turn_on", entity_id="light.kitchen")],
+    )
+    store = SignalStore()
+    series = SignalSeries("binary_sensor.door")
+    series.add(door_ts, "on")
+    store.add(series)
+
+    # 10 minutes after the door: inside the 15-minute clock tolerance, well
+    # outside the 5-minute one a state trigger is held to.
+    result = backtest(
+        candidate, [human("light.kitchen", "on", door_ts + 600)], store, Options(), WINDOW
+    )
+    assert door_ts in result.false_fire_samples
+    assert result.true_fires == 0
+
+
+# --- Home Assistant semantics -------------------------------------------
+def _minute(day: int, hour: int, minute: int = 0) -> float:
+    return (START + dt.timedelta(days=day, hours=hour, minutes=minute)).timestamp()
+
+
+@pytest.mark.parametrize(
+    "hour, expected",
+    [
+        (23, True),   # late evening: inside the wrapped window
+        (2, True),    # small hours: still inside it
+        (5, True),    # just before the end
+        (12, False),  # midday: outside
+        (21, False),  # just before the start
+    ],
+)
+def test_an_overnight_window_wraps_around_midnight(hour, expected):
+    """'after 22:00 and before 06:00' is an evening, not an empty set."""
+    condition = Condition(kind="time", after="22:00:00", before="06:00:00")
+    from amminer.backtest import _condition_holds
+
+    holds = _condition_holds(condition, _minute(2, hour), SignalStore(), local_tz())
+    assert holds is expected
+
+
+def test_a_daytime_window_still_reads_normally():
+    from amminer.backtest import _condition_holds
+
+    condition = Condition(kind="time", after="09:00:00", before="17:00:00")
+    tz = local_tz()
+    assert _condition_holds(condition, _minute(2, 12), SignalStore(), tz) is True
+    assert _condition_holds(condition, _minute(2, 3), SignalStore(), tz) is False
+    assert _condition_holds(condition, _minute(2, 20), SignalStore(), tz) is False
+
+
+def test_an_overnight_rule_can_actually_fire():
+    """The wrap bug made every night-time candidate unsimulatable, so every
+    one of them was rejected for never having fired."""
+    candidate = Candidate(
+        miner="test",
+        title="late night",
+        triggers=[Trigger(kind="state", entity_id="binary_sensor.motion", to_state="on")],
+        conditions=[Condition(kind="time", after="22:00:00", before="06:00:00")],
+        actions=[Action(service="light.turn_on", entity_id="light.hallway")],
+    )
+    store = SignalStore()
+    series = SignalSeries("binary_sensor.motion")
+    changes = []
+    for day in range(8):
+        ts = _minute(day, 23, 30)
+        series.add(ts, "on")
+        series.add(ts + 60, "off")
+        changes.append(human("light.hallway", "on", ts + 5))
+    store.add(series)
+
+    result = backtest(candidate, changes, store, Options(), WINDOW)
+    assert result.true_fires == 8
+    assert result.passed is True, result.reason
+
+
+def test_numeric_range_entry_only():
+    trigger = Trigger(kind="numeric_state", entity_id="sensor.temp", above=10, below=20)
+    store = SignalStore()
+    series = SignalSeries("sensor.temp")
+    base = _minute(1, 12)
+    # 5 -> 25 jumps clean over the band; 25 -> 15 enters it; 15 -> 25 leaves it;
+    # 25 -> 5 crosses both bounds downward without ever being inside.
+    for offset, value in enumerate([5, 25, 15, 25, 5]):
+        series.add(base + offset * 60, value)
+    store.add(series)
+
+    from amminer.backtest import _numeric_trigger_fires
+
+    fires = _numeric_trigger_fires(trigger, store)
+    assert fires == [base + 2 * 60]
+
+
+def test_a_single_bound_numeric_trigger_is_unchanged():
+    trigger = Trigger(kind="numeric_state", entity_id="sensor.lux", below=600)
+    store = SignalStore()
+    series = SignalSeries("sensor.lux")
+    base = _minute(1, 12)
+    for offset, value in enumerate([700, 500, 400, 800, 300]):
+        series.add(base + offset * 60, value)
+    store.add(series)
+
+    from amminer.backtest import _numeric_trigger_fires
+
+    assert _numeric_trigger_fires(trigger, store) == [base + 60, base + 4 * 60]
+
+
+def test_an_unavailable_gap_re_arms_a_numeric_trigger():
+    """Coming back into range after a restart is a fire in Home Assistant."""
+    trigger = Trigger(kind="numeric_state", entity_id="sensor.temp", below=10)
+    store = SignalStore()
+    series = SignalSeries("sensor.temp")
+    base = _minute(1, 12)
+    series.add(base, 20)
+    series.add(base + 60, 5)  # enters
+    series.add(base + 120, "unavailable")  # restart
+    series.add(base + 180, 5)  # back, still in range
+    store.add(series)
+
+    from amminer.backtest import _numeric_trigger_fires
+
+    assert _numeric_trigger_fires(trigger, store) == [base + 60, base + 180]
+
+
+def test_a_flapping_trigger_is_not_smoothed_into_a_pass():
+    """Collapsing a burst is a courtesy to the reader; HA runs the action each time."""
+    candidate = Candidate(
+        miner="test",
+        title="flapper",
+        triggers=[Trigger(kind="state", entity_id="binary_sensor.motion", to_state="on")],
+        actions=[Action(service="light.turn_on", entity_id="light.hallway")],
+    )
+    store = SignalStore()
+    series = SignalSeries("binary_sensor.motion")
+    changes = []
+    for day in range(8):
+        ts = _minute(day, 18)
+        # One "event" to a person: twelve service calls to Home Assistant.
+        for i in range(12):
+            series.add(ts + i * 4, "on")
+            series.add(ts + i * 4 + 2, "off")
+        changes.append(human("light.hallway", "on", ts + 5))
+    store.add(series)
+
+    result = backtest(candidate, changes, store, Options(), WINDOW)
+
+    assert result.total_fires == 8  # what a person would say happened
+    assert result.burst_fires == 8 * 11  # what would really have run
+    assert result.passed is False
+    assert "flaps" in result.reason
+
+
+def test_an_ordinary_rule_reports_no_bursts():
+    candidate = Candidate(
+        miner="test",
+        title="calm",
+        triggers=[Trigger(kind="state", entity_id="binary_sensor.motion", to_state="on")],
+        actions=[Action(service="light.turn_on", entity_id="light.hallway")],
+    )
+    store = SignalStore()
+    series = SignalSeries("binary_sensor.motion")
+    changes = []
+    for day in range(8):
+        ts = _minute(day, 18)
+        series.add(ts, "on")
+        series.add(ts + 300, "off")
+        changes.append(human("light.hallway", "on", ts + 5))
+    store.add(series)
+
+    result = backtest(candidate, changes, store, Options(), WINDOW)
+    assert result.burst_fires == 0
+    assert result.passed is True, result.reason
+
+
+# --- risk tiering --------------------------------------------------------
+def _repeating(service: str, entity_id: str, days: int = 10):
+    """A clean, high-precision habit - the kind a light suggestion is made of."""
+    candidate = Candidate(
+        miner="test",
+        title=f"{service} {entity_id}",
+        triggers=[Trigger(kind="state", entity_id="binary_sensor.motion", to_state="on")],
+        actions=[Action(service=service, entity_id=entity_id)],
+    )
+    store = SignalStore()
+    series = SignalSeries("binary_sensor.motion")
+    changes = []
+    target = {"lock.lock": "locked", "lock.unlock": "unlocked",
+              "cover.close_cover": "closed", "cover.open_cover": "open"}.get(service, "on")
+    for day in range(days):
+        ts = _minute(day, 18)
+        series.add(ts - 30, "on")
+        series.add(ts - 20, "off")
+        changes.append(human(entity_id, target, ts))
+    store.add(series)
+    return candidate, changes, store
+
+
+def test_a_lamp_habit_passes_on_the_ordinary_bar():
+    candidate, changes, store = _repeating("light.turn_on", "light.hallway")
+    result = backtest(candidate, changes, store, Options(), WINDOW)
+    assert result.passed is True, result.reason
+    assert result.risky_domains == []
+
+
+def test_the_same_evidence_is_not_enough_for_a_lock():
+    """Identical statistics, a different thing being controlled."""
+    candidate, changes, store = _repeating("lock.lock", "lock.front_door")
+    result = backtest(candidate, changes, store, Options(), WINDOW)
+    assert result.precision == 1.0
+    assert result.true_fires == 10
+    assert result.risky_domains == ["lock"]
+    assert result.passed is False
+    assert "at least 12 needed for a lock" in result.reason
+
+
+def test_a_lock_passes_once_the_evidence_is_there():
+    candidate, changes, store = _repeating("lock.lock", "lock.front_door", days=20)
+    result = backtest(candidate, changes, store, Options(), WINDOW)
+    assert result.risky_domains == ["lock"]
+    assert result.passed is True, result.reason
+
+
+@pytest.mark.parametrize(
+    "service, entity_id",
+    [
+        ("lock.unlock", "lock.front_door"),
+        ("cover.open_cover", "cover.garage"),
+        ("valve.open_valve", "valve.mains"),
+    ],
+)
+def test_unlocking_and_opening_are_never_proposed_from_a_correlation(service, entity_id):
+    """No precision makes a correlation a reason to unsecure a house."""
+    candidate, changes, store = _repeating(service, entity_id, days=60)
+    result = backtest(candidate, changes, store, Options(), WINDOW)
+    assert result.passed is False
+    assert result.simulated is False  # refused before the statistics are consulted
+    assert "less secured" in result.reason
+
+
+def test_the_refusal_can_be_lifted_deliberately():
+    candidate, changes, store = _repeating("lock.unlock", "lock.front_door", days=20)
+    options = Options(allow_security_actions=True)
+    result = backtest(candidate, changes, store, options, WINDOW)
+    assert result.simulated is True
+    assert result.risky_domains == ["lock"]  # still on the stricter thresholds
+    assert result.passed is True, result.reason

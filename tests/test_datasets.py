@@ -154,3 +154,62 @@ def test_real_casas_archive_parses_and_mines():
     for candidate in candidates:
         assert candidate.evidence.occurrences >= Options().min_occurrences
         assert candidate.evidence.consistency >= Options().min_consistency
+
+
+# --- fixture determinism -------------------------------------------------
+def test_the_fixture_is_reproducible_from_its_seed_alone(tmp_path):
+    """The same seed and the same end date must give byte-identical ground truth."""
+    import datetime as dt
+
+    from amminer.testing.synthetic import build_default_fixture
+
+    end = dt.datetime(2024, 5, 1, 12, 0, tzinfo=dt.UTC)
+    first = build_default_fixture(tmp_path / "a.db", days=45, end=end, seed=99, tz=dt.UTC)
+    second = build_default_fixture(tmp_path / "b.db", days=45, end=end, seed=99, tz=dt.UTC)
+
+    assert first.start_ts == second.start_ts
+    assert first.end_ts == second.end_ts
+    assert first.time_of_day == second.time_of_day
+    assert first.conditional == second.conditional
+
+
+def test_every_weekday_the_suite_could_start_on_still_recovers_the_habit(tmp_path):
+    """The generator's weekday branches consume different amounts of randomness.
+
+    Pinning the end date makes the suite reproducible; this keeps the coverage
+    that pinning it would otherwise remove.
+    """
+    import datetime as dt
+
+    from amminer.config import Options
+    from amminer.discovery.recorder import (
+        RecorderInfo,
+        create_recorder_engine,
+        probe,
+        sqlite_readonly_url,
+    )
+    from amminer.miners import time_of_day
+    from amminer.recorderdb import causality
+    from amminer.recorderdb.queries import ORIGIN_EVENT_TYPES, RecorderQueries
+    from amminer.testing.synthetic import build_default_fixture
+
+    for offset in range(7):
+        end = dt.datetime(2024, 5, 1, 12, 0, tzinfo=dt.UTC) + dt.timedelta(days=offset)
+        path = tmp_path / f"week{offset}.db"
+        truth = build_default_fixture(path, days=45, end=end, seed=20240501, tz=dt.UTC)
+        engine = create_recorder_engine(sqlite_readonly_url(path))
+        try:
+            info = probe(engine, RecorderInfo(dialect="sqlite"))
+            queries = RecorderQueries(engine, info)
+            changes = queries.state_changes(truth.start_ts - 1, truth.end_ts + 1)
+            events = queries.events(
+                truth.start_ts - 1, truth.end_ts + 1, list(ORIGIN_EVENT_TYPES)
+            )
+            causality.annotate(changes, events)
+            found = time_of_day.mine(
+                changes, Options(), (truth.start_ts, truth.end_ts)
+            )
+        finally:
+            engine.dispose()
+        targets = {a.entity_id for c in found for a in c.actions}
+        assert "light.kitchen" in targets, f"habit lost when the window ends on {end:%A}"

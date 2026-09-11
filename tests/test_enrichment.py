@@ -239,3 +239,96 @@ def test_gap_ids_are_stable():
     first = {g.id for g in suggest(resolver, signals, [])}
     second = {g.id for g in suggest(resolver, signals, [])}
     assert first == second
+
+
+def test_statistics_are_stamped_when_their_hour_closes(queries, fixture_db):
+    """An hourly mean stamped at the hour it opens lets a backtest see ahead."""
+    _path, truth = fixture_db
+    store = build_signal_store(
+        [], ["sensor.outdoor_temperature"], queries, (truth.start_ts, truth.end_ts)
+    )
+    series = store.get("sensor.outdoor_temperature")
+    assert series is not None
+    rows = queries.statistics(["sensor.outdoor_temperature"], truth.start_ts, truth.end_ts)
+    assert rows, "fixture has no statistics to check against"
+    opens = min(float(row["start_ts"]) for row in rows)
+    # Nothing is readable at the instant the first hour begins; the mean of that
+    # hour is only known once it is over.
+    assert series.numeric_at(opens) is None
+    assert series.numeric_at(opens + 3600) is not None
+
+
+def test_statistics_never_replace_real_readings(queries, fixture_db):
+    """A year of hourly means must not swallow ten days of actual values."""
+    _path, truth = fixture_db
+    raw = [
+        change
+        for change in queries.state_changes(truth.start_ts - 1, truth.end_ts + 86400)
+        if change.entity_id == "sensor.outdoor_temperature"
+    ]
+    assert raw, "fixture has no raw readings to protect"
+    recent = [c for c in raw if c.ts >= truth.end_ts - 2 * 86400][:10]
+    assert recent
+
+    store = build_signal_store(
+        recent, ["sensor.outdoor_temperature"], queries, (truth.start_ts, truth.end_ts)
+    )
+    series = store.get("sensor.outdoor_temperature")
+    assert series is not None
+    # The exact readings survive at their own timestamps ...
+    for change in recent:
+        if change.numeric is not None:
+            assert series.numeric_at(change.ts) == pytest.approx(change.numeric)
+    # ... and the statistics still cover the period before them.
+    assert series.numeric_at(truth.start_ts + 10 * 86400) is not None
+    assert "statistics" in series.source
+
+
+# --- detector precision -------------------------------------------------
+def _resolver_with(*states, platform="template") -> EntityResolver:
+    resolver = EntityResolver()
+    resolver.merge_states(list(states))
+    for info in resolver.entities.values():
+        info.platform = platform
+    return resolver
+
+
+def _state(entity_id: str, name: str, **attributes) -> dict:
+    return {"entity_id": entity_id, "state": "1",
+            "attributes": {"friendly_name": name, **attributes}}
+
+
+def test_the_integration_that_made_an_entity_is_not_a_description_of_it():
+    """'template' contains 'temp', and template sensors are everywhere."""
+    resolver = _resolver_with(
+        _state("sensor.garden_gnome_count", "Garden gnome count"),
+        _state("sensor.outside_humidity", "Outside humidity"),
+        _state("sensor.external_ip_uptime", "External IP uptime"),
+    )
+    assert detect_signals(resolver).outdoor_temperature == []
+
+
+def test_real_outdoor_thermometers_are_still_found():
+    resolver = _resolver_with(
+        _state("sensor.outdoor_temperature", "Outdoor temperature",
+               device_class="temperature"),
+        _state("sensor.garden_temp", "Garden temp"),
+    )
+    found = detect_signals(resolver).outdoor_temperature
+    assert found == ["sensor.garden_temp", "sensor.outdoor_temperature"]
+
+
+def test_a_pattern_may_not_start_in_the_middle_of_a_word():
+    """`go_?e` was matching 'man(go_e)thanol'."""
+    resolver = _resolver_with(_state("sensor.mango_ethanol", "Mango ethanol"))
+    assert detect_signals(resolver).ev_charger == []
+
+
+def test_but_a_real_prefix_still_matches():
+    resolver = _resolver_with(
+        _state("sensor.go_echarger_power", "go-e charger power"),
+        _state("sensor.sma_inverter_pv_power", "SMA inverter"),
+    )
+    signals = detect_signals(resolver)
+    assert signals.ev_charger == ["sensor.go_echarger_power"]
+    assert signals.solar_production == ["sensor.sma_inverter_pv_power"]

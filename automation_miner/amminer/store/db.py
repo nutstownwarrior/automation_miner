@@ -109,6 +109,14 @@ CREATE TABLE IF NOT EXISTS runs (
     error        TEXT
 );
 
+CREATE TABLE IF NOT EXISTS generations (
+    suggestion_id TEXT PRIMARY KEY,
+    ts            REAL NOT NULL,
+    digest        TEXT NOT NULL,
+    source        TEXT,
+    payload       TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS gap_suggestions (
     id          TEXT PRIMARY KEY,
     kind        TEXT NOT NULL,
@@ -194,6 +202,21 @@ class Store:
             "UPDATE runs SET finished_ts = ?, status = ?, stats = ?, error = ? WHERE id = ?",
             (time.time(), status, _json(stats or {}), error, run_id),
         )
+
+    def close_interrupted_runs(self) -> int:
+        """Mark runs that never finished, so nothing sits at "running" forever.
+
+        A run row is opened before mining and closed after persisting.  If the
+        add-on is stopped in between - a Supervisor restart during the nightly
+        analysis - the row is left open and the status page shows a run that has
+        been in progress since whenever that was.
+        """
+        cursor = self._execute(
+            "UPDATE runs SET status = ?, finished_ts = ?, error = ?"
+            " WHERE finished_ts IS NULL AND status = 'running'",
+            ("interrupted", time.time(), "the add-on stopped while this run was in progress"),
+        )
+        return cursor.rowcount or 0
 
     def last_run(self) -> dict[str, Any] | None:
         rows = self._query("SELECT * FROM runs ORDER BY id DESC LIMIT 1")
@@ -333,6 +356,30 @@ class Store:
         self.set_status(suggestion_id, STATUS_DISMISSED)
         self.add_feedback(suggestion_id, "dismissed", {"reason": reason})
 
+    def restore(self, suggestion_id: str) -> bool:
+        """Undo a dismissal, including the record the next run consults.
+
+        Setting the status back to ``new`` on its own is not a restore: the
+        dismissals table is what mining filters against, so the suggestion is
+        dropped again on the next run and then pruned.  The user sees it
+        reappear and then quietly disappear.
+        """
+        row = self._query("SELECT 1 FROM suggestions WHERE id = ?", (suggestion_id,))
+        if not row:
+            return False
+        signatures = self._query(
+            "SELECT signature FROM dismissals WHERE suggestion_id = ?", (suggestion_id,)
+        )
+        self._execute("DELETE FROM dismissals WHERE suggestion_id = ?", (suggestion_id,))
+        for entry in signatures:
+            if entry["signature"]:
+                self._execute(
+                    "DELETE FROM dismissals WHERE signature = ?", (entry["signature"],)
+                )
+        self.set_status(suggestion_id, STATUS_NEW)
+        self.add_feedback(suggestion_id, "restored")
+        return True
+
     def is_dismissed(self, suggestion_id: str, signature: str | None = None) -> bool:
         rows = self._query("SELECT 1 FROM dismissals WHERE suggestion_id = ?", (suggestion_id,))
         if rows:
@@ -464,6 +511,15 @@ class Store:
             (suggestion_id, ts, None if matched is None else int(matched), _json(payload or {})),
         )
 
+    def last_shadow_ts(self, suggestion_id: str) -> float:
+        """Newest fire already recorded, so a re-run does not double-count."""
+        rows = self._query(
+            "SELECT MAX(ts) AS newest FROM shadow_events WHERE suggestion_id = ?",
+            (suggestion_id,),
+        )
+        newest = rows[0]["newest"] if rows else None
+        return float(newest) if newest is not None else 0.0
+
     def shadow_report(self, suggestion_id: str) -> dict[str, Any]:
         rows = self._query(
             "SELECT matched FROM shadow_events WHERE suggestion_id = ?", (suggestion_id,)
@@ -477,6 +533,35 @@ class Store:
             "unmatched": unmatched,
             "precision": (matched / (matched + unmatched)) if (matched + unmatched) else None,
         }
+
+    # --- generated automations ----------------------------------------
+    def save_generation(self, suggestion_id: str, digest: str, source: str, payload: dict) -> None:
+        """Remember the exact automation a user was shown.
+
+        Apply must write what was reviewed. Regenerating at apply time asks a
+        non-deterministic model the same question twice and writes the second
+        answer, which is not the one that was consented to.
+        """
+        self._execute(
+            "INSERT INTO generations(suggestion_id, ts, digest, source, payload)"
+            " VALUES(?,?,?,?,?)"
+            " ON CONFLICT(suggestion_id) DO UPDATE SET ts=excluded.ts,"
+            " digest=excluded.digest, source=excluded.source, payload=excluded.payload",
+            (suggestion_id, time.time(), digest, source, _json(payload)),
+        )
+
+    def get_generation(self, suggestion_id: str) -> dict[str, Any] | None:
+        rows = self._query(
+            "SELECT * FROM generations WHERE suggestion_id = ?", (suggestion_id,)
+        )
+        if not rows:
+            return None
+        data = dict(rows[0])
+        try:
+            data["payload"] = json.loads(data["payload"])
+        except (json.JSONDecodeError, TypeError):
+            return None
+        return data
 
     # --- gap suggestions ---------------------------------------------
     def upsert_gap(self, gap_id: str, kind: str, title: str, payload: dict[str, Any]) -> None:
@@ -521,6 +606,7 @@ class Store:
             "overrides",
             "shadow_events",
             "runs",
+            "generations",
             "gap_suggestions",
         ):
             rows = self._query(f"SELECT COUNT(*) AS c FROM {table}")

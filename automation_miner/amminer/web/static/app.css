@@ -138,3 +138,7 @@ footer.muted { max-width: 1100px; margin: 0 auto; padding: 0 20px 40px; font-siz
   background: var(--ink); color: var(--bg); padding: 10px 18px; border-radius: 999px;
   font-size: 14px; box-shadow: 0 6px 20px rgba(0,0,0,.25); z-index: 50;
 }
+
+.assist { margin: 10px 0; padding: 8px 12px; border-left: 3px solid var(--accent); background: var(--bg); border-radius: 6px; }
+.assist p { margin: 4px 0; }
+.assist .tag { margin-right: 4px; }

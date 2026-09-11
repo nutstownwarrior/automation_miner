@@ -64,6 +64,36 @@ ACTIONABLE_DOMAINS: tuple[str, ...] = (
     "script",
 )
 
+#: Domains where being wrong costs more than a light left on: they move
+#: something physical, secure a building, or run unattended.  Every miner in
+#: this project applies the same statistical thresholds regardless of what it is
+#: proposing to control, so the tiering happens once, at the gate.
+RISKY_DOMAINS: tuple[str, ...] = (
+    "lock",
+    "cover",
+    "valve",
+    "alarm_control_panel",
+    "water_heater",
+    "siren",
+    "lawn_mower",
+    "vacuum",
+)
+
+#: Services that leave a home *less* secured than it was.  These are not
+#: conveniences that happen to be risky - unlocking a door because a light came
+#: on is a security decision, and no amount of statistical confidence in a
+#: correlation makes it one this add-on should propose on its own.
+SECURITY_SERVICES: frozenset[str] = frozenset(
+    {
+        "lock.unlock",
+        "lock.open",
+        "cover.open_cover",
+        "cover.open_cover_tilt",
+        "valve.open_valve",
+        "alarm_control_panel.alarm_disarm",
+    }
+)
+
 
 def _as_bool(value: Any, default: bool) -> bool:
     if isinstance(value, bool):
@@ -106,6 +136,20 @@ class Options:
     backtest_min_precision: float = 0.7
     backtest_max_false_fires_per_week: float = 3.0
     backtest_match_tolerance_seconds: int = 900
+    #: How often the rule has to have been *right* before a ratio means
+    #: anything.  One correct fire and no wrong ones is 100% precision and no
+    #: evidence at all.
+    backtest_min_true_fires: int = 4
+    #: How much of the real behaviour the rule has to account for.  A rule that
+    #: catches 3 of a user's 60 evening routines is precise and useless.
+    backtest_min_recall: float = 0.25
+    #: False fires next to a historical override are not merely unnecessary,
+    #: they land exactly where the user has already said no.
+    backtest_max_nuisance_fires: int = 0
+
+    #: Allow suggestions whose action unlocks, opens or disarms something.  Off
+    #: by default: these are security decisions, not conveniences.
+    allow_security_actions: bool = False
 
     # --- staleness ---
     stale_automation_days: int = 30
@@ -121,6 +165,27 @@ class Options:
     llm_base_url: str = ""
     llm_api_key: str = ""
     llm_timeout_seconds: int = 180
+
+    # --- optional AI assistance (all OFF by default) ---
+    # Each of these needs llm_provider to be set to something other than
+    # "none".  With the provider disabled they no-op and say so in the run
+    # report; nothing below can make the add-on produce a suggestion that has
+    # not passed the same deterministic gates as every other suggestion.
+    #
+    # Let the model read the entity inventory and label signal roles the
+    # regex detector missed.  Additive only: it can add roles, never remove one
+    # the deterministic detector found.
+    llm_entity_classification: bool = False
+    llm_classification_batch: int = 60
+    # Let the model propose extra conditions for rules the backtest rejected.
+    # Every proposal is re-backtested; only proposals that pass are surfaced.
+    llm_hypotheses: bool = False
+    llm_hypothesis_candidates: int = 10
+    llm_hypotheses_per_candidate: int = 3
+    # Let the model flag statistically real but semantically absurd rules.
+    # Advisory only: it can demote and annotate, never promote or remove.
+    llm_triage: bool = False
+    llm_triage_penalty: float = 0.5
 
     # --- paths (overridable for tests) ---
     ha_config_dir: str = "/homeassistant"
@@ -140,7 +205,17 @@ class Options:
         self.min_confidence = min(max(float(self.min_confidence), 0.0), 1.0)
         self.min_support = min(max(float(self.min_support), 0.0), 1.0)
         self.backtest_min_precision = min(max(float(self.backtest_min_precision), 0.0), 1.0)
+        self.backtest_min_recall = min(max(float(self.backtest_min_recall), 0.0), 1.0)
+        self.backtest_min_true_fires = max(int(self.backtest_min_true_fires), 1)
+        self.backtest_max_nuisance_fires = max(int(self.backtest_max_nuisance_fires), 0)
+        self.backtest_match_tolerance_seconds = max(int(self.backtest_match_tolerance_seconds), 1)
+        self.sequence_min_occurrences = max(int(self.sequence_min_occurrences), 2)
+        self.association_window_seconds = max(int(self.association_window_seconds), 1)
+        self.stale_automation_days = max(int(self.stale_automation_days), 1)
+        self.llm_timeout_seconds = max(int(self.llm_timeout_seconds), 1)
         self.min_occurrences = max(int(self.min_occurrences), 2)
+        self.llm_triage_penalty = min(max(float(self.llm_triage_penalty), 0.0), 1.0)
+        self.llm_classification_batch = max(int(self.llm_classification_batch), 5)
         self.override_window_seconds = max(int(self.override_window_seconds), 1)
 
     # ------------------------------------------------------------------
@@ -161,6 +236,24 @@ class Options:
                 return True
         return False
 
+    @property
+    def llm_enabled(self) -> bool:
+        """True when a provider is configured at all."""
+        return (self.llm_provider or "none").lower() not in ("", "none", "off", "disabled")
+
+    @property
+    def ai_features_requested(self) -> dict[str, bool]:
+        """The optional AI features the user asked for, on or off."""
+        return {
+            "entity_classification": bool(self.llm_entity_classification),
+            "hypotheses": bool(self.llm_hypotheses),
+            "triage": bool(self.llm_triage),
+        }
+
+    @property
+    def any_ai_feature(self) -> bool:
+        return any(self.ai_features_requested.values())
+
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
 
@@ -173,7 +266,16 @@ class Options:
         kwargs: dict[str, Any] = {}
         for key, value in data.items():
             spec = known.get(key)
-            if spec is None or value is None:
+            if spec is None:
+                # A typo in options.json got no diagnostic at all, while a
+                # merely mistyped value got a warning - so the more confusing
+                # mistake was the quieter one.  min_occurences: 50 silently did
+                # nothing and the user had no way to see why.
+                _LOGGER.warning(
+                    "Ignoring unknown option %r; it is not one this add-on has", key
+                )
+                continue
+            if value is None:
                 continue
             if spec.type in ("bool", bool):
                 kwargs[key] = _as_bool(value, bool(spec.default))
@@ -192,6 +294,19 @@ class Options:
                     kwargs[key] = [v.strip() for v in value.split(",") if v.strip()]
                 elif isinstance(value, (list, tuple)):
                     kwargs[key] = [str(v) for v in value]
+            elif spec.type in ("str", str):
+                # Uncoerced, a non-string here reaches Path() during startup and
+                # raises TypeError before logging is even configured, killing
+                # the add-on rather than degrading.
+                if not isinstance(value, str):
+                    _LOGGER.warning(
+                        "Option %s should be text; using %r instead of %r",
+                        key,
+                        spec.default,
+                        value,
+                    )
+                    continue
+                kwargs[key] = value
             else:
                 kwargs[key] = value
         return cls(**kwargs)

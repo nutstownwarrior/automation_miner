@@ -66,7 +66,7 @@ def test_time_of_day_needs_enough_occurrences(options, window):
     assert time_of_day.mine(changes, options, window) == []
 
 
-def test_time_of_day_rejects_scattered_times(options, window):
+def test_time_of_day_rejects_too_few_clustered_occurrences(options, window):
     """Twenty actions at random hours is not a habit, however many there are."""
     changes = []
     for day in range(40):
@@ -221,7 +221,9 @@ def test_conditional_recovers_the_temperature_driven_heater(
     assert trigger.below is not None
     # The generator's threshold is 8.0 C.
     assert abs(trigger.below - truth.conditional["below"]) <= 2.5
-    assert heater.evidence.lift > 1.4
+    # Not `lift > MIN_LIFT`, which the miner guarantees by construction and so
+    # asserts nothing.  This is the lift the injected pattern actually has.
+    assert heater.evidence.lift > 3.0
 
 
 def test_conditional_skips_when_no_signals(classified, options, window):
@@ -282,3 +284,178 @@ def test_energy_miner_suggests_shifting_expensive_runs(options):
     assert candidates[0].evidence.confidence >= 0.35
     cheapest_hour = candidates[0].evidence.extra["cheapest_block"][0]
     assert not (17 <= cheapest_hour <= 21)
+
+
+# --- association direction ----------------------------------------------
+def _ordered_pair_history(days: int = 80) -> list:
+    """The pump always comes on 60s before the light, and off 60s before it."""
+    from amminer.recorderdb.models import Cause, StateChange
+
+    def change(entity_id: str, state: str, ts: float, old: str) -> StateChange:
+        item = StateChange(entity_id=entity_id, state=state, ts=ts,
+                           old_state=old, last_changed_ts=ts)
+        item.cause = Cause.HUMAN
+        return item
+
+    base = 1_700_000_000.0
+    history = []
+    for day in range(days):
+        ts = base + day * 86400
+        history.append(change("switch.pump", "on", ts, "off"))
+        history.append(change("light.kitchen", "on", ts + 60, "off"))
+        history.append(change("switch.pump", "off", ts + 3600, "on"))
+        history.append(change("light.kitchen", "off", ts + 3660, "on"))
+    return history
+
+
+def test_association_does_not_propose_the_rule_backwards():
+    """A basket is a set, so FP-Growth yields both arrows with equal evidence."""
+    from amminer.config import Options as MinerOptions
+    from amminer.miners import association
+
+    history = _ordered_pair_history()
+    candidates = association.mine(
+        history, MinerOptions(), (history[0].ts, history[-1].ts)
+    )
+    arrows = {(c.triggers[0].entity_id, c.actions[0].entity_id) for c in candidates}
+
+    assert ("switch.pump", "light.kitchen") in arrows
+    # Same support, same confidence, same lift - and the pump does not come on
+    # because the light did.  Two cards with identical numbers is how a user
+    # accepts both and builds a loop.
+    assert ("light.kitchen", "switch.pump") not in arrows
+
+
+def test_a_sensor_that_merely_follows_is_not_offered_as_a_trigger():
+    """The power draw rises *because* the heater came on."""
+    from amminer.config import Options as MinerOptions
+    from amminer.miners import association
+    from amminer.recorderdb.models import Cause, StateChange
+
+    def change(entity_id, state, ts, old, cause=Cause.HUMAN):
+        item = StateChange(entity_id=entity_id, state=state, ts=ts,
+                           old_state=old, last_changed_ts=ts)
+        item.cause = cause
+        return item
+
+    base = 1_700_000_000.0
+    history = []
+    for day in range(80):
+        ts = base + day * 86400
+        history.append(change("switch.heater", "on", ts, "off"))
+        history.append(
+            change("binary_sensor.high_draw", "on", ts + 30, "off", Cause.DEVICE)
+        )
+        history.append(change("switch.heater", "off", ts + 7200, "on"))
+        history.append(
+            change("binary_sensor.high_draw", "off", ts + 7230, "on", Cause.DEVICE)
+        )
+
+    candidates = association.mine(history, MinerOptions(), (base, history[-1].ts))
+    arrows = {(c.triggers[0].entity_id, c.actions[0].entity_id) for c in candidates}
+    assert ("binary_sensor.high_draw", "switch.heater") not in arrows
+
+
+# --- confounding --------------------------------------------------------
+def test_conditional_does_not_mistake_a_shared_schedule_for_a_cause():
+    """A pure clock habit and an unrelated evening dip are not cause and effect."""
+    import datetime as dt
+
+    from amminer.config import Options as MinerOptions
+    from amminer.enrich.detect import SignalSet
+    from amminer.enrich.signals import SignalSeries, SignalStore
+    from amminer.miners import conditional
+    from amminer.recorderdb.models import Cause, StateChange
+
+    base = dt.datetime(2024, 1, 1, tzinfo=dt.UTC).timestamp()
+    days = 60
+    changes = []
+    for day in range(days):
+        on = base + day * 86400 + 18 * 3600
+        for ts, state, old in ((on, "on", "off"), (on + 3600, "off", "on")):
+            change = StateChange(entity_id="light.kitchen", state=state, ts=ts,
+                                 old_state=old, last_changed_ts=ts)
+            change.cause = Cause.HUMAN
+            changes.append(change)
+
+    # A nightly backup job, nothing to do with the light.
+    load = SignalSeries("sensor.server_load", numeric=True)
+    for day in range(days):
+        for hour in range(24):
+            load.add(base + day * 86400 + hour * 3600, 30.0 if 17 <= hour <= 21 else 70.0)
+    store = SignalStore()
+    store.add(load.finalise())
+
+    signals = SignalSet()
+    signals.power = ["sensor.server_load"]
+
+    found = conditional.mine(
+        changes, MinerOptions(), signals, store, (base, base + days * 86400)
+    )
+    assert found == [], [c.title for c in found]
+
+
+def test_sequence_confidence_is_conditional_on_the_trigger():
+    """A 10-of-10 routine reported 20% because it divided by everything."""
+    import datetime as dt
+
+    from amminer.config import Options as MinerOptions
+    from amminer.miners import sequence
+    from amminer.recorderdb.models import Cause, StateChange
+
+    def change(entity_id, state, ts, old):
+        item = StateChange(entity_id=entity_id, state=state, ts=ts,
+                           old_state=old, last_changed_ts=ts)
+        item.cause = Cause.HUMAN
+        return item
+
+    base = dt.datetime(2024, 1, 1, tzinfo=dt.UTC).timestamp()
+    changes = []
+    for day in range(10):
+        ts = base + day * 86400
+        changes.append(change("binary_sensor.front_door", "on", ts, "off"))
+        changes.append(change("light.hall", "on", ts + 20, "off"))
+        changes.append(change("light.porch", "on", ts + 40, "off"))
+    # Forty unrelated sessions on other days, which must not dilute anything.
+    for index in range(40):
+        ts = base + (20 + index) * 86400
+        changes.append(change("light.bedroom", "on", ts, "off"))
+        changes.append(change("light.bedroom", "off", ts + 60, "on"))
+
+    found = sequence.mine(changes, MinerOptions(), (base, base + 70 * 86400))
+    assert found, "the routine must be recovered"
+    routine = found[0]
+    assert routine.evidence.occurrences == 10
+    assert routine.evidence.opportunities == 10  # times the trigger happened
+    assert routine.evidence.confidence == pytest.approx(1.0)
+    assert routine.score == pytest.approx(1.0)
+
+
+def test_a_day_restricted_habit_must_beat_every_day_by_a_margin():
+    """Best-of-three correlated hypotheses, reported as if it were the only one."""
+    import datetime as dt
+    import random
+
+    from amminer.config import Options as MinerOptions
+    from amminer.miners import time_of_day
+    from amminer.recorderdb.models import Cause, StateChange
+
+    def trial(seed: int) -> bool:
+        rng = random.Random(seed)
+        base = dt.datetime(2024, 1, 1, tzinfo=dt.UTC).timestamp()
+        changes = []
+        for day in range(40):
+            if rng.random() >= 0.55:  # day-INDEPENDENT, so no day claim is true
+                continue
+            ts = base + day * 86400 + 18 * 3600 + rng.randint(-120, 120)
+            for at, state, old in ((ts, "on", "off"), (ts + 3600, "off", "on")):
+                item = StateChange(entity_id="light.kitchen", state=state, ts=at,
+                                   old_state=old, last_changed_ts=at)
+                item.cause = Cause.HUMAN
+                changes.append(item)
+        found = time_of_day.mine(changes, MinerOptions(), (base, base + 40 * 86400))
+        return any(c.conditions for c in found)
+
+    accepted = sum(trial(seed) for seed in range(200))
+    # Before the margin this was over half of them.
+    assert accepted < 40, f"{accepted}/200 day-independent habits called day-conditioned"

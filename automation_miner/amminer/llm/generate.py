@@ -18,6 +18,7 @@ from typing import Any
 
 from ..miners.base import Candidate
 from .blueprint import automation_id, candidate_to_automation, render_yaml
+from .equivalence import describe_divergence
 from .provider import BaseProvider, LLMError, NullProvider
 from .validate import ValidationReport, validate_automation
 
@@ -155,6 +156,14 @@ def generate(
                 SYSTEM_PROMPT, build_prompt(candidate, resolver, services)
             )
             llm_config = _normalise_llm_config(raw, candidate)
+
+            # BEFORE anything else: is this still the rule the user is being
+            # shown evidence for?  Reference validation only proves the model
+            # named things that exist, which a completely different automation
+            # also does.  A divergence here is not a formatting quibble - it is
+            # the model substituting an automation the user never reviewed.
+            divergence = describe_divergence(llm_config, blueprint_config)
+
             llm_report = validate_automation(
                 llm_config,
                 resolver=resolver,
@@ -162,6 +171,12 @@ def generate(
                 known_services=services,
                 run_check_config=run_check_config,
             )
+            if divergence:
+                llm_report.errors.extend(divergence)
+                llm_report.semantics_ok = False
+                llm_report.ok = False
+            else:
+                llm_report.semantics_ok = True
             result.llm_report = llm_report
             if llm_report.ok:
                 result.config = llm_config
@@ -175,6 +190,11 @@ def generate(
                 "LLM output was REJECTED by the validation gate: "
                 + "; ".join(llm_report.errors[:5])
             )
+            if divergence:
+                result.notes.append(
+                    "The model returned a DIFFERENT automation from the one that was "
+                    "mined and backtested; the deterministic rendering was used instead."
+                )
             if llm_report.unknown_entities:
                 result.notes.append(
                     "Hallucinated entity ids: " + ", ".join(llm_report.unknown_entities[:5])

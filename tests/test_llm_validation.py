@@ -308,3 +308,124 @@ def test_ollama_unavailable_reports_a_helpful_status(monkeypatch):
     status = OllamaProvider().status()
     assert status.available is False
     assert "Ollama" in status.error
+
+
+# --- bypasses ----------------------------------------------------------
+# Three ways an automation reached the end of the gate without its effect ever
+# having been checked.  Each of these is a real config Home Assistant accepts.
+def _wrap(action: dict) -> dict:
+    return {
+        "alias": "x",
+        "trigger": [{"platform": "time", "at": "06:30:00"}],
+        "action": [action],
+    }
+
+
+@pytest.mark.parametrize(
+    "name, action",
+    [
+        # Names no service at all, so there is nothing to look up.
+        ("bare template", {"service": "{{ svc }}", "target": {"entity_id": "light.kitchen"}}),
+        # Half a name: the domain is real, the service is chosen at runtime.
+        ("half template", {"service": "light.{{ s }}", "target": {"entity_id": "light.kitchen"}}),
+        # Names no entity, so the existence check passes vacuously.
+        ("templated target", {"service": "light.turn_on",
+                              "target": {"entity_id": "{{ trigger.entity_id }}"}}),
+        # Legal HA, and it means every light in the house.
+        ("wildcard shorthand", {"service": "light.turn_off", "entity_id": "all"}),
+        ("wildcard in a list", {"service": "light.turn_off",
+                                "target": {"entity_id": ["all"]}}),
+    ],
+)
+def test_runtime_decided_targets_are_refused(resolver, name, action):
+    report = validate_automation(
+        _wrap(action), resolver=resolver, known_services=SERVICES, run_check_config=False
+    )
+    assert report.ok is False, name
+    assert report.targets_static is False, name
+
+
+def test_prose_may_contain_braces(resolver):
+    """Only the parts that decide behaviour are held to this."""
+    config = _wrap({"service": "light.turn_on", "target": {"entity_id": "light.kitchen"}})
+    config["alias"] = "Kitchen light {{ not a template, just words }}"
+    config["description"] = "uses {% raw %} in the docs"
+    report = validate_automation(
+        config, resolver=resolver, known_services=SERVICES, run_check_config=False
+    )
+    assert report.targets_static is True
+    assert report.ok is True
+
+
+def test_an_unreachable_core_does_not_wave_services_through(resolver):
+    """No service index is a reason to check harder, not to stop checking."""
+    config = _wrap({"service": "shell_command.wipe", "target": {"entity_id": "light.kitchen"}})
+    report = validate_automation(
+        config, resolver=resolver, known_services=set(), run_check_config=False
+    )
+    assert report.services_verified is False
+    assert report.references_ok is False
+    assert report.ok is False
+    assert "shell_command.wipe" in report.unknown_services
+
+
+def test_the_fallback_still_admits_what_this_addon_generates(resolver):
+    """Degradation must not block the deterministic renderer's own output."""
+    config = _wrap({"service": "light.turn_on", "target": {"entity_id": "light.kitchen"}})
+    report = validate_automation(
+        config, resolver=resolver, known_services=set(), run_check_config=False
+    )
+    assert report.services_verified is False
+    assert report.ok is True
+    assert any("service list is unavailable" in w for w in report.warnings)
+
+
+def test_every_service_a_miner_can_emit_is_in_the_fallback_set():
+    """The fallback is only safe while it covers what service_for() returns."""
+    from amminer.config import ACTIONABLE_DOMAINS
+    from amminer.llm.validate import emittable_services
+    from amminer.miners.time_of_day import service_for
+
+    allowed = emittable_services()
+    states = ("on", "off", "open", "closed", "locked", "unlocked", "playing",
+              "cleaning", "docked", "heat", "cool", "option_a")
+    for domain in ACTIONABLE_DOMAINS:
+        for state in states:
+            emitted = service_for(f"{domain}.thing", state)
+            if emitted is not None:
+                assert emitted[0] in allowed, f"{domain}/{state} -> {emitted[0]}"
+
+
+def test_a_cloud_key_never_reaches_an_error_message():
+    """Error strings from here are stored in the database and rendered in the UI."""
+    from amminer.llm.provider import CloudProvider
+
+    secret = "AIzaSy-NOT-A-REAL-KEY-000000"
+    provider = CloudProvider("google", secret, model="gemini-2.0-flash")
+    with pytest.raises(LLMError) as raised:
+        provider.complete_json("system", "user")
+    assert secret not in str(raised.value)
+
+
+def test_google_authenticates_with_a_header_not_a_query_string():
+    from amminer.llm.provider import CloudProvider
+
+    provider = CloudProvider("google", "k", model="gemini-2.0-flash")
+    captured = {}
+
+    def fake_post(url, json, headers, timeout):  # noqa: A002
+        captured["url"] = url
+        captured["headers"] = headers
+        raise RuntimeError("stop here")
+
+    import httpx
+
+    original = httpx.post
+    httpx.post = fake_post
+    try:
+        with pytest.raises(RuntimeError):
+            provider.complete_json("system", "user")
+    finally:
+        httpx.post = original
+    assert "key=" not in captured["url"]
+    assert captured["headers"]["x-goog-api-key"] == "k"

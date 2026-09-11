@@ -8,12 +8,15 @@ UI, so the user always knows *why* they are seeing fewer suggestions.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 import traceback
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from . import backtest as backtest_module
 from . import conflicts as conflict_checks
 from . import gaps as gap_analysis
 from .automations import load_existing_automations
@@ -22,14 +25,19 @@ from .config import Options
 from .discovery.ha_config import HAConfig
 from .discovery.recorder import Recorder, open_recorder
 from .enrich.detect import detect_signals
-from .enrich.signals import build_signal_store
+from .enrich.signals import SignalStore, build_signal_store
 from .entities import build_resolver
 from .ha_api import HAClient
+from .llm import classify as llm_classify
+from .llm import hypothesis as llm_hypothesis
+from .llm import triage as llm_triage
+from .llm.provider import build_provider
 from .miners import association, conditional, energy, motif, sequence, stale, time_of_day
 from .miners.base import Candidate
 from .recorderdb import causality
+from .recorderdb.models import StateChange
 from .recorderdb.queries import ORIGIN_EVENT_TYPES, RecorderQueries
-from .store import Store
+from .store import STATUS_SHADOW, Store
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -55,10 +63,16 @@ class RunReport:
     miner_counts: dict[str, int] = field(default_factory=dict)
     #: miner name -> the error that stopped it, for miners that failed
     miner_errors: dict[str, str] = field(default_factory=dict)
+    #: AI feature name -> the error that stopped it
+    ai_errors: dict[str, str] = field(default_factory=dict)
+    #: Per optional AI feature: whether it ran and what it contributed.
+    ai: dict[str, Any] = field(default_factory=dict)
     surfaced: int = 0
     rejected: int = 0
     conflicted: int = 0
     gaps: int = 0
+    #: Would-be fires recorded for suggestions the user asked to shadow-test.
+    shadow_fires: int = 0
     degradations: list[str] = field(default_factory=list)
     state_rows: int = 0
 
@@ -78,10 +92,13 @@ class RunReport:
             "overrides": self.overrides,
             "miner_counts": self.miner_counts,
             "miner_errors": self.miner_errors,
+            "ai_errors": self.ai_errors,
+            "ai": self.ai,
             "surfaced": self.surfaced,
             "rejected": self.rejected,
             "conflicted": self.conflicted,
             "gaps": self.gaps,
+            "shadow_fires": self.shadow_fires,
             "degradations": self.degradations,
             "state_rows": self.state_rows,
         }
@@ -115,11 +132,39 @@ def resolve_window(options: Options, recorder: Recorder) -> tuple[float, float, 
     return start_ts, newest, notes
 
 
+def _log_shadow_fires(
+    store: Store,
+    changes: Sequence[StateChange],
+    signal_store: SignalStore,
+    options: Options,
+    window: tuple[float, float],
+) -> int:
+    """Replay every shadowed suggestion over history it has not been scored on."""
+    # Imported here: runner imports this module, so importing it back at module
+    # scope would be a cycle.
+    from .runner import candidate_from_payload
+
+    logged = 0
+    for row in store.list_suggestions(status=STATUS_SHADOW):
+        payload = row.get("payload") or {}
+        if not payload.get("actions"):
+            continue
+        candidate = candidate_from_payload(payload)
+        since = store.last_shadow_ts(row["id"])
+        for ts, matched in backtest_module.shadow_evaluate(
+            candidate, changes, signal_store, options, window, since_ts=since
+        ):
+            store.log_shadow_fire(row["id"], ts, matched=matched)
+            logged += 1
+    return logged
+
+
 def run_analysis(
     options: Options,
     store: Store,
     client: HAClient | None = None,
     ha_config: HAConfig | None = None,
+    resolver=None,
 ) -> tuple[RunReport, list[Candidate]]:
     """Run one complete analysis and persist the results."""
     report = RunReport()
@@ -136,7 +181,13 @@ def run_analysis(
             )
 
         # --- entity resolution ---------------------------------------
-        resolver = build_resolver(options.ha_config_dir, client)
+        # The caller may already have built one; reading the registry files and
+        # calling /api/states a second time doubles this run's load on Core for
+        # an object we then discard - and left Runner.resolver, which the UI and
+        # every preview use, as a different object from the one that was mined
+        # and backtested against.
+        if resolver is None:
+            resolver = build_resolver(options.ha_config_dir, client)
         report.entities = resolver.stats()
         if not resolver.entities:
             report.degradations.append(
@@ -191,26 +242,106 @@ def run_analysis(
                 "No context_user_id found in this history window: human and automated changes "
                 "cannot be told apart reliably, so all mining runs at reduced confidence."
             )
+        unknown = report.causality.get("unknown", 0)
+        if unknown and len(changes):
+            share = unknown / len(changes)
+            if share >= 0.1:
+                report.degradations.append(
+                    f"{share:.0%} of state rows carry no context at all, so who caused them "
+                    "is genuinely unknown. Those rows take no part in mining rather than "
+                    "being counted as device activity."
+                )
         overrides = causality.detect_overrides(changes, options.override_window_seconds)
         report.overrides = len(overrides)
         store.record_overrides(overrides)
         override_counts = store.override_counts()
 
+        # --- optional AI assistance ----------------------------------
+        # Every feature here is off by default and additive: with them disabled
+        # the run is bit-for-bit what it was before they existed.
+        provider = None
+        if options.any_ai_feature:
+            if not options.llm_enabled:
+                report.degradations.append(
+                    "AI assistance is switched on but llm_provider is 'none', so the "
+                    "assisted features did nothing. Set a provider to use them."
+                )
+                report.ai = {
+                    name: {"requested": True, "ran": False, "reason": "no llm_provider"}
+                    for name, on in options.ai_features_requested.items()
+                    if on
+                }
+            else:
+                provider = build_provider(options)
+                status = provider.status()
+                if not status.available:
+                    report.degradations.append(
+                        f"AI assistance is switched on but the {status.provider} provider is "
+                        f"not usable ({status.error}); the assisted features were skipped."
+                    )
+                    report.ai = {
+                        name: {"requested": True, "ran": False, "reason": status.error}
+                        for name, on in options.ai_features_requested.items()
+                        if on
+                    }
+                    provider = None
+
+        def run_ai(name: str, func, *args, **kwargs):
+            """Run one AI feature in isolation, like a miner."""
+            try:
+                outcome = func(*args, **kwargs)
+            except Exception as err:  # noqa: BLE001 - assistance is never fatal
+                _LOGGER.exception("AI feature %s failed: %s", name, err)
+                report.ai[name] = {
+                    "requested": True,
+                    "ran": False,
+                    "reason": f"{type(err).__name__}: {err}",
+                }
+                report.degradations.append(
+                    f"The AI {name.replace('_', ' ')} step failed and was skipped "
+                    f"({type(err).__name__}: {err})."
+                )
+                # "partial" means something the user asked for did not happen.
+                # A failed AI feature is exactly that, and reporting it as a
+                # plain "ok" run made the word mean only "a miner failed".
+                report.ai_errors[name] = f"{type(err).__name__}: {err}"
+                return None
+            report.ai[name] = {"requested": True, "ran": True, **outcome.as_dict()}
+            return outcome
+
         # --- enrichment ----------------------------------------------
         signals = detect_signals(resolver)
+
+        if provider is not None and options.llm_entity_classification:
+            classification = run_ai(
+                "entity_classification",
+                llm_classify.classify,
+                resolver,
+                provider,
+                options,
+                store,
+                options.llm_classification_batch,
+            )
+            if classification is not None:
+                llm_classify.apply_to_signals(signals, classification)
+                report.ai["entity_classification"].update(classification.as_dict())
+
         report.signals = signals.as_dict()
         if not signals.present():
             report.degradations.append(
                 "No external signals (sun, weather, presence, price) detected; only intrinsic "
                 "patterns are mined."
             )
-        signal_store = build_signal_store(
-            changes, signals.all_entities, queries, (start_ts, end_ts)
-        )
-        # Every entity a candidate might reference must be simulatable, so the
-        # backtester gets a store covering the whole mined entity set.
+        # One store, not two.  Every entity a candidate might reference has to
+        # be simulatable, so this covers the whole mined entity set - which is
+        # a superset of the detected signals.  Building a signals-only store as
+        # well meant a second full pass over the same state history for a
+        # strict subset of the same data, and both kept alive for the rest of
+        # the run.  The miners that used to take the smaller one look entities
+        # up by id and never enumerate it, so they see exactly what they did.
         all_entities = sorted({c.entity_id for c in changes} | set(signals.all_entities))
         full_store = build_signal_store(changes, all_entities, queries, (start_ts, end_ts))
+        signal_store = full_store
 
         # --- mining ---------------------------------------------------
         window = (start_ts, end_ts)
@@ -233,6 +364,23 @@ def run_analysis(
                     f"({type(err).__name__}: {err}). Other miners still ran."
                 )
                 return []
+
+        def run_stage(name, func, *args):
+            """Run one post-mining stage in isolation.
+
+            Same contract as run_miner, for the parts of the run that come
+            after it: a failure costs that stage and is reported, rather than
+            discarding work that already succeeded.  ``None`` means it failed.
+            """
+            try:
+                return func(*args)
+            except Exception as err:  # noqa: BLE001 - one stage must not end the run
+                _LOGGER.exception("Stage %s failed: %s", name, err)
+                report.miner_errors[name] = f"{type(err).__name__}: {err}"
+                report.degradations.append(
+                    f"The {name} step failed ({type(err).__name__}: {err})."
+                )
+                return None
 
         produced["time_of_day"] = run_miner(
             "time_of_day", time_of_day.mine, changes, options, window, resolver
@@ -280,63 +428,143 @@ def run_analysis(
             _LOGGER.info("Filtered %d previously dismissed candidates", before - len(mined))
 
         # --- backtest --------------------------------------------------
-        passed, rejected = backtest_all(
-            mined, changes, full_store, options, window, overrides
+        # Everything from here on is isolated the same way the miners are.  It
+        # used to fall through to the outer handler, which sets status=error
+        # and returns nothing - so an exception in any one of backtesting,
+        # conflict checking or gap analysis threw away every candidate every
+        # miner had already produced, and persisted none of them.
+        backtested = run_stage(
+            "backtest", backtest_all, mined, changes, full_store, options, window, overrides
         )
+        if backtested is None:
+            # Without a backtest nothing may be surfaced: an unmeasured rule is
+            # exactly what this project exists not to suggest.
+            passed, rejected = [], list(mined)
+        else:
+            passed, rejected = backtested
+        # --- AI hypotheses: propose, then measure with the same gate ---
+        if provider is not None and options.llm_hypotheses and rejected:
+            hypotheses = run_ai(
+                "hypotheses",
+                llm_hypothesis.propose_and_verify,
+                rejected,
+                changes,
+                full_store,
+                options,
+                window,
+                provider,
+                resolver,
+                overrides,
+            )
+            if hypotheses is not None and hypotheses.accepted:
+                accepted_origins = {
+                    c.extra.get("hypothesis", {}).get("origin_candidate")
+                    for c in hypotheses.accepted
+                }
+                passed.extend(hypotheses.accepted)
+                # A rejected candidate that a verified condition rescued is no
+                # longer a rejection; it was superseded, not discarded.
+                rejected = [c for c in rejected if c.id not in accepted_origins]
+
+        # --- AI triage: advisory demotion only -------------------------
+        if provider is not None and options.llm_triage and passed:
+            verdicts = run_ai("triage", llm_triage.triage, passed, provider, resolver)
+            if verdicts is not None:
+                llm_triage.apply_verdicts(passed, verdicts, options.llm_triage_penalty)
+                report.ai["triage"].update(verdicts.as_dict())
+                passed.sort(key=lambda c: c.score, reverse=True)
+
         report.surfaced = len(passed)
         report.rejected = len(rejected)
 
+        # --- shadow mode -----------------------------------------------
+        # "Shadow-test only" set a status and logged nothing, so the detail
+        # page reported 0 would-be fires forever.  Every run now replays the
+        # rules the user asked to watch against the history since it last
+        # looked, and records each fire.
+        report.shadow_fires = run_miner(
+            "shadow", _log_shadow_fires, store, changes, full_store, options, window
+        ) or 0
+
         # --- conflicts -------------------------------------------------
-        existing = load_existing_automations(ha_config, resolver)
-        conflict_checks.annotate_candidates(passed, existing, resolver)
-        report.conflicted = sum(
-            1 for c in passed if conflict_checks.has_blocking_conflict(c)
-        )
+        existing = run_stage("existing automations", load_existing_automations,
+                             ha_config, resolver) or []
+
+        def _annotate_conflicts() -> int:
+            conflict_checks.annotate_candidates(passed, existing, resolver)
+            return sum(1 for c in passed if conflict_checks.has_blocking_conflict(c))
+
+        conflicted = run_stage("conflicts", _annotate_conflicts)
+        if conflicted is None:
+            # Unchecked is not the same as clean, and the user is told so.
+            report.degradations.append(
+                "Conflict checking failed, so these suggestions have not been compared "
+                "against the automations you already have."
+            )
+        report.conflicted = conflicted or 0
 
         # --- persist ---------------------------------------------------
+        # Per candidate, not per loop: one candidate whose payload will not
+        # serialise must not take the other forty with it.
         for candidate in passed:
-            store.upsert_suggestion(
-                candidate.id,
-                candidate.miner,
-                candidate.title,
-                candidate.describe(resolver),
-                candidate.score,
-                candidate.as_dict(resolver),
-                run_id,
-            )
-            if candidate.backtest:
-                store.save_backtest(candidate.id, candidate.backtest)
+            def _save(candidate=candidate) -> bool:
+                store.upsert_suggestion(
+                    candidate.id,
+                    candidate.miner,
+                    candidate.title,
+                    candidate.describe(resolver),
+                    candidate.score,
+                    candidate.as_dict(resolver),
+                    run_id,
+                )
+                if candidate.backtest:
+                    store.save_backtest(candidate.id, candidate.backtest)
+                return True
+
+            run_stage(f"saving {candidate.id}", _save)
         for candidate in audit_findings:
             if candidate.id in dismissed:
                 continue
-            store.upsert_suggestion(
-                candidate.id,
-                candidate.miner,
-                candidate.title,
-                candidate.description,
-                candidate.score,
-                candidate.as_dict(resolver),
-                run_id,
-            )
-        store.prune_suggestions(run_id)
+
+            def _save_audit(candidate=candidate) -> bool:
+                store.upsert_suggestion(
+                    candidate.id,
+                    candidate.miner,
+                    candidate.title,
+                    candidate.description,
+                    candidate.score,
+                    candidate.as_dict(resolver),
+                    run_id,
+                )
+                return True
+
+            run_stage(f"saving {candidate.id}", _save_audit)
+        run_stage("pruning", store.prune_suggestions, run_id)
 
         # --- gaps ------------------------------------------------------
-        gap_suggestions = gap_analysis.suggest(
-            resolver, signals, changes, passed, recorder.info
-        )
-        report.gaps = len(gap_suggestions)
-        for gap in gap_suggestions:
-            store.upsert_gap(gap.id, gap.kind, gap.title, gap.as_dict())
+        def _suggest_gaps() -> int:
+            gap_suggestions = gap_analysis.suggest(
+                resolver, signals, changes, passed, recorder.info
+            )
+            for gap in gap_suggestions:
+                store.upsert_gap(gap.id, gap.kind, gap.title, gap.as_dict())
+            return len(gap_suggestions)
 
-        store.set_meta("last_audit", str(int(time.time())))
-        store.set_meta(
-            "existing_automation_audit",
-            __import__("json").dumps(conflict_checks.audit_existing(existing, resolver)),
-        )
+        report.gaps = run_stage("gap analysis", _suggest_gaps) or 0
+
+        def _write_audit() -> bool:
+            store.set_meta("last_audit", str(int(time.time())))
+            store.set_meta(
+                "existing_automation_audit",
+                json.dumps(conflict_checks.audit_existing(existing, resolver)),
+            )
+            return True
+
+        run_stage("automation audit", _write_audit)
 
         # A run where some miners failed still produced results, but saying it
         # was plain "ok" would hide that from the user.
-        report.status = "partial" if report.miner_errors else "ok"
+        report.status = "partial" if (report.miner_errors or report.ai_errors) else "ok"
         candidates = passed + audit_findings
         recorder.close()
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import threading
 from pathlib import Path
 
 from .config import Options
@@ -18,6 +19,10 @@ from .web.app import create_app
 _LOGGER = logging.getLogger(__name__)
 
 DEFAULT_PORT = 8099
+
+#: How long shutdown waits for an analysis to finish writing before giving up.
+#: An analysis over a real recorder database takes minutes, not seconds.
+SHUTDOWN_GRACE_SECONDS = 120.0
 
 
 def build_everything(options: Options | None = None):
@@ -35,6 +40,9 @@ def build_everything(options: Options | None = None):
         state_dir.mkdir(parents=True, exist_ok=True)
 
     store = Store(state_dir / "automation_miner.db")
+    interrupted = store.close_interrupted_runs()
+    if interrupted:
+        _LOGGER.info("Marked %d unfinished run(s) as interrupted", interrupted)
     runner = Runner(options, store)
     app = create_app(
         options,
@@ -52,10 +60,10 @@ def main() -> int:
     scheduler = Scheduler(options.schedule, runner.run_now)
     scheduler.start()
 
+    initial: threading.Thread | None = None
     if options.run_on_start:
-        import threading
-
-        threading.Thread(target=runner.run_now, name="amminer-initial", daemon=True).start()
+        initial = threading.Thread(target=runner.run_now, name="amminer-initial", daemon=True)
+        initial.start()
 
     import uvicorn
 
@@ -64,8 +72,23 @@ def main() -> int:
     try:
         uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning", access_log=False)
     finally:
-        scheduler.stop()
-        store.close()
+        # Order matters.  Stop scheduling, then let whatever is mid-run finish
+        # writing, and only then close the database.  A Supervisor restart is
+        # an ordinary event, an analysis takes far longer than a few seconds,
+        # and closing the store underneath one loses that run's work and leaves
+        # its row saying "running" for good.
+        scheduler.stop(timeout=SHUTDOWN_GRACE_SECONDS)
+        if initial is not None:
+            initial.join(timeout=SHUTDOWN_GRACE_SECONDS)
+        if runner.wait_until_idle(SHUTDOWN_GRACE_SECONDS):
+            store.close()
+        else:
+            _LOGGER.warning(
+                "An analysis is still running after %.0fs; leaving the database open "
+                "so it is not closed mid-write. The run will be marked interrupted "
+                "on the next start.",
+                SHUTDOWN_GRACE_SECONDS,
+            )
     return 0
 
 

@@ -210,10 +210,16 @@ class SyntheticRecorder:
         context_id: bytes | None = None,
         parent_id: bytes | None = None,
         attributes: dict[str, Any] | None = None,
-    ) -> bytes:
-        """Insert one ``states`` row, wiring up ``old_state_id`` automatically."""
+        no_context: bool = False,
+    ) -> bytes | None:
+        """Insert one ``states`` row, wiring up ``old_state_id`` automatically.
+
+        ``no_context`` writes a row with no context columns at all, which is
+        what a state restored after a restart, or a row from before Home
+        Assistant recorded contexts, actually looks like.
+        """
         metadata_id = self._metadata_id(entity_id)
-        context_id = context_id or new_context_id()
+        context_id = None if no_context else (context_id or new_context_id())
         cursor = self.conn.execute(
             "INSERT INTO states(metadata_id, state, attributes_id, old_state_id,"
             " last_updated_ts, last_changed_ts, context_id_bin, context_user_id_bin,"
@@ -294,8 +300,17 @@ def build_default_fixture(
     end: dt.datetime | None = None,
     seed: int = 1234,
     tz: dt.tzinfo | None = None,
+    messy: bool = False,
 ) -> Injected:
-    """Write a fixture DB with four known patterns and return the ground truth."""
+    """Write a fixture DB with four known patterns and return the ground truth.
+
+    ``messy`` adds what a real recorder is full of and this generator otherwise
+    never produced: entities dropping to ``unavailable``/``unknown`` around
+    restarts, sensors that flap, and human changes that carry no
+    ``context_user_id`` at all.  The same four patterns are still in there, so a
+    test can assert they survive contact with it - without which the most
+    heavily exercised path through the whole pipeline is the easy case.
+    """
     tz = tz or dt.datetime.now().astimezone().tzinfo or dt.UTC
     end = end or dt.datetime.now(tz).replace(hour=12, minute=0, second=0, microsecond=0)
     start = end - dt.timedelta(days=days)
@@ -303,8 +318,15 @@ def build_default_fixture(
     gen = SyntheticRecorder(path, tz=tz, seed=seed)
     user_bytes = uuid.uuid4().bytes
     truth = gen.truth
-    truth.start_ts = start.timestamp()
-    truth.end_ts = end.timestamp()
+    # The day loop below writes rows from midnight of the first day to late
+    # evening of the last, so the declared window has to span whole days. Using
+    # `start`/`end` directly would put the earliest and latest rows OUTSIDE the
+    # window the ground truth advertises, which silently changes what a
+    # window-bounded query returns depending on the day of the week.
+    truth.start_ts = dt.datetime.combine(start.date(), dt.time(0, 0), tzinfo=tz).timestamp()
+    truth.end_ts = dt.datetime.combine(
+        end.date(), dt.time(23, 59, 59), tzinfo=tz
+    ).timestamp()
     truth.user_id = user_bytes.hex()
 
     outdoor_series: list[tuple[float, float]] = []
@@ -318,6 +340,32 @@ def build_default_fixture(
     sequence_hits = 0
     assoc_hits = 0
     override_records: list[dict[str, Any]] = []
+
+    def maybe_messy(entity_id: str, ts: float) -> None:
+        """A restart, a dropout, or a flapping sensor - the ordinary mess."""
+        if not messy:
+            return
+        roll = gen.random.random()
+        if roll < 0.04:
+            # The integration dropped out and came back.  The restored state
+            # afterwards carries no context at all, which is what makes it
+            # genuinely unknown rather than merely un-attributed.
+            gen.add_state(entity_id, "unavailable", ts - 30)
+            gen.add_state(entity_id, "unknown", ts - 20)
+            gen.add_state(entity_id, "off", ts - 10, no_context=True)
+        elif roll < 0.08:
+            # A flapping contact: several changes inside a few seconds.
+            for step in range(4):
+                gen.add_state(entity_id, "on" if step % 2 == 0 else "off", ts - 12 + step * 3)
+
+    def user_context(ts: float) -> bytes | None:
+        """Some real human changes carry no user id: physical switches, scenes.
+
+        The recorder records the change and nothing about who caused it.
+        """
+        if messy and gen.random.random() < 0.15:
+            return None
+        return user_bytes
 
     while day <= last_day:
         weekday = day.weekday()
@@ -336,7 +384,8 @@ def build_default_fixture(
             tod_days += 1
             if gen.random.random() < 0.9:  # 90 % consistency
                 ts = gen._at(day, 6, 30, jitter=6)
-                gen.add_state("light.kitchen", "on", ts, user_id=user_bytes)
+                maybe_messy("light.kitchen", ts)
+                gen.add_state("light.kitchen", "on", ts, user_id=user_context(ts))
                 tod_hits += 1
                 # ... and off again mid-morning (noise for the miner to ignore)
                 gen.add_state("light.kitchen", "off", ts + 3600, user_id=user_bytes)
@@ -347,7 +396,8 @@ def build_default_fixture(
         if gen.random.random() < 0.85:
             base_ts = gen._at(day, 17, 45, jitter=25)
             gen.add_state("person.alex", "home", base_ts)
-            gen.add_state("light.hallway", "on", base_ts + 40, user_id=user_bytes)
+            maybe_messy("light.hallway", base_ts + 40)
+            gen.add_state("light.hallway", "on", base_ts + 40, user_id=user_context(base_ts))
             gen.add_state("climate.living_room", "heat", base_ts + 95, user_id=user_bytes,
                           attributes={"temperature": 21.0})
             gen.add_state("climate.living_room", "off", base_ts + 5 * 3600, user_id=user_bytes)
@@ -362,7 +412,8 @@ def build_default_fixture(
                       attributes={"unit_of_measurement": "°C", "device_class": "temperature"})
         outdoor_series.append((evening_ts - 120, evening_temp))
         if evening_temp < 8.0:
-            gen.add_state("switch.heater", "on", evening_ts, user_id=user_bytes)
+            maybe_messy("sensor.outdoor_temperature", evening_ts - 200)
+            gen.add_state("switch.heater", "on", evening_ts, user_id=user_context(evening_ts))
             gen.add_state("switch.heater", "off", evening_ts + 7200, user_id=user_bytes)
             heater_conditional_hits += 1
 

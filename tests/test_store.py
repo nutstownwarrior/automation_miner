@@ -141,3 +141,21 @@ def test_store_survives_reopen(tmp_path):
     with Store(path) as store:
         assert store.is_dismissed("s1") is True
         assert store.get_suggestion("s1")["status"] == STATUS_DISMISSED
+
+
+def test_restore_undoes_the_dismissal_the_next_run_reads(store):
+    """Flipping the status back is not a restore if mining still filters it out."""
+    store.upsert_suggestion("x1", "time_of_day", "T", "s", 0.9, {"actions": [1]}, 1)
+    store.dismiss("x1", "not useful", signature="sig-1")
+    assert store.is_dismissed("x1") is True
+
+    assert store.restore("x1") is True
+    assert store.get_suggestion("x1")["status"] == "new"
+    # The next analysis run consults these, not the status column.
+    assert store.is_dismissed("x1") is False
+    assert "x1" not in store.dismissed_ids()
+    assert "sig-1" not in store.dismissed_signatures()
+
+
+def test_restoring_an_unknown_suggestion_reports_failure(store):
+    assert store.restore("never-existed") is False

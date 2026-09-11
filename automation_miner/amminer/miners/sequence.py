@@ -189,7 +189,15 @@ def mine(
             continue
 
         t_entity, _, t_state = trigger_item.partition("=")
-        confidence = support / max(len(sequences), 1)
+        # Confidence is P(the routine follows | the trigger happened), so the
+        # denominator is the sessions the trigger actually appeared in - not
+        # every session mined.  Dividing by the latter reported 20% for a
+        # routine that followed the door opening 10 times out of 10, and made
+        # every real routine's score fall as unrelated activity in the house
+        # grew, which has nothing to do with how reliable the routine is.
+        trigger_sessions = sum(1 for sequence in sequences if trigger_item in sequence)
+        confidence = support / max(trigger_sessions, 1)
+        support_ratio = support / max(len(sequences), 1)
         t_name = resolver.name_of(t_entity) if resolver else t_entity
         action_names = [a.describe(resolver) for a in actions]
 
@@ -205,20 +213,25 @@ def mine(
                 actions=actions,
                 evidence=Evidence(
                     occurrences=support,
-                    opportunities=len(sequences),
+                    # Opportunities is "times this could have happened", which
+                    # is the trigger's occurrences, not the whole day's traffic.
+                    opportunities=trigger_sessions,
                     confidence=confidence,
-                    support=confidence,
+                    support=support_ratio,
                     window_start_ts=start_ts,
                     window_end_ts=end_ts,
                     window_days=(end_ts - start_ts) / 86400.0,
                     notes=[
-                        f"This exact ordered sequence appeared {support} times in "
-                        f"{len(sequences)} activity sessions.",
+                        f"This exact ordered sequence followed {t_name} "
+                        f"{support} of the {trigger_sessions} times it happened "
+                        f"(across {len(sequences)} activity sessions).",
                         "Sequences were reconstructed from context chains and activity sessions.",
                     ],
                     extra={"pattern": list(pattern)},
                 ),
-                score=round(min(confidence * 2.0, 1.0) * min(support / 10.0, 1.0), 4),
+                # The doubling was compensating for the deflated denominator
+                # above; with a real conditional probability it is not needed.
+                score=round(confidence * min(support / 10.0, 1.0), 4),
             )
         )
 

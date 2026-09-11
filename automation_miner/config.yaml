@@ -15,7 +15,8 @@ stage: experimental
 ingress: true
 panel_icon: mdi:pickaxe
 panel_title: Automation Miner
-hassio_api: true
+# No hassio_api: nothing here calls a Supervisor endpoint.  The Core API is
+# reached through the Supervisor proxy, which homeassistant_api alone grants.
 homeassistant_api: true
 map:
   - homeassistant_config:ro
@@ -26,6 +27,7 @@ options:
   schedule: "0 3 * * *"
   run_on_start: true
   analysis_window_days: 0
+  max_auto_window_days: 60
   min_consistency: 0.6
   min_occurrences: 5
   time_cluster_minutes: 30
@@ -34,7 +36,11 @@ options:
   min_lift: 1.5
   override_window_seconds: 120
   backtest_min_precision: 0.7
+  backtest_min_recall: 0.25
+  backtest_min_true_fires: 4
   backtest_max_false_fires_per_week: 3
+  backtest_max_nuisance_fires: 0
+  allow_security_actions: false
   excluded_domains: []
   excluded_entities: []
   excluded_users: []
@@ -42,11 +48,15 @@ options:
   llm_model: ""
   llm_base_url: ""
   llm_api_key: ""
+  llm_entity_classification: false
+  llm_hypotheses: false
+  llm_triage: false
 schema:
   log_level: list(trace|debug|info|notice|warning|error|fatal)?
   schedule: str?
   run_on_start: bool?
   analysis_window_days: int(0,3650)?
+  max_auto_window_days: int(1,3650)?
   min_consistency: float(0.0,1.0)?
   min_occurrences: int(2,1000)?
   time_cluster_minutes: int(1,240)?
@@ -55,7 +65,11 @@ schema:
   min_lift: float(0.0,1000.0)?
   override_window_seconds: int(1,3600)?
   backtest_min_precision: float(0.0,1.0)?
+  backtest_min_recall: float(0.0,1.0)?
+  backtest_min_true_fires: int(1,1000)?
   backtest_max_false_fires_per_week: float(0.0,1000.0)?
+  backtest_max_nuisance_fires: int(0,1000)?
+  allow_security_actions: bool?
   excluded_domains:
     - str?
   excluded_entities:
@@ -66,3 +80,10 @@ schema:
   llm_model: str?
   llm_base_url: str?
   llm_api_key: password?
+  llm_entity_classification: bool?
+  llm_hypotheses: bool?
+  llm_triage: bool?
+  llm_classification_batch: int(5,200)?
+  llm_hypothesis_candidates: int(0,100)?
+  llm_hypotheses_per_candidate: int(0,10)?
+  llm_triage_penalty: float(0.0,1.0)?

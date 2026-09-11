@@ -27,6 +27,11 @@ You can **Review** (see the YAML and the full explanation), **Shadow-test**
 (log when it would fire without acting), or **Dismiss** (permanently — it will
 never be suggested again).
 
+Shadow-testing does not run continuously: each nightly analysis replays the
+rules you are watching over the history since it last looked and records every
+would-be fire, marking whether you really did that thing around then. So the
+count on the suggestion's page fills in a run at a time, not minute by minute.
+
 If the list is empty, open **Status**. It says exactly what limited the run.
 
 ## Pages
@@ -41,12 +46,17 @@ If the list is empty, open **Status**. It says exactly what limited the run.
 
 ## Applying a suggestion
 
-Press **Apply to Home Assistant** on a suggestion's detail page. Before anything
-is written, the automation must pass all three gates:
+Press **Apply to Home Assistant** on a suggestion's detail page. What gets
+written is the automation you were shown: it is stored when the preview is
+rendered, and Apply writes that stored object rather than generating a fresh
+one. Before anything is written it must pass all five gates:
 
-1. every entity, device, area and service it references exists,
-2. the YAML parses and matches Home Assistant's automation schema,
-3. `POST /api/config/core/check_config` succeeds.
+1. it still means what the mined rule meant - same triggers, conditions,
+   actions and mode (an LLM may reword the alias and description, nothing else),
+2. everything it touches is named outright - no templates, no `entity_id: all`,
+3. every entity, device, area and service it references exists,
+4. the YAML parses and matches Home Assistant's automation schema,
+5. `POST /api/config/core/check_config` succeeds.
 
 Only then is it written through the config API and `automation.reload` called.
 If any check fails, the reason is shown and nothing is written.
@@ -88,12 +98,41 @@ Association-rule thresholds. Defaults `0.02`, `0.6`, `1.5`.
 How soon after an automation acts a human correction counts as an *override*.
 Default `120`.
 
+### `backtest_min_true_fires`
+How many times a rule must have been *right* during the analysis window before
+its percentages are allowed to speak for it. A rule that fired once, correctly,
+scores 100% precision with no unwanted fires and rests on a single observation.
+Default `4`.
+
 ### `backtest_min_precision`
 Minimum backtest precision for a rule to be surfaced. Default `0.7`.
+
+### `backtest_min_recall`
+How much of the real behaviour the rule has to account for. A rule that fires
+correctly three times out of the twenty you actually did something is precise
+and useless. Default `0.25`.
 
 ### `backtest_max_false_fires_per_week`
 Nuisance budget. A rule that would have fired more often than this when you did
 not want it is rejected regardless of its precision. Default `3`.
+
+### `backtest_max_nuisance_fires`
+Unwanted fires allowed at moments where you have previously reached over and
+undone an automation on the same entity. These are not merely unnecessary - they
+land exactly where you have already said no - so the default is `0`.
+
+### `allow_security_actions`
+Off by default. While it is off, no suggestion whose action would unlock a door,
+open a cover or valve, or disarm an alarm is ever surfaced, no matter how strong
+the pattern behind it. Turning it on lets those suggestions through; they are
+still held to the stricter thresholds below.
+
+Actions in the `lock`, `cover`, `valve`, `alarm_control_panel`, `water_heater`,
+`siren`, `lawn_mower` and `vacuum` domains always face a higher bar than a lamp:
+95% precision, at least 12 correct fires, and no unwanted fires at all. These
+are deliberately not tied to the options above, so lowering
+`backtest_min_precision` to see more light suggestions does not also lower the
+bar for your front door.
 
 ### `excluded_domains`, `excluded_entities`, `excluded_users`
 Added to sensible built-in exclusions (`sensor.time`, `update.*`, …). Entities
@@ -104,6 +143,31 @@ accounts" in `excluded_users` so their changes are not mistaken for a human's.
 `none` (default) renders YAML deterministically from the mined schema.
 `ollama` auto-detects a local Ollama server. `openai`, `anthropic`, `google`
 and `openrouter` are opt-in and need `llm_api_key`.
+
+### `llm_entity_classification`, `llm_hypotheses`, `llm_triage`
+Three optional AI features, all `false` by default and all requiring
+`llm_provider` to be set to something other than `none`.
+
+- **`llm_entity_classification`** — lets the model read your entity inventory
+  (names, areas, device models, units — never states or history) and label
+  signal roles the built-in pattern matcher missed, such as a price sensor or a
+  dishwasher named in your own language. Additive only: it can add a signal,
+  never remove one. Cached until your entities change.
+- **`llm_hypotheses`** — for rules the backtest rejected, the model proposes
+  conditions that might explain when the action really happens. Every proposal
+  is re-backtested against your history with the same thresholds; only ones that
+  pass are shown, labelled as suggested-then-verified.
+- **`llm_triage`** — the model flags rules that are statistically real but make
+  no sense, and they are ranked lower with the reason shown. It cannot promote a
+  rule, hide one, or change any evidence.
+
+If a feature is switched on while `llm_provider` is `none`, or the provider is
+unreachable, the run says so on the Status page and continues normally.
+
+Tuning: `llm_classification_batch` (entities per call, default 60),
+`llm_hypothesis_candidates` (rejected rules to attempt, default 10),
+`llm_hypotheses_per_candidate` (default 3), `llm_triage_penalty` (score
+multiplier for an implausible verdict, default 0.5).
 
 ### `llm_model`, `llm_base_url`, `llm_api_key`
 Optional overrides. With Ollama, leaving `llm_model` empty picks the best

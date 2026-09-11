@@ -34,8 +34,37 @@ suggestions that would misfire the same way.
 **It backtests before it suggests.** Every candidate is replayed against your
 real history: how often would it have fired correctly, how often would it have
 fired when you did *not* want it, how many of your actions would it have missed.
-Anything below the precision threshold, or above the nuisance budget
-(unwanted fires per week), never reaches you. The numbers are shown on the card.
+A rule has to clear all five of these to reach you, and the numbers are shown on
+the card:
+
+- **enough evidence** — it must have been right at least `backtest_min_true_fires`
+  times. This one comes first because it is the one a percentage hides: a rule
+  that fired once, correctly, has 100% precision and zero unwanted fires per
+  week, and has shown nothing at all.
+- **precision** — of the times it would have fired, how many you wanted.
+- **recall** — how much of the real behaviour it accounts for. Firing correctly
+  three times out of the twenty you actually did something is precise and
+  useless.
+- **nuisance budget** — unwanted fires per week.
+- **no fires where you have already said no** — an unwanted fire that lands next
+  to a moment when you reached over and undid an automation is not merely
+  unnecessary, and is disqualifying on its own.
+
+Rules that trigger on an event rather than a clock time are matched more
+strictly, per trigger: "some time in the next quarter hour" is a fair reading of
+a daily habit and a dishonest one for a rule claiming the door opening caused
+the light.
+
+**Not everything gets the same bar.** A rule that moves a physical barrier or
+secures a building is not the same kind of suggestion as one that turns on a
+lamp, and every miner in this project would otherwise apply identical thresholds
+to both. Actions on `lock`, `cover`, `valve`, `alarm_control_panel`,
+`water_heater`, `siren`, `lawn_mower` and `vacuum` must clear 95% precision, at
+least 12 correct fires, and zero unwanted fires. Actions that leave the home
+*less* secured — unlocking, opening a cover or valve, disarming — are not
+proposed at all unless you turn on `allow_security_actions`: a correlation is
+never a reason to unlock a door, and there is no precision at which it becomes
+one.
 
 **It checks for conflicts.** Before surfacing a rule it looks for value
 inconsistencies, dependency loops, redundancy with an existing automation, and
@@ -170,20 +199,69 @@ entity ids it is allowed to use, and nothing else.
 - Cloud providers (OpenAI, Anthropic, Google, OpenRouter) are **strictly opt-in**
   and require an API key.
 
+### Optional AI assistance (all off by default)
+
+Three further features use the model for things statistics cannot do. Each is a
+separate switch, each defaults to **off**, and none of them can put a suggestion
+in front of you that has not passed the same deterministic gates as every other
+suggestion.
+
+| Option | What it does | What it is not allowed to do |
+|---|---|---|
+| `llm_entity_classification` | Labels signal roles the pattern matcher misses — a price sensor called `sensor.stroomprijs`, a dishwasher called `switch.geschirr`. Cached until your entities change. | Remove a role the deterministic detector found. It is additive only. |
+| `llm_hypotheses` | For rules the backtest **rejected**, proposes conditions that might explain when the action really happens — "only when it's cold out", "only on workdays". Each proposal is then re-backtested. | Surface anything. Only proposals that clear the same precision and nuisance thresholds are shown, and they carry a note saying the condition was suggested and then verified. |
+| `llm_triage` | Flags rules that are statistically real but semantically absurd — two things that merely happen at the same time of day. | Promote or hide anything. It can lower a score and attach a visible reason; the evidence and backtest stay exactly as they were. |
+
+`llm_hypotheses` is the one that changes what the tool can *find*: the built-in
+conditional miner only tests one signal at a time against a single threshold, so
+a combination like "dark **and** a workday" is outside its reach. The model
+supplies the guess, your history decides.
+
+Turning these on costs more calls than the YAML step: classification is one call
+per ~60 entities (cached), hypotheses one call per rejected rule, triage one per
+25 suggestions. The Status page reports exactly what each one did, including how
+many invented entity ids were discarded.
+
 ### The validation gate
 
-Nothing reaches your configuration without passing all three checks:
+Nothing reaches your configuration without passing all five checks:
 
-1. **Existence** — every `entity_id`, `device_id`, `area_id` and service must
+1. **Equivalence** — the model's automation is reduced to a canonical form of
+   its triggers, conditions, actions and mode, and compared against the same
+   reduction of the deterministic rendering. The prompt allows it to reword the
+   alias and description; anything else it changes is a rejection that names the
+   field. Checks 2 and 3 only prove that what the model named *exists* — an
+   entirely different automation built from real entities and real services
+   passes both. This one is what makes "the rule you read the evidence for" and
+   "the rule that gets written" the same rule.
+2. **Knowable targets** — a Jinja template names nothing, so an existence check
+   on `service: "{{ svc }}"` passes vacuously; `entity_id: all` names everything.
+   Both defer the decision to runtime, where no gate can see it, and neither is
+   something this add-on ever generates, so both are refused outright.
+3. **Existence** — every `entity_id`, `device_id`, `area_id` and service must
    exist in the registry-union-states set. This is what catches hallucination;
    Home Assistant's own config check does not.
-2. **Schema** — the YAML must parse and match Home Assistant's automation schema
+4. **Schema** — the YAML must parse and match Home Assistant's automation schema
    (mirrored in voluptuous).
-3. **`POST /api/config/core/check_config`** must pass.
+5. **`POST /api/config/core/check_config`** must pass.
+
+Every one of them fails closed. If Home Assistant is unreachable and the live
+service list is unavailable, the service check does not quietly become a no-op:
+it falls back to the closed set of services the miners are capable of emitting,
+which is narrower than your real instance. An unreachable Core can cost you a
+legitimate suggestion; it cannot turn "unverified" into "fine".
 
 If the LLM's output fails the gate, it is rejected, the reason is shown
-(including which entity ids it invented), and you are given the deterministic
-rendering instead.
+(including which entity ids it invented, or which field it rewrote), and you are
+given the deterministic rendering instead.
+
+**Apply writes the artifact you previewed.** The automation shown on the detail
+page is stored when it is rendered, and Apply writes that stored object rather
+than asking the model the same question a second time — a second answer would be
+an automation you never saw. It is re-validated in full, `check_config`
+included, before it is written; reuse means no new content, not no new checks.
+If the finding has since been re-mined into a different rule, the stale preview
+is discarded and regenerated rather than applied.
 
 ---
 
@@ -201,7 +279,11 @@ without touching any of it.
 | `min_support` / `min_confidence` / `min_lift` | `0.02` / `0.6` / `1.5` | association-rule thresholds |
 | `override_window_seconds` | `120` | how soon a correction counts as an override |
 | `backtest_min_precision` | `0.7` | minimum backtest precision to surface a rule |
+| `backtest_min_recall` | `0.25` | how much of the real behaviour a rule must account for |
+| `backtest_min_true_fires` | `4` | times a rule must have been right before its percentages count |
 | `backtest_max_false_fires_per_week` | `3` | nuisance budget |
+| `backtest_max_nuisance_fires` | `0` | unwanted fires allowed where you previously overrode an automation |
+| `allow_security_actions` | `false` | let suggestions unlock, open or disarm things |
 | `excluded_domains` / `excluded_entities` / `excluded_users` | `[]` | added to sensible built-in exclusions; entities accept globs |
 | `llm_provider` | `none` | `none`, `ollama`, or a cloud provider (opt-in) |
 | `schedule` | `0 3 * * *` | cron for the nightly analysis |
@@ -224,6 +306,7 @@ not do is listed on the Status page and at the top of the suggestions list.
 | No LLM | deterministic blueprint YAML you can paste |
 | No recorder at all | the run is marked *degraded* and says why |
 | A miner raising | only that miner's findings are lost; the run is marked *partial* and names the failure |
+| An AI feature enabled without a provider, or failing | the feature is skipped and says so; the deterministic run is unaffected |
 
 ---
 
@@ -300,13 +383,33 @@ python -m amminer.testing.synthetic /tmp/rec.db --days 45
   `statistics`) and injects known patterns: a 06:30 weekday habit, an
   arrive-home sequence, a temperature-driven heater habit, and deliberate
   override events. The miners are asserted to recover exactly those.
-- **Both dialects** — the same production SQL runs against SQLite always, and
-  against MariaDB/PostgreSQL when `AMMINER_TEST_MYSQL_URL` is set
-  (`pytest -m mariadb`).
+- **Dialects** — every test runs the production SQL against SQLite. Setting
+  `AMMINER_TEST_MYSQL_URL` adds one MariaDB test (`pytest -m mariadb`) that
+  asserts the same queries execute there and return context ids; it does not
+  compare results between the two. PostgreSQL is supported by the same
+  SQLAlchemy code path and the DDL translator in `testing/mysql_loader.py`, but
+  nothing in CI exercises it — treat Postgres as untested rather than verified.
+- **Timezones** — the suite pins `TZ=UTC` so the synthetic history and the
+  miners agree, and `tests/test_timezones.py` deliberately runs the mining path
+  under several real zones, which is the case a Home Assistant instance is
+  actually in.
+- **Messy history** — the same generator, with `messy=True`, adds what a real
+  recorder is full of and the clean fixture never had: restarts leaving
+  `unavailable`/`unknown` and then a restored state with no context at all,
+  flapping contacts, and human changes carrying no `context_user_id`. The whole
+  pipeline runs against it and the same injected patterns must still come out,
+  so the degraded paths are exercised by the flagship test rather than only by
+  small unit tests.
+- **Mutation checks** — the thresholds that decide what a user is shown
+  (`min_consistency`, the conditional miner's lift/purity/staleness bounds, the
+  association lift and human-consequent filters, the stale-automation cutoff)
+  each have a test that fails when the check is deleted. They were added because
+  every one of them could be removed with the suite staying green.
 - **Public datasets** — `amminer.testing.datasets` maps CASAS, ARAS and
   Kasteren into the internal schema. The archives are not redistributable, so
   the tests run on data generated in those exact on-disk formats; point
   `AMMINER_CASAS_FILE` at a real CASAS file to run against the genuine archive.
+  CI does not set it, so CI validates the format handling, not the archives.
 - **Registry snapshots** — including entities with no `unique_id` (recovered via
   the states union) and large `deleted_entities` sections (which must be ignored).
 - **Golden LLM tests** — a deliberately hallucinating model is asserted to be

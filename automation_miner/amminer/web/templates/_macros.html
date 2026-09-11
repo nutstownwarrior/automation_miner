@@ -52,3 +52,29 @@
   </div>
   {% endif %}
 {% endmacro %}
+
+{% macro assist_block(extra) %}
+  {% set triage = (extra or {}).get('triage') %}
+  {% set hypothesis = (extra or {}).get('hypothesis') %}
+  {% if triage or hypothesis %}
+  <div class="assist">
+    {% if hypothesis %}
+    <p class="small">
+      <span class="tag miner">assisted</span>
+      The condition <em>{{ hypothesis.reason }}</em> was suggested by the assistant,
+      then <strong>verified against your history</strong> before being shown.
+    </p>
+    {% endif %}
+    {% if triage %}
+    <p class="small {{ 'warn' if triage.verdict == 'implausible' }}">
+      <span class="tag {{ 'warning' if triage.verdict == 'implausible' else '' }}">
+        {{ triage.verdict }}</span>
+      {{ triage.reason }}
+      {% if triage.score_penalty %}
+      <span class="muted">(ranked lower &mdash; the evidence below is unchanged)</span>
+      {% endif %}
+    </p>
+    {% endif %}
+  </div>
+  {% endif %}
+{% endmacro %}

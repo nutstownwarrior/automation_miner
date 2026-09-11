@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 
 import pytest
 from amminer.config import Options
 from amminer.discovery.ha_config import HAConfig
 from amminer.pipeline import MIN_DAYS_FOR_SEQUENCE_MINING, resolve_window, run_analysis
+from amminer.store import Store
 from amminer.testing.synthetic import build_default_fixture
 
 
@@ -205,6 +207,227 @@ def test_pipeline_error_is_captured_not_raised(ha_config_dir, store, monkeypatch
     assert store.last_run()["status"] == "error"
 
 
+# --- optional AI features -----------------------------------------------
+class _Stub:
+    """A provider stub that answers whichever AI feature is asking."""
+
+    name = "stub"
+    enabled = True
+
+    def __init__(self, raises: bool = False):
+        self.raises = raises
+        self.calls = 0
+
+    def status(self):
+        from amminer.llm.provider import LLMStatus
+
+        return LLMStatus("stub", True, "http://stub", "stub-model")
+
+    def complete_json(self, system, user):
+        from amminer.llm.provider import LLMError
+
+        self.calls += 1
+        if self.raises:
+            raise LLMError("stub is down")
+        if "label Home Assistant entities" in system:
+            return {"assignments": [
+                {"entity_id": "sensor.outdoor_temperature",
+                 "roles": ["outdoor_temperature"]},
+            ]}
+        if "explain WHEN" in system:
+            return {"hypotheses": [
+                {"reason": "it tracks the outdoor temperature",
+                 "conditions": [{"kind": "numeric_state",
+                                 "entity_id": "sensor.outdoor_temperature",
+                                 "below": 8}]},
+            ]}
+        if "make SENSE" in system:
+            payload = json.loads(user)
+            return {"reviews": [
+                {"id": rule["id"], "verdict": "plausible", "reason": "fine"}
+                for rule in payload["rules"]
+            ]}
+        return {}
+
+
+def _use_stub(monkeypatch, stub):
+    import amminer.pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "build_provider", lambda options: stub)
+    return stub
+
+
+def test_ai_features_are_off_by_default(ha_config_dir, store, fake_client):
+    report, _candidates = run(ha_config_dir, store, fake_client)
+    assert report.ai == {}
+    assert all(v is False for v in Options().ai_features_requested.values())
+
+
+def test_disabled_ai_changes_nothing(ha_config_dir, store, fake_client, tmp_path, monkeypatch):
+    """The assisted run with every feature off must equal the plain run."""
+    stub = _use_stub(monkeypatch, _Stub())
+    baseline, _ = run(ha_config_dir, store, fake_client)
+
+    other = Store(tmp_path / "second.db")
+    options = Options(
+        ha_config_dir=str(ha_config_dir), state_dir=str(ha_config_dir),
+        llm_provider="ollama",  # a provider IS configured, the features are not
+    )
+    second, _ = run_analysis(options, other, fake_client, HAConfig(ha_config_dir))
+
+    assert stub.calls == 0, "no AI call may happen with the features switched off"
+    assert second.surfaced == baseline.surfaced
+    assert second.rejected == baseline.rejected
+    assert second.ai == {}
+    other.close()
+
+
+def test_enabled_without_a_provider_degrades_clearly(ha_config_dir, store, fake_client):
+    report, _candidates = run(
+        ha_config_dir, store, fake_client,
+        llm_entity_classification=True, llm_hypotheses=True, llm_triage=True,
+    )
+    assert report.status == "ok"
+    assert any("llm_provider is 'none'" in d for d in report.degradations)
+    assert all(info["ran"] is False for info in report.ai.values())
+    assert set(report.ai) == {"entity_classification", "hypotheses", "triage"}
+
+
+def test_all_three_features_run_and_are_reported(ha_config_dir, store, fake_client, monkeypatch):
+    stub = _use_stub(monkeypatch, _Stub())
+    report, _candidates = run(
+        ha_config_dir, store, fake_client, llm_provider="ollama",
+        llm_entity_classification=True, llm_hypotheses=True, llm_triage=True,
+    )
+    assert report.status == "ok"
+    assert stub.calls > 0
+    for feature in ("entity_classification", "hypotheses", "triage"):
+        assert report.ai[feature]["ran"] is True, feature
+    assert report.ai["triage"]["reviewed"] > 0
+    assert report.ai["hypotheses"]["considered"] > 0
+
+
+def test_a_verified_hypothesis_is_surfaced_and_supersedes_its_origin(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    """Wiring test: whether a rescue is possible depends on the data, so the
+    rescue itself is stubbed here and exercised for real in test_llm_assist.py.
+    What must hold regardless is that an accepted hypothesis is persisted with
+    its provenance and that its origin stops being counted as a rejection."""
+    import amminer.pipeline as pipeline_module
+    from amminer.llm.hypothesis import HypothesisResult
+    from amminer.miners.base import Action, Candidate, Trigger
+
+    _use_stub(monkeypatch, _Stub())
+    captured: dict[str, object] = {}
+
+    def fake_propose(rejected, changes, signal_store, options, window, provider,
+                     resolver=None, overrides=()):
+        assert rejected, "the pipeline must hand over the rejected candidates"
+        origin = rejected[0]
+        captured["origin_id"] = origin.id
+        rescued = Candidate(
+            miner=f"{origin.miner}+hypothesis",
+            title=origin.title,
+            triggers=list(origin.triggers) or [Trigger(kind="time", at="06:30:00")],
+            actions=list(origin.actions)
+            or [Action(service="light.turn_on", entity_id="light.kitchen")],
+        )
+        rescued.backtest = {"passed": True, "precision": 0.95, "summary": "verified"}
+        rescued.extra["hypothesis"] = {
+            "reason": "it only happens on cold days",
+            "origin_candidate": origin.id,
+        }
+        result = HypothesisResult(considered=1, proposed=1)
+        result.accepted = [rescued]
+        return result
+
+    monkeypatch.setattr(pipeline_module.llm_hypothesis, "propose_and_verify", fake_propose)
+    report, _candidates = run(
+        ha_config_dir, store, fake_client, llm_provider="ollama", llm_hypotheses=True,
+    )
+
+    assisted = [
+        s for s in store.list_suggestions(status="new")
+        if (s["payload"].get("extra") or {}).get("hypothesis")
+    ]
+    assert assisted, "an accepted hypothesis must be persisted"
+    payload = assisted[0]["payload"]
+    assert payload["miner"].endswith("+hypothesis")
+    assert payload["backtest"]["passed"] is True
+    assert payload["extra"]["hypothesis"]["reason"] == "it only happens on cold days"
+    assert report.ai["hypotheses"]["accepted"] == 1
+    # The rescued rule replaces its origin rather than sitting alongside it.
+    assert captured["origin_id"] not in {s["id"] for s in store.list_suggestions()}
+
+
+def test_a_failing_ai_feature_does_not_break_the_run(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    _use_stub(monkeypatch, _Stub(raises=True))
+    report, _candidates = run(
+        ha_config_dir, store, fake_client, llm_provider="ollama",
+        llm_entity_classification=True, llm_hypotheses=True, llm_triage=True,
+    )
+    # A provider that is simply down is handled inside each feature and shows
+    # up as a degradation, not as a broken run.
+    assert report.status == "ok"
+    assert report.error is None
+    assert report.ai_errors == {}
+    assert report.surfaced > 0, "the deterministic miners must still deliver"
+    assert store.list_suggestions(status="new")
+
+
+def test_an_ai_feature_that_crashes_makes_the_run_partial(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    """A feature raising is not the same as a provider being down."""
+    import amminer.llm.triage as llm_triage
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("a bug in the triage feature itself")
+
+    monkeypatch.setattr(llm_triage, "triage", explode)
+    _use_stub(monkeypatch, _Stub())
+    report, _candidates = run(
+        ha_config_dir, store, fake_client, llm_provider="ollama", llm_triage=True,
+    )
+    assert report.status == "partial"
+    assert "triage" in report.ai_errors
+    # "partial" must still mean the rest of the run delivered.
+    assert report.surfaced > 0
+    assert store.list_suggestions(status="new")
+
+
+def test_triage_cannot_push_a_rule_past_the_backtest_gate(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    """Even a model that loves everything cannot surface a rejected rule."""
+
+    class Enthusiast(_Stub):
+        def complete_json(self, system, user):
+            if "make SENSE" in system:
+                payload = json.loads(user)
+                return {"reviews": [
+                    {"id": rule["id"], "verdict": "plausible", "reason": "superb"}
+                    for rule in payload["rules"]
+                ]}
+            return {}
+
+    _use_stub(monkeypatch, Enthusiast())
+    baseline, _ = run(ha_config_dir, store, fake_client)
+    baseline_surfaced = baseline.surfaced
+
+    other_store = Store(ha_config_dir / "triage.db")
+    options = Options(
+        ha_config_dir=str(ha_config_dir), state_dir=str(ha_config_dir),
+        llm_provider="ollama", llm_triage=True,
+    )
+    report, _ = run_analysis(options, other_store, fake_client, HAConfig(ha_config_dir))
+    assert report.surfaced == baseline_surfaced
+    other_store.close()
+
+
 # --- window resolution --------------------------------------------------
 class _Recorder:
     def __init__(self, oldest, newest):
@@ -234,3 +457,53 @@ def test_explicit_window_is_clamped_to_available_history():
     start, end, notes = resolve_window(Options(analysis_window_days=90), recorder)
     assert (end - start) / 86400 == pytest.approx(9, abs=0.1)
     assert any("only" in n for n in notes)
+
+
+def test_a_failing_stage_does_not_discard_what_the_miners_produced(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    """Only the miners were isolated; everything after them was all-or-nothing."""
+    import amminer.pipeline as pipeline_module
+
+    def explode(*args, **kwargs):
+        raise MemoryError("simulated OOM inside gap analysis")
+
+    monkeypatch.setattr(pipeline_module.gap_analysis, "suggest", explode)
+    report, _candidates = run(ha_config_dir, store, fake_client)
+
+    assert report.status == "partial"
+    assert report.error is None
+    assert "gap analysis" in report.miner_errors
+    # The candidates that were already mined and backtested are still here.
+    assert report.surfaced > 0
+    assert store.list_suggestions(status="new")
+
+
+def test_a_failing_conflict_check_says_so_rather_than_implying_clean(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    import amminer.pipeline as pipeline_module
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("conflict checking blew up")
+
+    monkeypatch.setattr(pipeline_module.conflict_checks, "annotate_candidates", explode)
+    report, _candidates = run(ha_config_dir, store, fake_client)
+
+    assert report.status == "partial"
+    assert report.surfaced > 0
+    assert any("not been compared" in d for d in report.degradations)
+    assert store.list_suggestions(status="new")
+
+
+def test_an_unfinished_run_is_closed_on_the_next_start(store):
+    """A Supervisor restart mid-analysis left the row saying 'running' forever."""
+    run_id = store.start_run()
+    assert store.last_run()["status"] == "running"
+    assert store.close_interrupted_runs() == 1
+    closed = store.last_run()
+    assert closed["id"] == run_id
+    assert closed["status"] == "interrupted"
+    assert closed["finished_ts"] is not None
+    # Nothing left to close the second time.
+    assert store.close_interrupted_runs() == 0

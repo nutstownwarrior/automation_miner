@@ -145,8 +145,10 @@ def test_config_yaml_maps_the_right_directories(addon_config):
 
 
 def test_config_yaml_grants_the_apis_we_use(addon_config):
-    assert addon_config["hassio_api"] is True
     assert addon_config["homeassistant_api"] is True
+    # An add-on that asks for a privilege it does not use is asking for trust
+    # it does not need.  Nothing here calls a Supervisor endpoint.
+    assert "hassio_api" not in addon_config
 
 
 def test_config_yaml_is_multi_arch(addon_config):
@@ -169,6 +171,18 @@ def test_option_defaults_match_the_python_defaults(addon_config):
         if not hasattr(defaults, key) or isinstance(value, list):
             continue
         assert getattr(defaults, key) == value, f"{key} differs from the Python default"
+
+
+def test_ai_features_are_exposed_in_the_addon_ui(addon_config):
+    """They must be togglable from HA's Configuration tab, not just code."""
+    for option in ("llm_entity_classification", "llm_hypotheses", "llm_triage"):
+        assert addon_config["options"][option] is False, f"{option} must default off"
+        assert addon_config["schema"][option] == "bool?"
+
+
+def test_ai_tuning_knobs_are_range_checked(addon_config):
+    assert addon_config["schema"]["llm_triage_penalty"] == "float(0.0,1.0)?"
+    assert addon_config["schema"]["llm_hypotheses_per_candidate"] == "int(0,10)?"
 
 
 def test_api_key_option_is_a_password_field(addon_config):
@@ -329,3 +343,46 @@ def test_dockerfile_installs_wheels_only():
 def test_repository_yaml_is_valid():
     repository = yaml.safe_load((ADDON_DIR.parent / "repository.yaml").read_text())
     assert repository["name"] and repository["url"]
+
+
+def test_a_typo_in_the_options_file_is_reported(caplog):
+    """The more confusing mistake had the quieter diagnostic: none at all."""
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        options = Options.from_mapping({"min_occurences": 50, "min_occurrences": 7})
+    assert options.min_occurrences == 7
+    assert any("min_occurences" in record.message for record in caplog.records)
+
+
+def test_a_non_text_path_option_does_not_kill_startup(caplog):
+    """Uncoerced, this reaches Path() and raises before logging is configured."""
+    import logging
+    from pathlib import Path
+
+    with caplog.at_level(logging.WARNING):
+        options = Options.from_mapping({"state_dir": 5})
+    assert isinstance(options.state_dir, str)
+    Path(options.state_dir)  # must not raise
+    assert any("state_dir" in record.message for record in caplog.records)
+
+
+def test_every_runtime_option_is_clamped_to_something_usable():
+    options = Options(
+        backtest_min_recall=5.0,
+        backtest_min_true_fires=0,
+        backtest_max_nuisance_fires=-3,
+        backtest_match_tolerance_seconds=0,
+        sequence_min_occurrences=0,
+        association_window_seconds=0,
+        stale_automation_days=0,
+        llm_timeout_seconds=0,
+    )
+    assert options.backtest_min_recall == 1.0
+    assert options.backtest_min_true_fires == 1
+    assert options.backtest_max_nuisance_fires == 0
+    assert options.backtest_match_tolerance_seconds == 1
+    assert options.sequence_min_occurrences == 2
+    assert options.association_window_seconds == 1
+    assert options.stale_automation_days == 1
+    assert options.llm_timeout_seconds == 1

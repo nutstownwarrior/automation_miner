@@ -63,3 +63,26 @@ First release.
   (no musl wheels, never imported here) and matplotlib out of the image.
 - A miner that raises no longer aborts the analysis; the run completes, is
   marked `partial`, and reports which miner failed and why.
+
+**Optional AI assistance (all off by default)**
+
+- `llm_entity_classification`: the model labels signal roles the regex detector
+  misses. Additive only, cached on an inventory fingerprint, and every returned
+  entity id and role is validated before use.
+- `llm_hypotheses`: for backtest-rejected rules the model proposes explanatory
+  conditions, each of which is rebuilt as a normal candidate and put through the
+  same backtester. Only verified proposals are surfaced, carrying their
+  provenance. Proposals naming unknown entities, unsimulatable condition kinds,
+  or no actual constraint are rejected before measurement.
+- `llm_triage`: advisory plausibility verdicts that can demote and annotate a
+  suggestion but never promote, hide or alter its evidence.
+- Each feature runs in isolation: a failure is reported and skipped rather than
+  affecting the deterministic run.
+- The Anthropic provider now forces JSON with an assistant prefill; it was the
+  only path without machine-enforced structured output.
+
+**Fixed**
+
+- The synthetic fixture declared an analysis window that did not cover the rows
+  it generated, so a window-bounded query returned a different first row
+  depending on the day of the week the tests ran.

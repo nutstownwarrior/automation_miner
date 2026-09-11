@@ -127,6 +127,40 @@ class SignalStore:
         }
 
 
+#: Long-term statistics rows are hourly buckets stamped at the hour they open.
+STATISTICS_INTERVAL_SECONDS = 3600.0
+
+
+def _merge_statistics(
+    raw: SignalSeries | None, stats: SignalSeries
+) -> SignalSeries | None:
+    """Fill the gaps around *raw* with hourly means, without replacing it.
+
+    Statistics survive ``purge_keep_days`` and raw history does not, so for an
+    entity with ten days of readings and a year of statistics the statistics
+    series is far longer - and swapping one for the other traded precise values
+    for hourly averages over the very period we had the real thing for.  Raw
+    points win wherever they exist; statistics fill only outside their span.
+    """
+    if stats.empty:
+        return None
+    if raw is None or raw.empty:
+        return stats
+    if not raw.numeric:
+        # An hourly mean says nothing useful about a categorical entity.
+        return None
+    first, last = raw.times[0], raw.times[-1]
+    merged = SignalSeries(raw.entity_id, numeric=True, source=f"{raw.source}+statistics")
+    for ts, value in zip(stats.times, stats.values, strict=True):
+        if ts < first or ts > last:
+            merged.add(ts, value)
+    if merged.empty:
+        return None
+    for ts, value in zip(raw.times, raw.values, strict=True):
+        merged.add(ts, value)
+    return merged.finalise()
+
+
 def build_signal_store(
     changes: Sequence[StateChange],
     wanted: Iterable[str],
@@ -211,16 +245,24 @@ def build_signal_store(
                         entity_id,
                         SignalSeries(entity_id, numeric=True, source="statistics"),
                     )
-                    series.add(float(row["start_ts"]), float(value))
+                    # start_ts opens the hour this mean covers.  Stamping the
+                    # point there makes "what was the temperature at 14:05?"
+                    # answerable with an average of 14:00-15:00 - readings that
+                    # had not happened yet.  A backtest that can see the future
+                    # is not a backtest, so the point is stamped when its
+                    # interval closes and is fully in the past.
+                    series.add(
+                        float(row["start_ts"]) + STATISTICS_INTERVAL_SECONDS, float(value)
+                    )
                 for entity_id, series in by_entity.items():
-                    existing = store.get(entity_id)
-                    if existing is None or len(existing) < len(series):
+                    merged = _merge_statistics(store.get(entity_id), series)
+                    if merged is not None:
                         _LOGGER.info(
-                            "Using long-term statistics for %s (%d hourly points)",
+                            "Filled %s from long-term statistics (%d hourly points)",
                             entity_id,
                             len(series),
                         )
-                        store.add(series)
+                        store.add(merged)
 
     _LOGGER.info("Signal store: %s", store.stats())
     return store

@@ -16,13 +16,29 @@ from .config import Options
 from .discovery.ha_config import HAConfig
 from .entities import EntityResolver, build_resolver
 from .ha_api import HAClient
-from .llm.generate import generate
+from .llm.blueprint import candidate_to_automation, render_yaml
+from .llm.equivalence import matches, semantic_form
+from .llm.generate import GenerationResult, generate
 from .llm.provider import build_provider
+from .llm.validate import validate_automation
 from .miners.base import Action, Candidate, Condition, Evidence, Trigger
 from .pipeline import RunReport, run_analysis
 from .store import Store
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def generation_digest(config: dict[str, Any]) -> str:
+    """Identity of what an automation *does*, for consent purposes.
+
+    Keyed on the semantic form, so re-rendering the same rule yields the same
+    digest while any change to trigger/condition/action changes it.
+    """
+    import hashlib
+    import json as _json
+
+    payload = _json.dumps(semantic_form(config), sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
 def candidate_from_payload(payload: dict[str, Any]) -> Candidate:
@@ -70,6 +86,9 @@ class Runner:
         self._services: list[str] | None = None
         self._lock = threading.Lock()
         self._running = False
+        #: Set whenever no analysis is in flight, so shutdown can wait for one.
+        self._idle = threading.Event()
+        self._idle.set()
 
     # ------------------------------------------------------------------
     @property
@@ -97,13 +116,14 @@ class Runner:
                 _LOGGER.info("Analysis already running; ignoring request")
                 return self.last_report
             self._running = True
+            self._idle.clear()
         started = time.time()
         try:
             # A fresh resolver each run picks up newly added entities.
             self.resolver = build_resolver(self.options.ha_config_dir, self.client)
             self._services = None
             report, _candidates = run_analysis(
-                self.options, self.store, self.client, self.ha_config
+                self.options, self.store, self.client, self.ha_config, resolver=self.resolver
             )
             self.last_report = report
             return report
@@ -112,7 +132,18 @@ class Runner:
             return self.last_report
         finally:
             self._running = False
+            self._idle.set()
             _LOGGER.info("Analysis finished in %.1fs", time.time() - started)
+
+    def wait_until_idle(self, timeout: float) -> bool:
+        """Block until no analysis is in flight.  False if it is still going.
+
+        Shutdown closes the database.  Doing that under a run that is still
+        writing raises "Cannot operate on a closed database" mid-write, loses
+        every candidate not yet persisted, and leaves the run row saying
+        "running" forever.
+        """
+        return self._idle.wait(timeout)
 
     # ------------------------------------------------------------------
     def preview_yaml(self, suggestion_id: str) -> dict[str, Any] | None:
@@ -138,9 +169,19 @@ class Runner:
             services=self._ensure_services(),
             run_check_config=False,  # a preview must not hammer Core
         )
-        return result.as_dict()
+        # Persist exactly what is about to be rendered, so Apply writes this
+        # artifact rather than asking the model the same question again.
+        if result.config:
+            self.store.save_generation(
+                suggestion_id, generation_digest(result.config), result.source, result.config
+            )
+        data = result.as_dict()
+        data["digest"] = generation_digest(result.config) if result.config else None
+        return data
 
-    def apply(self, suggestion_id: str) -> dict[str, Any] | None:
+    def apply(
+        self, suggestion_id: str, confirm_conflicts: bool = False
+    ) -> dict[str, Any] | None:
         """Generate, fully validate (including check_config) and write."""
         stored = self.store.get_suggestion(suggestion_id)
         if stored is None:
@@ -149,14 +190,72 @@ class Runner:
         if not payload.get("actions"):
             return {"ok": False, "errors": ["This finding has no automation to apply."]}
         candidate = candidate_from_payload(payload)
-        generation = generate(
-            candidate,
-            resolver=self._ensure_resolver(),
-            provider=build_provider(self.options),
-            client=self.client if self.client.configured else None,
-            services=self._ensure_services(),
-            run_check_config=True,
-        )
+
+        # A conflict of error severity means this rule and an existing one pull
+        # the same entity opposite ways.  The conflict check was being run,
+        # counted in the report, and then not consulted by the one operation it
+        # exists to inform.  The user still decides - they just have to say so.
+        blocking = [
+            conflict
+            for conflict in (payload.get("conflicts") or [])
+            if conflict.get("severity") == "error"
+        ]
+        if blocking and not confirm_conflicts:
+            return {
+                "ok": False,
+                "needs_confirmation": True,
+                "conflicts": blocking,
+                "errors": [
+                    "This rule conflicts with an automation you already have: "
+                    + "; ".join(str(c.get("message", "")) for c in blocking[:3])
+                ],
+            }
+
+        # Apply what was reviewed. Regenerating here would ask a
+        # non-deterministic model the same question a second time and write the
+        # second answer - an automation the user never saw. The stored artifact
+        # is still re-validated below, including check_config, before it is
+        # written; reuse means "no new content", not "no new checks".
+        stored = self.store.get_generation(suggestion_id)
+        if stored is not None and not matches(
+            stored["payload"], candidate_to_automation(candidate, self._ensure_resolver())
+        ):
+            # The finding was re-mined into a different rule after the preview.
+            # The stored artifact is no longer what this suggestion says, so it
+            # is not what the user approved either.
+            stored = None
+
+        if stored is not None:
+            generation = GenerationResult()
+            generation.config = stored["payload"]
+            generation.source = f"{stored.get('source') or 'stored'} (reviewed)"
+            generation.yaml_text = render_yaml(stored["payload"])
+            generation.notes.append(
+                "Applying the automation exactly as it was previewed."
+            )
+            generation.report = validate_automation(
+                generation.config,
+                resolver=self._ensure_resolver(),
+                client=self.client if self.client.configured else None,
+                known_services=self._ensure_services(),
+                run_check_config=True,
+            )
+        else:
+            # Never previewed (an API caller, or a store that lost the row):
+            # generate once and apply that same object - still a single
+            # generation, so there is no divergence window.
+            generation = generate(
+                candidate,
+                resolver=self._ensure_resolver(),
+                provider=build_provider(self.options),
+                client=self.client if self.client.configured else None,
+                services=self._ensure_services(),
+                run_check_config=True,
+            )
+            generation.notes.append(
+                "No stored preview for this suggestion; generated and applied in one step."
+            )
+
         result = apply_generation(generation, self.client)
         data = result.as_dict()
         data["generation"] = generation.as_dict()
