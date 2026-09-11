@@ -89,6 +89,56 @@ Shape:
 """
 
 
+DRAFT_PROMPT = """\
+You help someone word a standing preference about their own home automation.
+
+A preference is one sentence saying what NOT to suggest. You are given what they
+want changed, and - if they are amending one that already exists - its current
+wording.
+
+Rules you MUST follow:
+- Output ONE JSON object and nothing else. No prose, no markdown fences.
+- "rule" is ONE sentence, written as a rule about what not to suggest.
+- Apply exactly what they asked for and change nothing else. If they narrow a
+  rule, keep the rest of it intact.
+- Do not add conditions, rooms, times or devices they did not mention. You are
+  wording their instruction, not improving it.
+- Do not refer to "the user" or to yourself. Write the rule plainly.
+- If what they said cannot be expressed as a preference, return an empty rule.
+
+Shape:
+{"rule": "Do not suggest anything that automates the guest room lamp."}
+"""
+
+
+def draft(instruction: str, rule: str, provider: BaseProvider) -> tuple[str, str | None]:
+    """Word a preference from an instruction.  Returns ``(proposal, error)``.
+
+    This deliberately returns a proposal and writes nothing.  A model that could
+    edit a stored preference directly would be able to reword the rules that
+    hide things, which is the one power this whole feature is built to withhold.
+    Here it can only fill in a text box that a person then reads and saves, so
+    the stored rule is the user's either way.
+    """
+    instruction = clean_model_text(instruction, limit=500)
+    if not instruction:
+        return "", "say what you would like changed"
+    if not provider.enabled:
+        return "", "no LLM provider configured"
+
+    prompt = json.dumps(
+        {"current_rule": clean_model_text(rule, limit=200), "change_requested": instruction},
+        indent=2,
+    )
+    try:
+        raw = provider.complete_json(DRAFT_PROMPT, prompt)
+    except LLMError as err:
+        _LOGGER.warning("Drafting a preference failed: %s", err)
+        return "", str(err)
+    # The same cap the store applies, so what is shown is what can be saved.
+    return clean_model_text(raw.get("rule"), limit=200), None
+
+
 @dataclass
 class Preference:
     rule: str

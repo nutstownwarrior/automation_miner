@@ -318,3 +318,56 @@ def test_a_preference_carries_its_stored_id_into_matching(tmp_path):
     ]})
     result = prefs.apply_preferences([one], [rebuilt], llm)
     assert result.suppressed[one.id]["rule"] == "Quite different wording."
+
+
+# --- wording help, which writes nothing ---------------------------------
+def test_an_instruction_is_turned_into_a_reworded_rule():
+    llm = StubLLM({"rule": "Do not suggest anything for the guest room lamp."})
+    proposal, error = prefs.draft(
+        "only the lamp, not the whole room", "Never automate the guest room.", llm
+    )
+    assert proposal == "Do not suggest anything for the guest room lamp."
+    assert error is None
+
+
+def test_the_current_wording_and_the_request_are_both_sent():
+    llm = StubLLM({"rule": "x"})
+    prefs.draft("only the lamp", "Never automate the guest room.", llm)
+    assert "only the lamp" in llm.prompts[0]
+    assert "Never automate the guest room." in llm.prompts[0]
+
+
+def test_a_draft_is_capped_the_same_way_the_store_caps_it():
+    """Otherwise the box shows something longer than what can be saved."""
+    llm = StubLLM({"rule": "word " * 200})
+    proposal, _ = prefs.draft("make it long", "A rule.", llm)
+    assert len(proposal) <= 200
+
+
+def test_an_empty_instruction_never_reaches_the_model():
+    llm = StubLLM({"rule": "something"})
+    proposal, error = prefs.draft("   ", "A rule.", llm)
+    assert (proposal, llm.prompts) == ("", [])
+    assert "say what you would like changed" in error
+
+
+def test_a_provider_failure_drafts_nothing():
+    proposal, error = prefs.draft("narrow it", "A rule.", StubLLM(raises=True))
+    assert proposal == "" and "stub is down" in error
+
+
+def test_a_malformed_reply_drafts_nothing():
+    assert prefs.draft("narrow it", "A rule.", StubLLM({"nope": 1})) == ("", None)
+
+
+def test_drafting_with_no_provider_says_so():
+    proposal, error = prefs.draft("narrow it", "A rule.", NullProvider())
+    assert proposal == "" and "no LLM provider" in error
+
+
+def test_drafting_is_a_proposal_and_touches_no_store(tmp_path):
+    """A model that could edit a stored preference could reword what hides things."""
+    store, preference = _stored(tmp_path)
+    before = store.list_preferences(active_only=False)
+    prefs.draft("change it completely", preference.rule, StubLLM({"rule": "Something else."}))
+    assert store.list_preferences(active_only=False) == before

@@ -45,6 +45,9 @@ once there are a few to generalise from. You can also write one yourself below.<
     <span class="muted small">learned from {{ pref.evidence | length }} dismissal(s)</span>
     {% endif %}
     <span class="actions">
+      {% if options.llm_preferences %}
+      <button class="btn ghost small" data-action="preference-draft" data-id="{{ pref.id }}">Reword with AI</button>
+      {% endif %}
       <button class="btn ghost small" data-action="preference-save" data-id="{{ pref.id }}">Save</button>
       {% if pref.active %}
       <button class="btn ghost small" data-action="preference-off" data-id="{{ pref.id }}">Switch off</button>
@@ -65,8 +68,18 @@ was generalised from are still on record, a later run may learn something like i
   <input class="rule-input" type="text" id="new-preference" maxlength="200"
          placeholder="Never suggest anything for the bathroom."
          aria-label="A new preference">
+  {% if options.llm_preferences %}
+  <button class="btn ghost small" data-action="preference-draft" data-id="">Word it with AI</button>
+  {% endif %}
   <button class="btn ghost small" data-action="preference-add">Add a preference</button>
 </form>
+
+{% if options.llm_preferences %}
+<p class="muted small">&ldquo;Reword with AI&rdquo; asks the model to word a change for you
+&mdash; say <em>&ldquo;only the lamp, not the whole room&rdquo;</em> and it rewrites the
+sentence. It only fills in the box: nothing is stored until you read it and press
+<strong>Save</strong>, and what is saved then counts as your own wording.</p>
+{% endif %}
 
 {% if hidden %}
 <h2>Hidden by a preference <span class="count">{{ hidden | length }}</span></h2>

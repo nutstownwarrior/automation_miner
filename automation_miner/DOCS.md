@@ -251,6 +251,16 @@ lists them as editable fields rather than as verdicts:
 - **Write your own**, with no dismissals behind it at all — "never suggest
   anything for the bathroom". It applies from the next analysis and is never
   touched by relearning.
+- **Reword it with the model's help.** Press *Reword with AI*, say what you want
+  changed in plain language — "only the lamp, not the whole room", "this should
+  not apply at weekends" — and it rewrites the sentence for you.
+
+The wording helper **writes nothing**. It fills in the same text box a hand edit
+uses and stops there; the rule reaches the store only when you have read it and
+pressed Save, and what is stored then counts as your own wording like any other
+edit. A model that could change a stored preference directly would be able to
+reword the rules that hide things, which is the one power this feature exists to
+withhold.
 
 Switching off, rewriting or deleting a preference brings back everything it was
 hiding immediately. Rewriting does so because a rule you have just disagreed with

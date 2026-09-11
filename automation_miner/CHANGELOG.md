@@ -42,7 +42,19 @@ lists preferences as **editable fields**, not as verdicts:
   generalised again from the same dismissals, and that switching it off is the
   option that sticks;
 - **writing one by hand** needs no dismissals at all, and is never touched by
-  relearning.
+  relearning;
+- **rewording with the model's help** turns "only the lamp, not the whole room"
+  into the amended sentence. The helper writes nothing: it fills in the same box
+  a hand edit uses, and the rule reaches the store only once a person has read it
+  and pressed Save. A model that could change a stored preference directly would
+  be able to reword the rules that hide things, which is the one power this
+  feature exists to withhold.
+
+Its endpoint is declared ahead of `/preferences/{id}` — routes match in order, so
+the parameterised one would otherwise have tried to edit a preference called
+"draft" — and the provider call runs in a threadpool rather than on the event
+loop, because a timeout measured in minutes awaited there stalls every other
+request, `/health` included.
 
 Switching off, rewriting or deleting brings back everything the preference was
 hiding, immediately. Rewriting does so because a rule the user has just

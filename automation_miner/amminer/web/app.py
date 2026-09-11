@@ -23,9 +23,11 @@ from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from starlette.concurrency import run_in_threadpool
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from ..config import Options
+from ..llm import preferences as llm_preferences
 from ..llm.provider import build_provider
 from ..store import Store
 from ..store.db import (
@@ -256,6 +258,55 @@ def create_app(
         if preference is None:
             raise HTTPException(status_code=400, detail="a preference needs a rule")
         return {"status": "added", "preference": preference}
+
+    # Declared before "/preferences/{preference_id}": routes match in order, so
+    # the parameterised one would otherwise swallow this path and try to edit a
+    # preference called "draft".
+    @api.post("/preferences/draft")
+    async def draft_preference(request: Request):
+        """Word a preference from an instruction, and write nothing.
+
+        The model drafts; the person saves. It returns a proposal for the same
+        text box a hand edit uses, so nothing reaches the store until someone
+        has read it and pressed Save - and what is then stored is marked as the
+        user's, because they approved it.
+        """
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        instruction = str(body.get("instruction") or "")
+        current = str(body.get("rule") or "")
+        preference_id = body.get("preference")
+        if isinstance(preference_id, str) and preference_id:
+            stored = store.get_preference(preference_id)
+            if stored is None:
+                raise HTTPException(status_code=404, detail="unknown preference")
+            current = current or stored["rule"]
+        if not options.llm_preferences:
+            raise HTTPException(
+                status_code=503,
+                detail="turn on llm_preferences to use the wording helper",
+            )
+
+        provider = build_provider(options)
+        # The provider call has a timeout measured in minutes, so it must not
+        # run on the event loop: one of these would otherwise freeze every other
+        # request, /health included.
+        proposal, error = await run_in_threadpool(
+            llm_preferences.draft, instruction, current, provider
+        )
+        if error:
+            raise HTTPException(status_code=503, detail=error)
+        if not proposal:
+            raise HTTPException(
+                status_code=422,
+                detail="that could not be worded as a preference - try saying it as "
+                "something you do not want suggested",
+            )
+        return {"status": "drafted", "rule": proposal, "saved": False}
 
     @api.post("/preferences/{preference_id}")
     async def edit_preference(request: Request, preference_id: str):

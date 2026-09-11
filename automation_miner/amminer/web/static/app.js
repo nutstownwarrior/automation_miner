@@ -99,6 +99,31 @@
         window.location.reload();
       });
     },
+    "preference-draft": function (id) {
+      // The model only ever fills in the box. Saving stays a deliberate act,
+      // because a rule that hides suggestions should never be written by
+      // anything but the person it hides them from.
+      var input = id
+        ? document.querySelector('[data-rule-for="' + id + '"]')
+        : document.getElementById("new-preference");
+      if (!input) { return null; }
+      var instruction = window.prompt(
+        "What should change about this preference?\n\n" +
+        "For example: \"only the lamp, not the whole room\", or " +
+        "\"this should not apply at weekends\".",
+        "");
+      if (!instruction || !instruction.trim()) { return null; }
+      notify("Asking\u2026");
+      return post("/api/preferences/draft", {
+        preference: id || undefined,
+        rule: input.value,
+        instruction: instruction
+      }).then(function (result) {
+        input.value = result.rule;
+        input.focus();
+        notify("Drafted. Check the wording, then press Save - nothing is stored yet.");
+      });
+    },
     "preference-save": function (id) {
       var input = document.querySelector('[data-rule-for="' + id + '"]');
       if (!input || !input.value.trim()) {

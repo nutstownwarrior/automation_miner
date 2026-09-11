@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 from amminer.config import Options
 from amminer.discovery.ha_config import HAConfig
@@ -444,3 +446,173 @@ def test_a_preference_can_be_written_by_hand(wired):
     assert response.status_code == 200
     assert response.json()["preference"]["source"] == "user"
     assert client.post("/api/preferences", json={"rule": ""}).status_code == 400
+
+
+# --- wording help, which proposes and never writes -----------------------
+def _drafting_app(ha_config_dir, store, fake_client, monkeypatch, reply=None,
+                  raises=False, delay=0.0):
+    """The archive page with the wording helper on and a stub model behind it."""
+    import amminer.web.app as web_app
+    from amminer.llm.provider import LLMError, NullProvider
+
+    class StubLLM(NullProvider):
+        name, enabled = "stub", True
+
+        def complete_json(self, system, user):
+            if delay:
+                time.sleep(delay)
+            if raises:
+                raise LLMError("stub is down")
+            return reply if reply is not None else {}
+
+    monkeypatch.setattr(web_app, "build_provider", lambda _options: StubLLM())
+    options = Options(
+        ha_config_dir=str(ha_config_dir), state_dir=str(ha_config_dir),
+        llm_provider="ollama", llm_preferences=True,
+    )
+    runner = Runner(options, store, fake_client)
+    runner.ha_config = HAConfig(ha_config_dir)
+    return create_app(options, store, runner=runner, client=fake_client, ingress_only=False)
+
+
+def _with_drafting(ha_config_dir, store, fake_client, monkeypatch, **kwargs):
+    app = _drafting_app(ha_config_dir, store, fake_client, monkeypatch, **kwargs)
+    return TestClient(app), app
+
+
+def test_the_wording_helper_proposes_and_stores_nothing(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    client, _app = _with_drafting(
+        ha_config_dir, store, fake_client, monkeypatch,
+        reply={"rule": "Do not suggest anything for the guest room lamp."},
+    )
+    store.save_preferences([{"id": "pg", "rule": "Never automate the guest room.",
+                             "evidence": ["d1", "d2"]}])
+
+    response = client.post("/api/preferences/draft", json={
+        "preference": "pg", "instruction": "only the lamp, not the whole room",
+    })
+    assert response.status_code == 200
+    assert response.json()["rule"] == "Do not suggest anything for the guest room lamp."
+    assert response.json()["saved"] is False
+    # The stored rule is untouched until a person presses Save.
+    assert store.list_preferences()[0]["rule"] == "Never automate the guest room."
+
+    client.post("/api/preferences/pg", json={"rule": response.json()["rule"]})
+    assert store.list_preferences()[0]["rule"] == (
+        "Do not suggest anything for the guest room lamp."
+    )
+    assert store.list_preferences()[0]["edited"] == 1
+
+
+def test_the_wording_helper_has_its_own_path_not_the_edit_one(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    """`/preferences/draft` must not be read as editing a preference called 'draft'."""
+    client, _app = _with_drafting(
+        ha_config_dir, store, fake_client, monkeypatch, reply={"rule": "A worded rule."},
+    )
+    assert client.post(
+        "/api/preferences/draft", json={"instruction": "nothing in the bathroom"}
+    ).status_code == 200
+    assert store.list_preferences(active_only=False) == []
+
+
+def test_the_wording_helper_needs_the_feature_switched_on(wired):
+    client, store, _runner, _ha = wired
+    response = client.post("/api/preferences/draft", json={"instruction": "narrow it"})
+    assert response.status_code == 503
+    assert "llm_preferences" in response.json()["detail"]
+
+
+def test_a_draft_for_an_unknown_preference_is_404(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    client, _app = _with_drafting(
+        ha_config_dir, store, fake_client, monkeypatch, reply={"rule": "x"},
+    )
+    assert client.post(
+        "/api/preferences/draft", json={"preference": "nope", "instruction": "narrow it"}
+    ).status_code == 404
+
+
+def test_a_model_that_is_down_does_not_change_a_preference(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    client, _app = _with_drafting(ha_config_dir, store, fake_client, monkeypatch, raises=True)
+    store.save_preferences([{"id": "pg", "rule": "A rule.", "evidence": ["d1"]}])
+    response = client.post(
+        "/api/preferences/draft", json={"preference": "pg", "instruction": "narrow it"}
+    )
+    assert response.status_code == 503
+    assert store.list_preferences()[0]["rule"] == "A rule."
+
+
+def test_something_that_is_not_a_preference_is_refused(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    client, _app = _with_drafting(
+        ha_config_dir, store, fake_client, monkeypatch, reply={"rule": ""}
+    )
+    response = client.post(
+        "/api/preferences/draft", json={"instruction": "what is the weather"}
+    )
+    assert response.status_code == 422
+
+
+def test_a_slow_model_does_not_freeze_the_rest_of_the_ui(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    """The one handler here that is `async def` must not hold the event loop.
+
+    A provider call has a timeout measured in minutes. Awaiting it on the loop
+    would stall every other request behind it, /health included - which is what
+    the Supervisor watches to decide the add-on is alive.
+    """
+    import asyncio
+
+    app = _drafting_app(
+        ha_config_dir, store, fake_client, monkeypatch,
+        reply={"rule": "A worded rule."}, delay=1.0,
+    )
+
+    async def call(method: str, path: str, body: bytes = b""):
+        sent: list[dict] = []
+        scope = {
+            "type": "http", "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": "1.1", "method": method, "scheme": "http",
+            "path": path, "raw_path": path.encode(), "query_string": b"",
+            "root_path": "", "client": ("172.30.32.2", 5000),
+            "server": ("testserver", 80),
+            "headers": [(b"host", b"testserver"), (b"content-type", b"application/json")],
+        }
+
+        async def receive():
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        async def send(message):
+            sent.append(message)
+
+        await app(scope, receive, send)
+        status = next(m["status"] for m in sent if m["type"] == "http.response.start")
+        return status
+
+    async def both():
+        # Timed from before the slow request is scheduled, not from the health
+        # call: a handler that blocks the loop runs to completion first, so the
+        # health call itself would look fast while the whole UI had stalled.
+        started = time.monotonic()
+        slow = asyncio.create_task(
+            call("POST", "/api/preferences/draft", b'{"instruction": "narrow it"}')
+        )
+        await asyncio.sleep(0.1)  # let the slow request reach the provider
+        health = await call("GET", "/api/health")
+        elapsed = time.monotonic() - started
+        answered_while_waiting = not slow.done()
+        return health, elapsed, answered_while_waiting, await slow
+
+    health_status, elapsed, answered_while_waiting, draft_status = asyncio.run(both())
+    assert (health_status, draft_status) == (200, 200)
+    assert answered_while_waiting, "/health only answered once the model call had finished"
+    assert elapsed < 0.5, f"/health waited {elapsed:.2f}s behind a model call"
