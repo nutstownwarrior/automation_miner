@@ -3,9 +3,18 @@
 from __future__ import annotations
 
 import datetime as dt
+import os
+import random
+from zoneinfo import ZoneInfo
 
 import pytest
-from amminer.backtest import backtest, backtest_all, ground_truth_actions, simulate_fires
+from amminer.backtest import (
+    backtest,
+    backtest_all,
+    ground_truth_actions,
+    simulate_fires,
+    split_window,
+)
 from amminer.config import Options
 from amminer.enrich.signals import SignalSeries, SignalStore
 from amminer.miners.base import Action, Candidate, Condition, Trigger
@@ -220,7 +229,26 @@ def test_unsimulatable_trigger_is_rejected_not_crashed():
 
 
 def test_candidate_without_ground_truth_is_rejected():
+    """The rule fires (it is an unconditional daily trigger) against a truth
+    list that is empty - not "nothing to evaluate", but "evaluated, and every
+    single fire was wrong".  The ordinary floor/precision gate catches it."""
     result = backtest(daily_candidate(), [], SignalStore(), Options(), WINDOW)
+    assert result.true_fires == 0
+    assert result.passed is False
+    assert "too little to judge" in result.reason
+
+
+def test_a_candidate_with_neither_fires_nor_truth_gets_the_plain_refusal():
+    """The one case with genuinely nothing to evaluate: a trigger that never
+    fires, replayed against a period the user never did the thing either."""
+    candidate = Candidate(
+        miner="test",
+        title="never fires, never happened",
+        triggers=[Trigger(kind="state", entity_id="binary_sensor.never", to_state="on")],
+        actions=[Action(service="light.turn_on", entity_id="light.kitchen")],
+    )
+    result = backtest(candidate, [], SignalStore(), Options(), WINDOW)
+    assert result.simulated is False
     assert result.passed is False
     assert "no manual occurrences" in result.reason
 
@@ -681,3 +709,579 @@ def test_the_refusal_can_be_lifted_deliberately():
     assert result.simulated is True
     assert result.risky_domains == ["lock"]  # still on the stricter thresholds
     assert result.passed is True, result.reason
+
+
+# --- temporal holdout validation -----------------------------------------
+def test_split_window_is_a_wall_clock_split_of_the_final_fraction():
+    """A row-count split would let a habit that got denser near the end of the
+    window buy itself a bigger holdout; this must not move with the data."""
+    split = split_window(WINDOW, Options(backtest_holdout_fraction=0.25))
+    assert split.train == (WINDOW[0], WINDOW[0] + 21 * 86400.0)
+    assert split.holdout == (WINDOW[0] + 21 * 86400.0, WINDOW[1])
+    assert split.train_days == pytest.approx(21.0)
+    assert split.holdout_days == pytest.approx(7.0)
+
+
+def test_plain_backtest_never_validates_on_a_holdout():
+    """Without asking for it, backtest() is exactly what it always was."""
+    changes = [
+        human("light.kitchen", "on", (START + dt.timedelta(days=d, hours=6, minutes=30)).timestamp())
+        for d in range(DAYS)
+    ]
+    result = backtest(daily_candidate(), changes, SignalStore(), Options(), WINDOW)
+    assert result.validation == "in_sample"
+    assert result.holdout_evaluated is False
+    assert result.segments is None
+
+
+def test_a_habit_that_stopped_during_the_holdout_is_caught():
+    """The canonical overfit case this feature exists to catch: a habit that
+    was real for the first 21 days and then simply stopped.  The rule (an
+    unconditional daily trigger) keeps firing every day of the 7-day holdout
+    regardless - against zero real occurrences there.  In-sample this still
+    looks fine (75% precision over the whole window); it must not survive
+    being checked against the period it was not mined from."""
+    changes = [
+        human("light.kitchen", "on", (START + dt.timedelta(days=d, hours=6, minutes=30)).timestamp())
+        for d in range(21)
+    ]
+
+    options = Options()
+    in_sample = backtest(daily_candidate(), changes, SignalStore(), options, WINDOW)
+    assert in_sample.passed is True, in_sample.reason
+    assert in_sample.precision == pytest.approx(21 / 28)
+
+    validated = backtest(
+        daily_candidate(), changes, SignalStore(), options, WINDOW, validate_holdout=True
+    )
+    assert validated.validation == "holdout"
+    assert validated.holdout_reason == "behaviour_absent_in_holdout"
+    assert validated.holdout_days == pytest.approx(7.0)
+    assert validated.true_fires == 0
+    assert validated.false_fires == 7
+    assert validated.precision == 0.0
+    assert validated.passed is False
+    assert "appears to have stopped" in validated.reason
+    # The in-sample number is still visible for anyone who wants to see that
+    # this did look fine before being checked - it just is not what gated it.
+    assert validated.segments["full"]["passed"] is True
+
+
+def test_a_genuine_overfit_is_rejected_on_precision_not_the_evidence_floor():
+    """A habit that got materially worse (not absent) during the holdout: a
+    non-trivial number of real occurrences there, and the rule is still wrong
+    about most of them.  This must fail on PRECISION, not be let off because
+    there was not quite enough evidence to judge - the evidence floor for a
+    slice of the window is scaled to the same rate as the full-window one
+    (see the floor-scaling test below), and 4 correct fires clears it."""
+    changes = [
+        human("light.kitchen", "on", (START + dt.timedelta(days=d, hours=6, minutes=30)).timestamp())
+        for d in range(21)
+    ]
+    # Holdout (days 21-27): the rule still fires all 7 days, but the user only
+    # actually did it on 4 of them.
+    for d in (21, 22, 24, 26):
+        changes.append(
+            human("light.kitchen", "on", (START + dt.timedelta(days=d, hours=6, minutes=30)).timestamp())
+        )
+
+    validated = backtest(
+        daily_candidate(), changes, SignalStore(), Options(), WINDOW, validate_holdout=True
+    )
+    assert validated.validation == "holdout"
+    assert validated.holdout_reason == "evaluated"
+    assert validated.true_fires == 4
+    assert validated.false_fires == 3
+    assert validated.true_fires >= 1  # comfortably clears the scaled evidence floor
+    assert validated.passed is False
+    assert "precision" in validated.reason
+    assert "too little to judge" not in validated.reason
+
+
+def test_a_three_observation_candidate_is_still_rejected():
+    """Regression probe: 3 total real occurrences (2 in training, 1 in the
+    holdout) must be rejected under holdout validation exactly as a plain
+    backtest rejects it - a floor scaled all the way down to 1 observation is
+    not a floor, and the full-window requirement (which this candidate also
+    fails outright, at 3 < 4) is additive, not something a holdout slice can
+    ever substitute for."""
+    candidate = Candidate(
+        miner="test",
+        title="three observations",
+        triggers=[Trigger(kind="state", entity_id="binary_sensor.door", to_state="on")],
+        actions=[Action(service="light.turn_on", entity_id="light.kitchen")],
+    )
+    store = SignalStore()
+    series = SignalSeries("binary_sensor.door")
+    changes = []
+    for day in (5, 10, 25):  # two in training, one in the holdout
+        ts = (START + dt.timedelta(days=day, hours=18)).timestamp()
+        series.add(ts - 30, "on")
+        series.add(ts - 20, "off")
+        changes.append(human("light.kitchen", "on", ts))
+    store.add(series)
+
+    plain = backtest(candidate, changes, store, Options(), WINDOW)
+    assert plain.true_fires == 3
+    assert plain.passed is False
+    assert "too little to judge" in plain.reason  # 3 < the unscaled floor of 4
+
+    validated = backtest(candidate, changes, store, Options(), WINDOW, validate_holdout=True)
+    assert validated.passed is False, "a single holdout observation must not clear any floor"
+    assert "fails the full-window check" in validated.reason
+
+
+def test_the_evidence_floor_is_scaled_but_never_below_two_and_always_additive():
+    """A candidate with real evidence in both segments - 4 total, split 2 and
+    2 - clears the full-window floor of 4 outright and the holdout's own
+    floor scaled to its quarter-share (``max(2, ceil(4 * 0.25)) == 2``).  This
+    is what the scaling exists for: neither segment's floor is the whole-
+    window count applied unchanged, but neither is a single observation."""
+    candidate = Candidate(
+        miner="test",
+        title="four observations",
+        triggers=[Trigger(kind="state", entity_id="binary_sensor.door", to_state="on")],
+        actions=[Action(service="light.turn_on", entity_id="light.kitchen")],
+    )
+    store = SignalStore()
+    series = SignalSeries("binary_sensor.door")
+    changes = []
+    for day in (5, 10, 22, 25):  # two in training, two in the holdout
+        ts = (START + dt.timedelta(days=day, hours=18)).timestamp()
+        series.add(ts - 30, "on")
+        series.add(ts - 20, "off")
+        changes.append(human("light.kitchen", "on", ts))
+    store.add(series)
+
+    validated = backtest(candidate, changes, store, Options(), WINDOW, validate_holdout=True)
+    assert validated.validation == "holdout"
+    assert validated.holdout_reason == "evaluated"
+    assert validated.true_fires == 2  # the holdout's own count
+    assert validated.passed is True, validated.reason
+
+
+def test_insufficient_history_falls_back_to_in_sample_and_says_so():
+    """A window too short for a trustworthy holdout must not silently pass
+    (nor silently fail) on one - it falls back, and the fallback is labelled."""
+    short_window = (START.timestamp(), (START + dt.timedelta(days=10)).timestamp())
+    changes = [
+        human("light.kitchen", "on", (START + dt.timedelta(days=d, hours=6, minutes=30)).timestamp())
+        for d in range(10)
+    ]
+    options = Options()  # backtest_holdout_fraction=0.25 -> 2.5 days, below the 7-day floor
+    plain = backtest(daily_candidate(), changes, SignalStore(), options, short_window)
+    validated = backtest(
+        daily_candidate(), changes, SignalStore(), options, short_window, validate_holdout=True
+    )
+    assert validated.validation == "in_sample"
+    assert validated.holdout_reason == "insufficient_history"
+    assert validated.holdout_evaluated is True
+    assert validated.holdout_days == pytest.approx(2.5)
+    assert validated.train_days == pytest.approx(7.5)
+    # Falling back means exactly that: the same verdict a plain backtest gives.
+    assert validated.passed == plain.passed
+    assert validated.true_fires == plain.true_fires
+    assert "not enough held-out history" in validated.validation_note()
+
+
+def test_no_activity_in_holdout_falls_back_to_in_sample_and_says_so():
+    """Duration is fine, but genuinely nothing happened in the holdout either
+    way - not "the habit stopped" (the rule never fired there at all) and not
+    "not enough evidence" (there is none) - so there is nothing to judge it on
+    and the whole window is used instead, distinctly labelled from both."""
+    candidate = Candidate(
+        miner="test",
+        title="conditional, quiet lately",
+        triggers=[Trigger(kind="state", entity_id="binary_sensor.door", to_state="on")],
+        actions=[Action(service="light.turn_on", entity_id="light.kitchen")],
+    )
+    store = SignalStore()
+    series = SignalSeries("binary_sensor.door")
+    changes = []
+    # The door (and the light) only ever happened during the training slice.
+    for day in range(10):
+        ts = (START + dt.timedelta(days=day, hours=18)).timestamp()
+        series.add(ts - 30, "on")
+        series.add(ts - 20, "off")
+        changes.append(human("light.kitchen", "on", ts))
+    store.add(series)
+
+    result = backtest(candidate, changes, store, Options(), WINDOW, validate_holdout=True)
+    assert result.validation == "in_sample"
+    assert result.holdout_reason == "no_activity_in_holdout"
+    assert "nothing happened in the held-out period" in result.validation_note()
+
+
+def test_a_real_habit_with_enough_history_is_validated_on_the_holdout():
+    changes = [
+        human("light.kitchen", "on", (START + dt.timedelta(days=d, hours=6, minutes=30)).timestamp())
+        for d in range(DAYS)
+    ]
+    result = backtest(
+        daily_candidate(), changes, SignalStore(), Options(), WINDOW, validate_holdout=True
+    )
+    assert result.validation == "holdout"
+    assert result.holdout_reason == "evaluated"
+    assert result.holdout_days == pytest.approx(7.0)
+    assert result.passed is True, result.reason
+    assert result.true_fires == 7  # only the holdout week counts now
+    assert "Validated on 7 days" in result.validation_note()
+
+
+def test_backtest_all_defaults_to_holdout_validation():
+    good = daily_candidate()
+    changes = [
+        human("light.kitchen", "on", (START + dt.timedelta(days=d, hours=6, minutes=30)).timestamp())
+        for d in range(DAYS)
+    ]
+    passed, _rejected = backtest_all([good], changes, SignalStore(), Options(), WINDOW)
+    assert passed[0].backtest["validation"] == "holdout"
+
+
+def test_a_result_that_never_reaches_holdout_still_has_a_validation_note():
+    """A blank validation line would be indistinguishable from a validated
+    card - every result, validated or not, says something."""
+    plain = backtest(daily_candidate(), [], SignalStore(), Options(), WINDOW)
+    assert plain.validation_note() == "Not checked against held-out history."
+    audit = backtest(
+        Candidate(miner="stale_automation", title="stale", entities=["automation.x"]),
+        [], SignalStore(), Options(), WINDOW,
+    )
+    assert audit.validation_note() == "Not checked against held-out history."
+
+
+# --- risky domains must never become easier to pass than before this PR --
+def test_a_lock_with_training_only_misfires_is_still_rejected():
+    """Regression probe: a lock rule with 4 spurious motion-triggered
+    misfires, all of them during training, and a clean holdout.  Under a
+    holdout that replaces full-window gating instead of adding to it, the
+    clean holdout alone would have surfaced this; the full-window false-fire
+    budget (zero, for a risky domain) is the pre-PR bar and must still apply
+    regardless of how clean the holdout looks in isolation."""
+    candidate = Candidate(
+        miner="test",
+        title="lock on motion",
+        triggers=[Trigger(kind="state", entity_id="binary_sensor.motion", to_state="on")],
+        actions=[Action(service="lock.lock", entity_id="lock.front_door")],
+    )
+    store = SignalStore()
+    series = SignalSeries("binary_sensor.motion")
+    changes = []
+    for day in range(28):  # 28 real lock events, one a day, every day
+        ts = (START + dt.timedelta(days=day, hours=18)).timestamp()
+        series.add(ts - 30, "on")
+        series.add(ts - 20, "off")
+        changes.append(human("lock.front_door", "locked", ts))
+    for day in (2, 4, 6, 8):  # 4 spurious motion events, training only
+        spurious = (START + dt.timedelta(days=day, hours=3)).timestamp()
+        series.add(spurious, "on")
+        series.add(spurious + 10, "off")
+    store.add(series)
+
+    plain = backtest(candidate, changes, store, Options(), WINDOW)
+    assert plain.risky_domains == ["lock"]
+    assert plain.false_fires == 4
+    assert plain.passed is False, "the pre-PR bar this rule must still clear"
+
+    validated = backtest(candidate, changes, store, Options(), WINDOW, validate_holdout=True)
+    assert validated.risky_domains == ["lock"]
+    assert validated.passed is False, (
+        "training-only misfires must not be forgiven because the holdout looks clean"
+    )
+    assert "fails the full-window check" in validated.reason
+
+
+def test_a_risky_rule_that_only_passed_full_window_gating_is_now_rejected():
+    """A lock rule with a spotless record for three weeks (0 false fires ever,
+    so it clears the risky domain's zero-tolerance nuisance budget and its
+    precision floor identically under either kind of gating) - but during the
+    holdout the user's actual locking stopped lining up with the rule's
+    trigger at all: real lock-events still happen, the motion trigger just
+    never catches any of them any more.  Averaged over the whole window this
+    still reads as a healthy, passing rule; it must not survive being checked
+    against the week it stopped actually firing correctly."""
+    candidate = Candidate(
+        miner="test",
+        title="lock on motion",
+        triggers=[Trigger(kind="state", entity_id="binary_sensor.motion", to_state="on")],
+        actions=[Action(service="lock.lock", entity_id="lock.front_door")],
+    )
+    store = SignalStore()
+    series = SignalSeries("binary_sensor.motion")
+    changes = []
+    for day in range(21):  # training: motion and the lock line up every day
+        ts = (START + dt.timedelta(days=day, hours=18)).timestamp()
+        series.add(ts - 30, "on")
+        series.add(ts - 20, "off")
+        changes.append(human("lock.front_door", "locked", ts))
+    for day in range(21, 28):  # holdout: the lock still happens, motion does not
+        ts = (START + dt.timedelta(days=day, hours=18)).timestamp()
+        changes.append(human("lock.front_door", "locked", ts))
+    store.add(series)
+
+    options = Options()
+    plain = backtest(candidate, changes, store, options, WINDOW)
+    assert plain.risky_domains == ["lock"]
+    assert plain.false_fires == 0
+    assert plain.true_fires == 21
+    assert plain.precision == 1.0
+    assert plain.passed is True, plain.reason  # clears every risky floor today
+
+    validated = backtest(candidate, changes, store, options, WINDOW, validate_holdout=True)
+    assert validated.validation == "holdout"
+    assert validated.risky_domains == ["lock"]
+    assert validated.true_fires == 0  # the rule never actually fired in the holdout
+    assert validated.missed == 7  # against seven real lock-events it did not catch
+    assert validated.passed is False, "a lock must never become easier to pass than before"
+
+
+def test_a_risky_rules_true_fires_floor_is_checked_against_the_full_window():
+    """The floor itself (12 correct fires) is deliberately NOT scaled down for
+    a risky domain.  Ten correct fires, none wrong, three of them inside the
+    holdout: a floor scaled to the holdout's quarter-share of the window
+    (``ceil(12 * 0.25) == 3``) would let this pass on exactly its 3 holdout
+    occurrences.  It must instead still fail, on the true, unscaled floor of
+    12 checked against all ten."""
+    candidate = Candidate(
+        miner="test",
+        title="lock on motion, thin evidence",
+        triggers=[Trigger(kind="state", entity_id="binary_sensor.motion", to_state="on")],
+        actions=[Action(service="lock.lock", entity_id="lock.front_door")],
+    )
+    store = SignalStore()
+    series = SignalSeries("binary_sensor.motion")
+    changes = []
+    for day in (0, 3, 6, 9, 12, 15, 18, 22, 24, 26):  # 7 in training, 3 in the holdout
+        ts = (START + dt.timedelta(days=day, hours=18)).timestamp()
+        series.add(ts - 30, "on")
+        series.add(ts - 20, "off")
+        changes.append(human("lock.front_door", "locked", ts))
+    store.add(series)
+
+    validated = backtest(candidate, changes, store, Options(), WINDOW, validate_holdout=True)
+    assert validated.validation == "holdout"
+    assert validated.true_fires == 3  # the holdout's own count: a perfect precision
+    assert validated.precision == 1.0  # if the floor were the only thing scaled down
+    assert validated.passed is False, "10 total fires must still fail the unscaled 12-fire floor"
+    assert "at least 12 needed" in validated.reason
+    assert validated.risky_domains == ["lock"]
+
+
+def test_a_risky_rule_with_genuine_evidence_can_still_surface():
+    """RISKY_MIN_TRUE_FIRES (12) unscaled on BOTH the full window and a
+    7-day holdout demanded nearly two correct lock-fires a day - practically
+    unreachable, and a real product regression.  The holdout-side floor is
+    scaled to the rate the full-window one represents (same as an ordinary
+    rule), so a lock with real, consistent evidence across the whole window
+    can surface; the full-window floor stays the unscaled 12 it always was."""
+    candidate, changes, store = _repeating("lock.lock", "lock.front_door", days=28)
+    validated = backtest(candidate, changes, store, Options(), WINDOW, validate_holdout=True)
+    assert validated.validation == "holdout"
+    assert validated.risky_domains == ["lock"]
+    assert validated.passed is True, validated.reason
+
+
+def test_a_risky_rule_with_too_little_evidence_never_becomes_easier():
+    """The same shape of rule, but with only 10 correct fires (all inside
+    training, so the holdout falls back to in-sample) - below the unscaled
+    12-fire floor, exactly as it always was.  Holdout validation must never
+    make this pass when a plain backtest would not have."""
+    candidate, changes, store = _repeating("lock.lock", "lock.front_door", days=10)
+    plain = backtest(candidate, changes, store, Options(), WINDOW)
+    assert plain.passed is False
+    validated = backtest(candidate, changes, store, Options(), WINDOW, validate_holdout=True)
+    assert validated.passed is False, "must never be easier to pass than the plain backtest"
+
+
+def test_a_configured_min_true_fires_of_one_is_honoured_on_the_full_window():
+    """backtest_min_true_fires: 1 is schema-permitted.  The full-window floor
+    must use it exactly - not silently raised to the holdout side's minimum
+    of 2, which exists only to keep a SCALED floor meaningful."""
+    once = (START + dt.timedelta(days=3, hours=6, minutes=30)).timestamp()
+    candidate = Candidate(
+        miner="test",
+        title="single occurrence",
+        triggers=[Trigger(kind="state", entity_id="binary_sensor.door", to_state="on")],
+        actions=[Action(service="light.turn_on", entity_id="light.kitchen")],
+    )
+    store = SignalStore()
+    series = SignalSeries("binary_sensor.door")
+    series.add(once - 30, "on")
+    store.add(series)
+    changes = [human("light.kitchen", "on", once)]
+
+    options = Options(backtest_min_true_fires=1)
+    plain = backtest(candidate, changes, store, options, WINDOW)
+    assert plain.true_fires == 1
+    assert plain.passed is True, plain.reason
+
+    # And the same full-window floor applies unmodified inside the additive
+    # holdout path - this candidate has no holdout activity at all, so it
+    # falls back to exactly this verdict.
+    validated = backtest(candidate, changes, store, options, WINDOW, validate_holdout=True)
+    assert validated.holdout_reason == "no_activity_in_holdout"
+    assert validated.passed is True, validated.reason
+
+
+# --- a structural invariant: holdout validation is additive, never easier -
+def test_holdout_validation_never_passes_what_the_full_window_would_reject():
+    """Randomised regression guard for the property the additive design exists
+    to guarantee: passing with ``validate_holdout=True`` must always imply the
+    plain, full-window backtest also passes.  This is a direct consequence of
+    ``chosen.passed = result.passed and holdout_result.passed`` (and every
+    other branch either returning the plain result outright or forcing an
+    extra failure) - not a search for a counterexample so much as a standing
+    guard against a future change to this file quietly breaking it, which
+    matters more here than in most modules: three more PRs build on this one.
+
+    Deliberately in-memory and seeded: no recorder, no I/O, so it stays fast
+    and exactly repeatable.
+    """
+    rng = random.Random(20240912)
+    options_pool = [
+        Options(),
+        Options(backtest_min_true_fires=1),
+        Options(backtest_min_true_fires=2),
+        Options(backtest_holdout_fraction=0.3),
+        Options(backtest_holdout_fraction=0.1),
+        Options(backtest_min_precision=0.5),
+        Options(backtest_max_false_fires_per_week=1.0),
+    ]
+    densities = (0.9, 0.7, 0.5, 0.3, 0.1, 0.0, 1.0)
+    services = (
+        ("light.turn_on", "light.kitchen"),
+        ("lock.lock", "lock.front_door"),
+    )
+
+    checked = 0
+    for _ in range(200):
+        service, entity_id = rng.choice(services)
+        target = "locked" if service == "lock.lock" else "on"
+        fire_days = {d for d in range(28) if rng.random() < rng.choice(densities)}
+        truth_days = {d for d in range(28) if rng.random() < rng.choice(densities)}
+
+        store = SignalStore()
+        series = SignalSeries("binary_sensor.trigger")
+        for day in sorted(fire_days):
+            ts = (START + dt.timedelta(days=day, hours=12)).timestamp()
+            series.add(ts - 30, "on")
+            series.add(ts - 20, "off")
+        store.add(series)
+        changes = [
+            human(entity_id, target, (START + dt.timedelta(days=day, hours=12)).timestamp())
+            for day in sorted(truth_days)
+        ]
+        candidate = Candidate(
+            miner="test",
+            title="property",
+            triggers=[Trigger(kind="state", entity_id="binary_sensor.trigger", to_state="on")],
+            actions=[Action(service=service, entity_id=entity_id)],
+        )
+        options = rng.choice(options_pool)
+
+        plain = backtest(candidate, changes, store, options, WINDOW)
+        validated = backtest(candidate, changes, store, options, WINDOW, validate_holdout=True)
+        checked += 1
+        if validated.passed:
+            assert plain.passed, (
+                "holdout validation passed a candidate the full window would not",
+                vars(options), sorted(fire_days), sorted(truth_days),
+            )
+    assert checked == 200
+
+
+# --- the split point is a local-day boundary, and survives DST ----------
+def test_a_mid_day_split_snaps_to_the_nearer_local_midnight():
+    """A window whose raw split lands mid-afternoon must not cut a day in
+    half between the miners and the backtester.  40 days leaves both segments
+    comfortably clear of their minimums after the snap moves the point by up
+    to half a day."""
+    start = dt.datetime(2024, 3, 1, 6, 0, tzinfo=local_tz())  # not midnight
+    end = start + dt.timedelta(days=40)
+    window = (start.timestamp(), end.timestamp())
+    split = split_window(window, Options(backtest_holdout_fraction=0.25))
+    moment = dt.datetime.fromtimestamp(split.train[1], local_tz())
+    assert moment.time() == dt.time(0, 0), moment
+
+
+def test_snapping_backs_off_when_it_would_violate_the_minimums():
+    """Snapping must never itself be the reason a split stops being viable."""
+    start = dt.datetime(2024, 3, 1, 0, 0, tzinfo=local_tz())
+    end = start + dt.timedelta(days=10)  # raw split at start+7.5 days
+    window = (start.timestamp(), end.timestamp())
+    options = Options(backtest_holdout_fraction=0.25)  # min_train_days=14 by default
+    split = split_window(window, options)
+    # Neither neighbouring midnight (day 7 or day 8) leaves 14 training days
+    # available in a 10-day window, so the raw, unsnapped point is kept.
+    assert split.train_days == pytest.approx(7.5)
+    assert split.holdout_days == pytest.approx(2.5)
+
+
+def test_split_survives_a_daylight_saving_transition():
+    """US clocks spring forward on 2024-03-10: that day is 23 wall-clock hours
+    long.  The split must still land on a calendar midnight and produce a
+    sane, non-inverted train/holdout pair either side of it."""
+    tz = ZoneInfo("America/New_York")
+    start = dt.datetime(2024, 2, 20, 0, 0, tzinfo=tz)
+    end = dt.datetime(2024, 3, 21, 0, 0, tzinfo=tz)  # straddles the transition
+    window = (start.timestamp(), end.timestamp())
+    options = Options(
+        backtest_holdout_fraction=0.25, backtest_min_train_days=1, backtest_min_holdout_days=1,
+    )
+
+    previous = os.environ.get("TZ")
+    os.environ["TZ"] = "America/New_York"
+    try:
+        split = split_window(window, options)
+    finally:
+        if previous is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous
+
+    moment = dt.datetime.fromtimestamp(split.train[1], tz)
+    assert moment.time() == dt.time(0, 0), moment
+    assert split.train[1] < split.holdout[1]
+    assert split.train_days > 0
+    assert split.holdout_days > 0
+    # Both segments are whole calendar days give or take the one hour the
+    # transition itself removed from wall-clock time that week - not several
+    # hours adrift the way an un-snapped, un-guarded split could be.
+    assert split.train_days == pytest.approx(round(split.train_days), abs=0.05)
+
+
+def test_snapping_handles_a_local_midnight_that_does_not_exist():
+    """Brazil used to start daylight saving exactly at midnight (last used
+    2018-11-04): 00:00-00:59 never happened on the wall clock that day, and
+    naively combining a date with time(0, 0) in that zone silently resolves
+    to 01:00 once round-tripped through its own timestamp.  The snap must
+    land on that date regardless, not drift onto the wrong day or hour."""
+    tz = ZoneInfo("America/Sao_Paulo")
+    naive_midnight = dt.datetime(2018, 11, 4, 0, 0, tzinfo=tz)
+    resolved_elsewhere = dt.datetime.fromtimestamp(naive_midnight.timestamp(), tz)
+    assert resolved_elsewhere.date() == dt.date(2018, 11, 4)
+    assert resolved_elsewhere.hour != 0, "the probe itself must exercise the nonexistent time"
+
+    start = dt.datetime(2018, 10, 25, 0, 0, tzinfo=tz)
+    end = dt.datetime(2018, 11, 14, 0, 0, tzinfo=tz)  # straddles 2018-11-04
+    window = (start.timestamp(), end.timestamp())
+    options = Options(
+        backtest_holdout_fraction=0.5, backtest_min_train_days=1, backtest_min_holdout_days=1,
+    )
+
+    previous = os.environ.get("TZ")
+    os.environ["TZ"] = "America/Sao_Paulo"
+    try:
+        split = split_window(window, options)
+    finally:
+        if previous is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous
+
+    moment = dt.datetime.fromtimestamp(split.train[1], tz)
+    # The raw split lands on 2018-11-04; snapping must keep it on that date -
+    # not silently drift to the 3rd or the 5th - and use the first moment
+    # that date actually has, rather than an untested guess.
+    assert moment.date() == dt.date(2018, 11, 4), moment
+    assert moment.hour in (0, 1), moment

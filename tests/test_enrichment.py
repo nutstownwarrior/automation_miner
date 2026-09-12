@@ -153,6 +153,54 @@ def test_attribute_series_are_extracted():
     assert store.numeric_at("weather.home#temperature", 200.0) == 9.5
 
 
+class _StubStatisticsQueries:
+    """Just enough of RecorderQueries to exercise the statistics fallback."""
+
+    def __init__(self, rows):
+        self._rows = rows
+
+    def statistic_ids(self):
+        return {row["statistic_id"] for row in self._rows}
+
+    def statistics(self, statistic_ids, start_ts, end_ts):
+        return [
+            row for row in self._rows
+            if row["statistic_id"] in statistic_ids
+            and (start_ts is None or row["start_ts"] >= start_ts)
+            and (end_ts is None or row["start_ts"] < end_ts)
+        ]
+
+
+def test_a_bucket_that_closes_at_or_past_the_boundary_is_not_used():
+    """A hunt for train/holdout leakage: an hourly mean is a training-time
+    value only if the WHOLE hour it covers closed STRICTLY before the
+    boundary - the query's own start_ts < end_ts filter alone lets in a
+    bucket whose mean covers up to fifty-nine minutes past it, and a bucket
+    landing exactly on the boundary is itself holdout by the same ``ts <
+    split`` convention the raw state changes are split on."""
+    from amminer.enrich.signals import STATISTICS_INTERVAL_SECONDS
+
+    boundary = 1_000_000.0
+    queries = _StubStatisticsQueries([
+        # Closes well before the boundary: must be used.
+        {"statistic_id": "sensor.temp", "start_ts": boundary - 7200, "mean": 10.0},
+        # Starts before the boundary but its hour only closes after it: must
+        # not be used as training data.
+        {"statistic_id": "sensor.temp", "start_ts": boundary - 1800, "mean": 99.0},
+        # Closes exactly on the boundary: the point it would be stamped at is
+        # itself the first holdout instant, not the last training one.
+        {"statistic_id": "sensor.temp",
+         "start_ts": boundary - STATISTICS_INTERVAL_SECONDS, "mean": 77.0},
+    ])
+    store = build_signal_store([], ["sensor.temp"], queries, (boundary - 86400, boundary))
+    series = store.get("sensor.temp")
+    assert series is not None
+    assert all(ts < boundary for ts in series.times), series.times
+    assert 99.0 not in series.values
+    assert 77.0 not in series.values
+    assert series.numeric_at(boundary - 7200 + STATISTICS_INTERVAL_SECONDS) == 10.0
+
+
 def test_long_term_statistics_fill_in_short_raw_history(queries, fixture_db):
     """LTS survives purge_keep_days - it must be used when raw history is thin."""
     _path, truth = fixture_db

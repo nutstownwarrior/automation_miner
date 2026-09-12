@@ -58,6 +58,18 @@ def test_values_are_coerced_and_clamped():
     assert options.run_on_start is False
 
 
+def test_holdout_options_default_and_clamp():
+    assert Options().backtest_holdout_fraction == 0.25
+    assert Options().backtest_min_holdout_days == 7
+    assert Options().backtest_min_train_days == 14
+    options = Options(
+        backtest_holdout_fraction=1.5, backtest_min_holdout_days=0, backtest_min_train_days=-1
+    )
+    assert options.backtest_holdout_fraction == 0.9  # never the whole window
+    assert options.backtest_min_holdout_days == 1
+    assert options.backtest_min_train_days == 1
+
+
 def test_default_exclusions_are_always_applied():
     options = Options(excluded_entities=["light.mine"])
     assert options.is_excluded("sensor.time") is True

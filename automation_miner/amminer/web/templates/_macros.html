@@ -32,6 +32,11 @@
       {% if backtest.nuisance_fires %}<div><dt>Nuisance</dt><dd>{{ backtest.nuisance_fires }}</dd></div>{% endif %}
     </dl>
     {% endif %}
+    {% if backtest.validation_note %}
+    <p class="small {{ 'ok' if backtest.passed else 'warn' }}">
+      {{ backtest.validation_note }}
+    </p>
+    {% endif %}
     <p class="muted small">{{ backtest.reason }}</p>
   </div>
   {% endif %}

@@ -385,11 +385,44 @@ def run_analysis(
         # the run.  The miners that used to take the smaller one look entities
         # up by id and never enumerate it, so they see exactly what they did.
         all_entities = sorted({c.entity_id for c in changes} | set(signals.all_entities))
-        full_store = build_signal_store(changes, all_entities, queries, (start_ts, end_ts))
-        signal_store = full_store
+        window = (start_ts, end_ts)
+        # The full window, used below for the backtest step (which needs to
+        # see the holdout to judge candidates against it) and for the audit
+        # miner (see the note by that call): unlike everything mined for a
+        # suggestion, staleness is a fact about age and configuration, not a
+        # statistical pattern being generalised, so there is nothing for it to
+        # leak by seeing the whole window.
+        full_store = build_signal_store(changes, all_entities, queries, window)
+
+        # --- train/holdout split ---------------------------------------
+        # The final slice of the window is never mined from - only used, in
+        # the backtest step below, to judge what was mined from the rest.  A
+        # candidate a miner never saw the holdout to build cannot have been
+        # shaped by it, which is the whole point: precision measured there is
+        # a genuine estimate of how the rule does on history it has not seen,
+        # not a report card on the exam it was allowed to study from.
+        split = backtest_module.split_window(window, options)
+        train_window = split.train
+        train_changes = [c for c in changes if c.ts < train_window[1]]
+        # Its own store, built from training rows alone, so a conditional
+        # miner cannot read a signal's holdout-period values either - a
+        # temperature threshold picked with next week's readings in view would
+        # leak exactly the same way a trigger time picked from them would.
+        train_store = build_signal_store(train_changes, all_entities, queries, train_window)
+        if (
+            split.holdout_days < options.backtest_min_holdout_days
+            or split.train_days < options.backtest_min_train_days
+        ):
+            report.degradations.append(
+                f"Only {split.holdout_days:.1f} days of history can be held out to validate "
+                f"suggestions against (need at least {options.backtest_min_holdout_days}), "
+                f"leaving {split.train_days:.1f} to mine from (need at least "
+                f"{options.backtest_min_train_days}). Suggestions are graded against the "
+                "whole analysis window instead of history they were not mined from, until "
+                "there is more of it."
+            )
 
         # --- mining ---------------------------------------------------
-        window = (start_ts, end_ts)
         produced: dict[str, list[Candidate]] = {}
 
         def run_miner(name, func, *args):
@@ -411,35 +444,41 @@ def run_analysis(
                 return []
 
         produced["time_of_day"] = run_miner(
-            "time_of_day", time_of_day.mine, changes, options, window, resolver
+            "time_of_day", time_of_day.mine, train_changes, options, train_window, resolver
         )
         produced["conditional"] = run_miner(
-            "conditional", conditional.mine, changes, options, signals, signal_store, window,
-            resolver,
+            "conditional", conditional.mine, train_changes, options, signals, train_store,
+            train_window, resolver,
         )
         produced["motif"] = run_miner(
-            "motif", motif.mine, changes, options, full_store, window, resolver
+            "motif", motif.mine, train_changes, options, train_store, train_window, resolver
         )
         produced["energy_shift"] = run_miner(
-            "energy_shift", energy.mine, changes, options, signals, signal_store, window, resolver
+            "energy_shift", energy.mine, train_changes, options, signals, train_store,
+            train_window, resolver,
         )
 
-        if report.window_days >= MIN_DAYS_FOR_SEQUENCE_MINING:
+        if split.train_days >= MIN_DAYS_FOR_SEQUENCE_MINING:
             produced["association"] = run_miner(
-                "association", association.mine, changes, options, window, resolver
+                "association", association.mine, train_changes, options, train_window, resolver
             )
             produced["sequence"] = run_miner(
-                "sequence", sequence.mine, changes, options, window, resolver
+                "sequence", sequence.mine, train_changes, options, train_window, resolver
             )
         else:
             produced["association"] = []
             produced["sequence"] = []
             report.degradations.append(
-                f"Only {report.window_days:.1f} days of history (< "
+                f"Only {split.train_days:.1f} days of training history (< "
                 f"{MIN_DAYS_FOR_SEQUENCE_MINING}): association and sequence mining are disabled. "
                 "Switch the recorder to MariaDB and raise purge_keep_days to enable them."
             )
 
+        # Deliberately the full window, not train_changes/train_window: a stale
+        # or unused automation is found by its age and configuration
+        # (last_triggered, whether anything still references it), not by
+        # mining a behavioural pattern that then has to generalise.  There is
+        # no train/holdout split to leak across here.
         audit_findings = run_miner(
             "audit", stale.mine, changes, resolver, options, window, override_counts
         )
@@ -470,6 +509,19 @@ def run_analysis(
             passed, rejected = [], list(mined)
         else:
             passed, rejected = backtested
+            # holdout validation is per-candidate: the window can be long
+            # enough for a trustworthy split and a particular candidate can
+            # still have had nothing happen in it either way (see
+            # BacktestResult.holdout_reason).  That is worth a run-level note
+            # too, distinct from "the window itself was too short" above.
+            if any(
+                (c.backtest or {}).get("holdout_reason") == "no_activity_in_holdout"
+                for c in passed + rejected
+            ):
+                report.degradations.append(
+                    "Some suggestions had no activity in the held-out period to check them "
+                    "against, so they were graded on the whole analysis window instead."
+                )
         # --- AI hypotheses: propose, then measure with the same gate ---
         if provider is not None and options.llm_hypotheses and rejected:
             hypotheses = run_ai(
@@ -483,6 +535,7 @@ def run_analysis(
                 provider,
                 resolver,
                 overrides,
+                train_store,
             )
             if hypotheses is not None and hypotheses.accepted:
                 accepted_origins = {

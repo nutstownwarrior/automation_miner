@@ -121,6 +121,25 @@ Unwanted fires allowed at moments where you have previously reached over and
 undone an automation on the same entity. These are not merely unnecessary - they
 land exactly where you have already said no - so the default is `0`.
 
+### `backtest_holdout_fraction`, `backtest_min_holdout_days`, `backtest_min_train_days`
+A suggestion is only as trustworthy as the numbers behind it, and a rule graded
+on the very history it was found in will always look better than it is. So the
+final `backtest_holdout_fraction` (default `0.25`) of the analysis window is
+held back: nothing is mined from it, and it is used only to judge what was
+mined from the rest.
+
+When there is enough of both - at least `backtest_min_holdout_days` (default
+`7`) of holdout and at least `backtest_min_train_days` (default `14`) of
+training history - a suggestion is gated on how it did on history it never
+saw, and its card says so ("validated on N days of held-out history"). If the
+rule would have fired during that period but the user never actually did the
+thing any more, that is treated as the habit having stopped - the suggestion
+is rejected outright, not given the benefit of the doubt. With too little
+history to trust a holdout at all, or with genuinely nothing having happened
+in it either way, it falls back to being judged on the whole window instead,
+and says so plainly ("in-sample only"). Either way, the same thresholds above
+decide pass or fail.
+
 ### `llm_gaps`
 Off by default. Lets the model propose integrations or hardware the built-in
 detector has no rule for.
