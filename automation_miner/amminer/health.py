@@ -31,10 +31,25 @@ Nothing here writes to Home Assistant, changes a suggestion, or disables
 anything. The worst an unhealthy verdict does is put a sentence of
 recommended action in front of the user - the retiring or retuning stays
 theirs to do.
+
+Two honesty rules this module holds itself to, beyond the evidence floors
+documented on the Options fields below:
+
+* An ``automation_triggered`` event fires whether the automation's own
+  trigger matched or a person (or another automation) called
+  ``automation.trigger`` by hand. Both count as "it ran" here - a manual
+  trigger is still real evidence about whether the rule does something
+  useful when it runs - but it means ``actual_fires`` answers "how many
+  times did this run", not "how many times did its configured trigger
+  condition genuinely match".
+* A single automation's health check failing (a corrupted or pre-migration
+  snapshot, most plausibly) must cost only that automation's verdict, never
+  every other one's - see :func:`evaluate_all`.
 """
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -46,6 +61,8 @@ from .enrich.signals import SignalStore
 from .llm.equivalence import matches
 from .recorderdb.models import OverrideEvent, RecorderEvent
 
+_LOGGER = logging.getLogger(__name__)
+
 STATUS_ACTIVE = "active"
 STATUS_DELETED = "deleted"
 STATUS_EDITED = "edited"
@@ -56,16 +73,24 @@ VERDICT_HEALTHY = "healthy"
 VERDICT_NOISY = "noisy"
 VERDICT_DORMANT = "dormant"
 VERDICT_OVERRIDDEN = "overridden"
+#: Still running, but firing far less often than the pattern it was built
+#: from says it should - distinct from dormant (zero real fires): this one
+#: fires occasionally, just not nearly as often as it should be able to.
+VERDICT_UNDERPERFORMING = "underperforming"
 VERDICT_INSUFFICIENT = "insufficient_data"
 #: Not a judgement on the rule's performance at all - shown instead of one of
 #: the verdicts above whenever there is nothing to measure yet (the structural
-#: statuses: deleted, edited, disabled, unresolved).
+#: statuses: deleted, edited, disabled, unresolved) or the check itself failed
+#: (status error).
 VERDICT_NA = "n/a"
 
-# The actual thresholds (how many days, how few predicted fires, which
-# override rates) are configurable Options - see config.py's
-# health_min_days / health_min_predicted_for_dormant /
-# health_noisy_override_rate / health_overridden_override_rate and their own
+STATUS_ERROR = "error"
+
+# The actual thresholds (how many days, how few predicted or actual fires,
+# which override rates and shortfall ratio) are configurable Options - see
+# config.py's health_min_days / health_min_predicted_for_dormant /
+# health_min_fires_for_verdict / health_noisy_override_rate /
+# health_overridden_override_rate / health_shortfall_ratio and their own
 # docstrings for the reasoning. They live there, not as module constants
 # here, for the same reason backtest_min_true_fires lives in Options rather
 # than in backtest.py: a threshold a user might reasonably want to loosen or
@@ -294,6 +319,23 @@ def evaluate(
         )
         return health
 
+    # A handful of real fires is not enough to trust a RATIO over them: one
+    # fire and one revert is override_rate=1.0 and a single observation with
+    # a percentage's name on it. Below this floor, every verdict that reads
+    # override_rate - healthy included, not only the alarming ones - would be
+    # confidence this module has no right to. Dormancy above needed no such
+    # floor because it asks a different question (did it fire *at all*), and
+    # underperformance and override verdicts below both need it because both
+    # are read straight off actual.
+    if actual < options.health_min_fires_for_verdict:
+        return _insufficient(
+            health,
+            f"Only fired {actual} time{'' if actual == 1 else 's'} in "
+            f"{days_evaluated:.0f} days - too few real fires yet to judge reliably "
+            f"(need at least {options.health_min_fires_for_verdict}).",
+            "Check back once it has fired more.",
+        )
+
     if override_rate is not None and override_rate >= options.health_overridden_override_rate:
         health.verdict = VERDICT_OVERRIDDEN
         health.evidence = (
@@ -315,6 +357,35 @@ def evaluate(
         )
         return health
 
+    # override_rate alone cannot see this: an automation nobody is undoing is
+    # not thereby healthy if it has almost stopped happening. Dormant is the
+    # actual==0 case; this is the case where it still fires sometimes but the
+    # pattern it was built from says it should be firing far more - the
+    # predicted-vs-actual divergence this module computes but, without this
+    # check, never actually used for anything.
+    #
+    # No separate "enough predicted fires to trust the ratio" floor is needed
+    # here the way dormancy has one: actual has already cleared
+    # health_min_fires_for_verdict above (>= 1, and by default 5), so a
+    # shortfall ratio below health_shortfall_ratio (by default 0.3) already
+    # implies predicted is at least actual / health_shortfall_ratio - several
+    # times the floor dormancy itself needs to trust a prediction. A small
+    # predicted count simply cannot produce a false shortfall here.
+    if predicted > 0:
+        fire_ratio = actual / predicted
+        if fire_ratio < options.health_shortfall_ratio:
+            health.verdict = VERDICT_UNDERPERFORMING
+            health.evidence = (
+                f"The pattern it was built from would have applied {predicted} times "
+                f"in {days_evaluated:.0f} days; it actually ran only {actual} of those "
+                f"({fire_ratio:.0%})."
+            )
+            health.recommendation = (
+                "Consider retiring or retuning it - it has largely stopped doing what "
+                "it was built for, even though it still fires occasionally."
+            )
+            return health
+
     health.verdict = VERDICT_HEALTHY
     health.evidence = (
         f"Fired {actual} time{'' if actual == 1 else 's'} in {days_evaluated:.0f} days, "
@@ -326,6 +397,34 @@ def evaluate(
     )
     health.recommendation = "No action needed."
     return health
+
+
+def _error_result(applied_row: dict[str, Any], err: Exception) -> AutomationHealth:
+    """A row this run could not judge - a bug or a corrupted/pre-migration
+    snapshot, most plausibly - reported as exactly that, not folded into
+    "not enough data" (a different claim, wrong here) or silently dropped.
+
+    ``applied_row``'s own columns (automation_id, title, applied_ts) come
+    straight from NOT NULL database columns, so reading them cannot be what
+    raised - it is always the arbitrary, unversioned JSON in
+    candidate_payload/shipped_config that can. Falling back to the id itself
+    for anything that still cannot be read keeps this from raising a second
+    time while building the very report meant to explain the first failure.
+    """
+    automation_id = str(applied_row.get("automation_id") or "unknown")
+    return AutomationHealth(
+        automation_id=automation_id,
+        title=str(applied_row.get("title") or automation_id),
+        applied_ts=float(applied_row.get("applied_ts") or 0.0),
+        days_since_applied=0.0,
+        status=STATUS_ERROR,
+        verdict=VERDICT_NA,
+        evidence=f"Could not check this automation's health this run: {type(err).__name__}: {err}",
+        recommendation=(
+            "No recommendation - this looks like a bug in the health check itself, "
+            "not a judgement about the automation. Check back after the next run."
+        ),
+    )
 
 
 def evaluate_all(
@@ -351,7 +450,13 @@ def evaluate_all(
     existing_by_id = {a.id: a for a in existing if a.id}
     results: list[AutomationHealth] = []
     for row in store.list_applied_automations():
-        result = evaluate(row, existing_by_id, events, signal_store, overrides, options, window)
+        try:
+            result = evaluate(row, existing_by_id, events, signal_store, overrides, options, window)
+        except Exception as err:  # noqa: BLE001 - one bad row must not blank every other verdict
+            _LOGGER.exception(
+                "Health check failed for %s: %s", row.get("automation_id"), err
+            )
+            result = _error_result(row, err)
         store.save_automation_health(
             result.automation_id, result.status, result.verdict, result.as_dict()
         )

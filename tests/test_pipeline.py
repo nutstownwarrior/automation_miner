@@ -181,6 +181,43 @@ def test_a_deleted_automation_is_reported_gone_by_a_real_run(
     assert applied["health"]["verdict"] == "n/a"
 
 
+def test_a_corrupt_applied_row_does_not_blank_the_others_health_from_a_real_run(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    """One malformed applied_automations row must cost only its own verdict -
+    every other applied automation's health still comes out of the same run."""
+    import time as time_module
+
+    _record_applied(
+        store, monkeypatch, "bedtime1", "Bedtime dim", "22:15:00", "light.bedroom",
+        applied_ts=0.0,
+    )
+    monkeypatch.setattr(time_module, "time", lambda: 0.0)
+    try:
+        # "holiday1" is automation.holiday_mode - a real, live, enabled
+        # automation in this fixture (states-only, so its config is never
+        # compared against shipped_config), giving evaluate() a live
+        # automation to proceed against far enough to actually attempt
+        # candidate_from_payload and hit the corrupt trigger shape.
+        store.record_applied_automation(
+            "holiday1", "sugg-broken", "Broken automation",
+            {"triggers": [{"kind": "state", "no_such_field": "x"}], "actions": []},
+            {"id": "holiday1"},
+        )
+    finally:
+        monkeypatch.undo()
+
+    report, _ = run(ha_config_dir, store, fake_client)
+    assert report.automations["checked"] == 2
+
+    good = store.get_applied_automation("bedtime1")
+    assert good["health"]["verdict"] in ("overridden", "noisy")
+
+    broken = store.get_applied_automation("holiday1")
+    assert broken["health"]["status"] == "error"
+    assert "could not check" in broken["health"]["payload"]["evidence"].lower()
+
+
 def test_gap_suggestions_are_produced(ha_config_dir, store, fake_client):
     run(ha_config_dir, store, fake_client)
     gaps = store.list_gaps()

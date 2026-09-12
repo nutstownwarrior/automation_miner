@@ -24,12 +24,18 @@
       {% if h %}
         {% if h.verdict == 'healthy' %}
         <span class="tag ok">healthy</span>
-        {% elif h.verdict in ('noisy', 'dormant') %}
+        {% elif h.verdict in ('noisy', 'overridden') %}
+        {# Noisy and overridden are one finding - a human undoing this
+           automation - at two severities of the same override rate, not two
+           different diagnoses. Same tag colour; the wording carries the
+           severity, and the exact rate is always in the sentence below. #}
+        <span class="tag warning">overridden - {{ 'severe' if h.verdict == 'overridden' else 'moderate' }}</span>
+        {% elif h.verdict in ('dormant', 'underperforming') %}
         <span class="tag warning">{{ h.verdict }}</span>
-        {% elif h.verdict == 'overridden' %}
-        <span class="tag error">overridden</span>
         {% elif h.verdict == 'insufficient_data' %}
         <span class="tag">not enough data yet</span>
+        {% elif h.status == 'error' %}
+        <span class="tag error">could not check</span>
         {% else %}
         <span class="tag">{{ h.status }}</span>
         {% endif %}
@@ -40,7 +46,7 @@
     </header>
     <h3>{{ a.title }}</h3>
     {% if h %}
-    <p class="small {{ 'ok' if h.verdict == 'healthy' else ('warn' if h.verdict in ('noisy', 'dormant', 'overridden') else '') }}">
+    <p class="small {{ 'ok' if h.verdict == 'healthy' else ('warn' if h.verdict in ('noisy', 'dormant', 'overridden', 'underperforming') else '') }}">
       {{ h.evidence }}
     </p>
     {% if h.status == 'active' and h.verdict not in ('insufficient_data',) %}
@@ -53,7 +59,7 @@
       <div><dt>Days evaluated</dt><dd>{{ h.days_evaluated }}</dd></div>
     </dl>
     {% endif %}
-    {% if h.verdict in ('dormant', 'overridden', 'noisy') %}
+    {% if h.verdict in ('dormant', 'overridden', 'noisy', 'underperforming') %}
     <p class="small warn"><strong>Suggested action:</strong> {{ h.recommendation }} This add-on will not do it for you.</p>
     {% endif %}
     {% for note in h.notes or [] %}<p class="small muted">{{ note }}</p>{% endfor %}

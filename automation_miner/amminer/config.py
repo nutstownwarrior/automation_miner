@@ -184,6 +184,18 @@ class Options:
     #: Share above which it is not "sometimes wrong" but "wrong most of the
     #: time it runs" - the recommendation escalates from retune to retire.
     health_overridden_override_rate: float = 0.6
+    #: Below this many *real* fires, an override rate is a ratio over almost
+    #: nothing - one fire and one revert is a 100% override rate and a single
+    #: observation with a percentage's name on it.  Below this floor a verdict
+    #: that depends on override_rate (healthy, noisy or overridden) is not
+    #: shown at all; only dormancy, which needs no fires to have happened,
+    #: can still be reported.
+    health_min_fires_for_verdict: int = 5
+    #: Below this fraction of its predicted fires, an automation that is
+    #: technically still running has still largely stopped doing its job -
+    #: distinct from dormant (zero real fires): this one fires occasionally,
+    #: just far less than the pattern it was built from says it should.
+    health_shortfall_ratio: float = 0.3
 
     # --- being told ---
     #: Post a notification in Home Assistant when a run finds something new.
@@ -315,6 +327,8 @@ class Options:
         self.health_overridden_override_rate = min(
             max(float(self.health_overridden_override_rate), 0.0), 1.0
         )
+        self.health_min_fires_for_verdict = max(int(self.health_min_fires_for_verdict), 1)
+        self.health_shortfall_ratio = min(max(float(self.health_shortfall_ratio), 0.0), 1.0)
         # A rule the user is only sometimes wrong about (noisy) has to be a
         # lower bar than one they are wrong about most of the time
         # (overridden), or every noisy automation would also read as

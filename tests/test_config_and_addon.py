@@ -92,6 +92,14 @@ def test_a_lower_overridden_threshold_than_noisy_is_raised_to_match():
     assert options.health_overridden_override_rate == 0.5
 
 
+def test_health_evidence_floor_options_default_and_clamp():
+    assert Options().health_min_fires_for_verdict == 5
+    assert Options().health_shortfall_ratio == 0.3
+    options = Options(health_min_fires_for_verdict=0, health_shortfall_ratio=1.5)
+    assert options.health_min_fires_for_verdict == 1
+    assert options.health_shortfall_ratio == 1.0
+
+
 def test_default_exclusions_are_always_applied():
     options = Options(excluded_entities=["light.mine"])
     assert options.is_excluded("sensor.time") is True
