@@ -133,6 +133,30 @@
 </section>
 
 <section class="panel">
+  <h3>Suggestion ordering</h3>
+  {% if report and report.ranking %}
+  <dl class="metrics wide">
+    <div><dt>Your decisions used</dt><dd>{{ report.ranking.n_labels }}</dd></div>
+    <div><dt>Using</dt>
+      <dd>{{ 'the general prior' if report.ranking.fallback_to_prior else 'your personal model' }}</dd></div>
+    {% if report.ranking.fallback_reason %}
+    <div><dt>Why</dt><dd>{{ report.ranking.fallback_reason }}</dd></div>
+    {% endif %}
+  </dl>
+  <p class="muted small">
+    Used only to order suggestions on the index page - it cannot rescue a
+    suggestion that failed its backtest, and it cannot hide one that passed.
+    Turn it off with <code>ranking_enabled: false</code> to sort by each
+    miner's own score instead.
+  </p>
+  {% elif options.ranking_enabled %}
+  <p class="muted">Not yet trained - it runs during the next analysis.</p>
+  {% else %}
+  <p class="muted">Off. Suggestions are ordered by each miner's own score.</p>
+  {% endif %}
+</section>
+
+<section class="panel">
   <h3>Recent runs</h3>
   <table class="grid">
     <thead><tr><th>Started</th><th>Status</th><th>Surfaced</th><th>Rejected</th><th>Window</th></tr></thead>

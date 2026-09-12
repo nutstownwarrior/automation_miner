@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
-from amminer.store.db import STATUS_ACCEPTED, STATUS_DISMISSED, STATUS_NEW, Store
+from amminer.store.db import (
+    STATUS_ACCEPTED,
+    STATUS_DISMISSED,
+    STATUS_NEW,
+    STATUS_SHADOW,
+    STATUS_SUPPRESSED,
+    Store,
+)
 
 
 def add(store, suggestion_id="s1", miner="time_of_day", score=0.8, run_id=1):
@@ -12,7 +19,7 @@ def add(store, suggestion_id="s1", miner="time_of_day", score=0.8, run_id=1):
 
 
 def test_schema_is_created_and_counts_start_empty(store):
-    assert store.get_meta("schema_version") == "2"
+    assert store.get_meta("schema_version") == "3"
     assert all(count == 0 for count in store.counts().values())
 
 
@@ -130,7 +137,7 @@ def test_an_old_database_migrates_the_backtest_validation_columns(tmp_path):
     conn.close()
 
     with Store(path) as store:
-        assert store.get_meta("schema_version") == "2"
+        assert store.get_meta("schema_version") == "3"
         old = store.get_backtest("old-one")
         assert old["precision_score"] == 0.6
         assert old["validation"] == "in_sample"  # the new column's default
@@ -140,6 +147,74 @@ def test_an_old_database_migrates_the_backtest_validation_columns(tmp_path):
             "old-one", {"precision": 0.9, "passed": True, "validation": "holdout"}
         )
         assert store.get_backtest("old-one")["validation"] == "holdout"
+
+
+def test_an_old_ranking_models_table_migrates_and_ranking_still_works(tmp_path):
+    """This project's own branch briefly shipped ``ranking_models`` with a
+    ``prior_k`` column and no ``scaler`` - a blend fraction, before the fit
+    became a MAP estimate towards the prior.  ``CREATE TABLE IF NOT EXISTS``
+    does nothing to a database that already has the table in that shape, so
+    opening one must add what is missing rather than fail the first time
+    anything tries to write or read a model - and the row that shape left
+    behind must not be handed back as if it still meant something, since its
+    weights are in a since-abandoned space this version would misinterpret.
+    """
+    import sqlite3
+
+    from amminer.learn import ranking
+
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(str(path))
+    conn.executescript(
+        """
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO meta(key, value) VALUES ('schema_version', '3');
+        CREATE TABLE ranking_models (
+            id                     INTEGER PRIMARY KEY CHECK (id = 1),
+            feature_schema_version INTEGER NOT NULL,
+            n_labels               INTEGER NOT NULL,
+            trained_ts             REAL NOT NULL,
+            fallback_to_prior      INTEGER NOT NULL DEFAULT 1,
+            fallback_reason        TEXT,
+            prior_k                INTEGER NOT NULL,
+            bias                   REAL NOT NULL,
+            weights                TEXT NOT NULL
+        );
+        INSERT INTO ranking_models(id, feature_schema_version, n_labels, trained_ts,
+            fallback_to_prior, fallback_reason, prior_k, bias, weights)
+        VALUES (1, 1, 5, 0.0, 1, 'cold start', 20, -1.0, '{}');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    with Store(path) as store:
+        # The old row is discarded outright, not silently reinterpreted.
+        assert store.get_ranking_model() is None
+
+        # Not merely "the ALTER succeeded" - the whole path a real run takes
+        # (train, persist, read back, score with it) works on this database,
+        # which is exactly what a stray OperationalError on the missing `l2`
+        # column, before this fix, took down permanently and silently.
+        model = ranking.train_from_labels([])
+        store.save_ranking_model(model.as_dict())
+        row = store.get_ranking_model()
+        assert row is not None
+        restored = ranking.RankingModel.from_row(row)
+        assert restored is not None
+        assert restored.fallback_to_prior is True
+        assert 0.0 <= restored.probability(_bare_candidate()) <= 1.0
+
+
+def _bare_candidate():
+    from amminer.miners.base import Action, Candidate, Evidence
+
+    return Candidate(
+        miner="time_of_day",
+        title="t",
+        actions=[Action(service="light.turn_on", entity_id="light.x")],
+        evidence=Evidence(),
+    )
 
 
 def test_overrides_are_deduplicated(store):
@@ -217,3 +292,105 @@ def test_restore_undoes_the_dismissal_the_next_run_reads(store):
 
 def test_restoring_an_unknown_suggestion_reports_failure(store):
     assert store.restore("never-existed") is False
+
+
+# --- ranking labels (amminer.learn.ranking) --------------------------
+def test_ranking_labels_excludes_suppressed_and_shadow_suggestions(store):
+    for suggestion_id, status in (
+        ("accepted1", STATUS_ACCEPTED),
+        ("dismissed1", STATUS_DISMISSED),
+        ("suppressed1", STATUS_SUPPRESSED),
+        ("shadow1", STATUS_SHADOW),
+    ):
+        add(store, suggestion_id)
+        store.set_status(suggestion_id, status)
+
+    # Only accept()/dismiss() record the decision-time snapshot ranking needs;
+    # a bare set_status (as used above for suppressed/shadow, which have no
+    # "decision" of their own) leaves nothing for ranking_labels to find, so
+    # accepted1/dismissed1 need their own real calls to produce one.
+    store.upsert_suggestion("accepted2", "time_of_day", "T", "s", 0.9, {"actions": [1]}, 1)
+    store.accept("accepted2")
+    store.upsert_suggestion("dismissed2", "association", "T", "s", 0.9, {"actions": [1]}, 1)
+    store.dismiss("dismissed2", "not useful")
+
+    labels = {row["id"]: row["status"] for row in store.ranking_labels()}
+    assert labels == {"accepted2": STATUS_ACCEPTED, "dismissed2": STATUS_DISMISSED}
+
+
+def test_ranking_labels_use_the_payload_as_of_the_decision_not_the_live_row(store):
+    store.upsert_suggestion(
+        "s1", "time_of_day", "T", "s", 0.5, {"score": 0.5, "evidence": {"occurrences": 1}}, 1
+    )
+    store.dismiss("s1", "meh")
+    # A later run re-mines the same rule with very different numbers - as
+    # would happen to an *accepted* rule kept being re-mined every night.
+    store.upsert_suggestion(
+        "s1", "time_of_day", "T", "s", 0.99, {"score": 0.99, "evidence": {"occurrences": 999}}, 2
+    )
+
+    labels = store.ranking_labels()
+    assert len(labels) == 1
+    assert labels[0]["payload"]["evidence"]["occurrences"] == 1
+
+
+def test_ranking_labels_records_seen_count_as_of_the_decision(store):
+    store.upsert_suggestion("s1", "time_of_day", "T", "s", 0.5, {"score": 0.5}, 1)
+    store.upsert_suggestion("s1", "time_of_day", "T", "s", 0.5, {"score": 0.5}, 2)  # seen_count -> 2
+    store.dismiss("s1", "meh")
+    store.upsert_suggestion("s1", "time_of_day", "T", "s", 0.5, {"score": 0.5}, 3)  # after the decision
+
+    labels = store.ranking_labels()
+    assert labels[0]["seen_count_at_decision"] == 2
+
+
+def test_seen_counts_reads_the_live_row(store):
+    add(store, "a")
+    add(store, "a")  # seen_count -> 2
+    add(store, "b")
+    assert store.seen_counts(["a", "b", "missing"]) == {"a": 2, "b": 1}
+    assert store.seen_counts([]) == {}
+
+
+def test_ranking_model_round_trips(store):
+    assert store.get_ranking_model() is None
+    model = {
+        "feature_schema_version": 1,
+        "weights": {"consistency": 1.2},
+        "bias": -1.0,
+        "scaler": {"center": {"consistency": 0.5}, "scale": {"consistency": 0.2}},
+        "n_labels": 10,
+        "l2": 15.0,
+        "trained_ts": 12345.0,
+        "fallback_to_prior": False,
+        "fallback_reason": None,
+    }
+    store.save_ranking_model(model)
+    stored = store.get_ranking_model()
+    assert stored["n_labels"] == 10
+    assert stored["fallback_to_prior"] is False
+    assert stored["weights"] == {"consistency": 1.2}
+    assert stored["scaler"] == {"center": {"consistency": 0.5}, "scale": {"consistency": 0.2}}
+
+    # Overwritten wholesale on the next run, not appended.
+    model["n_labels"] = 20
+    model["fallback_to_prior"] = True
+    model["fallback_reason"] = "cold start"
+    store.save_ranking_model(model)
+    stored = store.get_ranking_model()
+    assert stored["n_labels"] == 20
+    assert stored["fallback_to_prior"] is True
+
+
+def test_accept_probability_orders_suggestions_ahead_of_score(store):
+    store.upsert_suggestion("low", "time_of_day", "T", "s", 0.9, {}, 1, accept_probability=0.1)
+    store.upsert_suggestion("high", "time_of_day", "T", "s", 0.1, {}, 1, accept_probability=0.9)
+    ordered = [s["id"] for s in store.list_suggestions(status=STATUS_NEW)]
+    assert ordered == ["high", "low"]
+
+
+def test_without_accept_probability_ordering_falls_back_to_score(store):
+    store.upsert_suggestion("low_score", "time_of_day", "T", "s", 0.1, {}, 1)
+    store.upsert_suggestion("high_score", "time_of_day", "T", "s", 0.9, {}, 1)
+    ordered = [s["id"] for s in store.list_suggestions(status=STATUS_NEW)]
+    assert ordered == ["high_score", "low_score"]

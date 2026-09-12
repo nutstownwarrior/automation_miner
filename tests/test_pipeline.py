@@ -932,3 +932,63 @@ def test_no_activity_in_holdout_is_reported_as_a_run_level_degradation(
     monkeypatch.setattr(pipeline_module, "backtest_all", stub)
     report, _candidates = run(ha_config_dir, store, fake_client)
     assert any("no activity in the held-out period" in d for d in report.degradations)
+
+
+# --- ranking (amminer.learn.ranking) ------------------------------------
+def test_ranking_scores_and_orders_suggestions_from_a_cold_start(
+    ha_config_dir, store, fake_client
+):
+    """Zero-config, zero-history: still gets a calibrated ordering from the prior."""
+    report, _candidates = run(ha_config_dir, store, fake_client)
+
+    assert report.ranking
+    assert report.ranking["n_labels"] == 0
+    assert report.ranking["fallback_to_prior"] is True
+
+    rows = store.list_suggestions(status="new")
+    actionable = [r for r in rows if r["payload"].get("actions")]
+    assert actionable
+    for row in actionable:
+        assert row["accept_probability"] is not None
+        assert 0.0 <= row["accept_probability"] <= 1.0
+        ranking_extra = row["payload"]["extra"]["ranking"]
+        assert ranking_extra["probability"] == pytest.approx(row["accept_probability"])
+        assert "have not accepted or dismissed" in ranking_extra["confidence_note"]
+
+    # accept_probability, not score, decides the order the index page reads.
+    ordered_by_probability = [r["id"] for r in
+                               sorted(rows, key=lambda r: -(r["accept_probability"] or -1))]
+    assert [r["id"] for r in store.list_suggestions(status="new")] == ordered_by_probability
+
+
+def test_ranking_disabled_falls_back_to_todays_score_ordering(ha_config_dir, store, fake_client):
+    report, _candidates = run(ha_config_dir, store, fake_client, ranking_enabled=False)
+
+    assert report.ranking == {}
+    rows = store.list_suggestions(status="new")
+    assert rows
+    for row in rows:
+        assert row["accept_probability"] is None
+        assert "ranking" not in (row["payload"].get("extra") or {})
+    assert [r["id"] for r in rows] == [
+        r["id"] for r in sorted(rows, key=lambda r: -r["score"])
+    ]
+
+
+def test_ranking_model_is_retrained_from_real_accept_dismiss_decisions(
+    ha_config_dir, store, fake_client
+):
+    """A second run picks up decisions made after the first, and only those."""
+    run(ha_config_dir, store, fake_client)
+    rows = [r for r in store.list_suggestions(status="new") if r["payload"].get("actions")]
+    store.accept(rows[0]["id"])
+    store.dismiss(rows[1]["id"], "not for me")
+
+    report, _candidates = run(ha_config_dir, store, fake_client)
+
+    # Two real decisions is below MIN_LABELS_TO_FIT, so the prior is still
+    # used - but the model now knows two labels exist, proving the labels
+    # made it from the store into the retrained model.
+    assert report.ranking["n_labels"] == 2
+    stored_model = store.get_ranking_model()
+    assert stored_model["n_labels"] == 2

@@ -331,8 +331,13 @@ def test_a_hidden_suggestion_is_shown_with_the_rule_that_hid_it(wired):
     assert "Hidden by a preference" in page
     assert "Never automate the guest room." in page
     assert title in page
-    # And it is not on the suggestions page it was hidden from.
-    assert title not in client.get("/").text
+    # And it is not on the suggestions page it was hidden from.  Checked by
+    # the card's own element id rather than by title text: two mined
+    # candidates can legitimately describe overlapping actions (a single-step
+    # habit and a routine that includes that same step), so one's title can
+    # be a plain-text substring of another's sentence without either being a
+    # duplicate - the id is what is actually unique.
+    assert f'id="s-{suggestion["id"]}"' not in client.get("/").text
 
 
 def test_switching_a_preference_off_restores_what_it_hid(wired):
@@ -685,3 +690,4 @@ def test_building_the_provider_does_not_freeze_the_ui_either(
     assert health_status == 200
     assert answered_while_waiting, "/health waited for the provider to be built"
     assert elapsed < 0.5, f"/health waited {elapsed:.2f}s while a provider was built"
+
