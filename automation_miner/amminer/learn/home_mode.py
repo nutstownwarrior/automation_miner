@@ -1382,6 +1382,15 @@ def decode_series(
     )
     series = SignalSeries(entity_id=entity_id, numeric=False, source="home_mode")
     bin_close = (first_idx + np.arange(len(labels)) + 1) * BIN_SECONDS
+    # Every window in this codebase is half-open [start, end) - see
+    # amminer.backtest.split_window and the invariant tests built on it - so
+    # a bin whose close lands exactly on (or past) window[1] belongs to
+    # whatever comes next, not to this window.  Left in, it would plant a
+    # signal timestamp at-or-after a holdout boundary even though the label
+    # itself was decoded causally; dropping it costs at most one BIN_SECONDS
+    # bin of coverage right at the edge.
     for ts, label in zip(bin_close, labels, strict=True):
+        if ts >= window[1]:
+            continue
         series.add(float(ts), _mode_label(int(label)))
     return series.finalise()
