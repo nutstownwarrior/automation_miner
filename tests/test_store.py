@@ -149,6 +149,74 @@ def test_an_old_database_migrates_the_backtest_validation_columns(tmp_path):
         assert store.get_backtest("old-one")["validation"] == "holdout"
 
 
+def test_an_old_ranking_models_table_migrates_and_ranking_still_works(tmp_path):
+    """This project's own branch briefly shipped ``ranking_models`` with a
+    ``prior_k`` column and no ``scaler`` - a blend fraction, before the fit
+    became a MAP estimate towards the prior.  ``CREATE TABLE IF NOT EXISTS``
+    does nothing to a database that already has the table in that shape, so
+    opening one must add what is missing rather than fail the first time
+    anything tries to write or read a model - and the row that shape left
+    behind must not be handed back as if it still meant something, since its
+    weights are in a since-abandoned space this version would misinterpret.
+    """
+    import sqlite3
+
+    from amminer.learn import ranking
+
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(str(path))
+    conn.executescript(
+        """
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO meta(key, value) VALUES ('schema_version', '3');
+        CREATE TABLE ranking_models (
+            id                     INTEGER PRIMARY KEY CHECK (id = 1),
+            feature_schema_version INTEGER NOT NULL,
+            n_labels               INTEGER NOT NULL,
+            trained_ts             REAL NOT NULL,
+            fallback_to_prior      INTEGER NOT NULL DEFAULT 1,
+            fallback_reason        TEXT,
+            prior_k                INTEGER NOT NULL,
+            bias                   REAL NOT NULL,
+            weights                TEXT NOT NULL
+        );
+        INSERT INTO ranking_models(id, feature_schema_version, n_labels, trained_ts,
+            fallback_to_prior, fallback_reason, prior_k, bias, weights)
+        VALUES (1, 1, 5, 0.0, 1, 'cold start', 20, -1.0, '{}');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    with Store(path) as store:
+        # The old row is discarded outright, not silently reinterpreted.
+        assert store.get_ranking_model() is None
+
+        # Not merely "the ALTER succeeded" - the whole path a real run takes
+        # (train, persist, read back, score with it) works on this database,
+        # which is exactly what a stray OperationalError on the missing `l2`
+        # column, before this fix, took down permanently and silently.
+        model = ranking.train_from_labels([])
+        store.save_ranking_model(model.as_dict())
+        row = store.get_ranking_model()
+        assert row is not None
+        restored = ranking.RankingModel.from_row(row)
+        assert restored is not None
+        assert restored.fallback_to_prior is True
+        assert 0.0 <= restored.probability(_bare_candidate()) <= 1.0
+
+
+def _bare_candidate():
+    from amminer.miners.base import Action, Candidate, Evidence
+
+    return Candidate(
+        miner="time_of_day",
+        title="t",
+        actions=[Action(service="light.turn_on", entity_id="light.x")],
+        evidence=Evidence(),
+    )
+
+
 def test_overrides_are_deduplicated(store):
     from amminer.recorderdb.models import OverrideEvent
 

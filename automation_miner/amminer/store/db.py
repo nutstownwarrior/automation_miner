@@ -209,8 +209,32 @@ class Store:
         ("suggestions", "accept_probability", "REAL"),
     )
 
+    def _rebuild_stale_ranking_models_table(self) -> None:
+        """Drop and recreate ``ranking_models`` if it predates ``l2``/``scaler``.
+
+        This table briefly shipped with a ``prior_k`` column (a blend
+        fraction) and no ``scaler``, before the fit became a MAP estimate
+        towards the prior. That is not a column an ``ALTER TABLE ADD COLUMN``
+        can fix: ``prior_k`` is ``NOT NULL`` with no default, so a database
+        with this table in that shape rejects every future write with an
+        ``IntegrityError`` regardless of what columns are added alongside it -
+        and CREATE TABLE IF NOT EXISTS, run below, does nothing to a table
+        that already exists. A plain ALTER also cannot widen ``prior_k``
+        itself into something nullable; SQLite has no such statement.
+
+        Dropping is safe here specifically because every row this table has
+        ever held is deliberately discardable: amminer.learn.ranking retrains
+        it from scratch every run regardless (see the table's own comment in
+        ``_SCHEMA``), so there is no data anywhere in it worth preserving
+        through a more careful column-by-column migration.
+        """
+        present = {row["name"] for row in self._conn.execute("PRAGMA table_info(ranking_models)")}
+        if present and not {"l2", "scaler"} <= present:
+            self._conn.execute("DROP TABLE ranking_models")
+
     def _migrate(self) -> None:
         with self._lock:
+            self._rebuild_stale_ranking_models_table()
             self._conn.executescript(_SCHEMA)
             for table, column, definition in self._ADDED_COLUMNS:
                 present = {
