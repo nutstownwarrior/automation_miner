@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..recorderdb.models import Cause, StateChange
+
 SCHEMA = """
 CREATE TABLE states_meta (
     metadata_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -478,6 +480,263 @@ def build_default_fixture(
     truth.overrides = override_records
     gen.close()
     return truth
+
+
+# ----------------------------------------------------------------------
+# Fixtures for amminer.learn.home_mode - plain StateChange lists, not a
+# recorder-shaped SQLite file. The home-mode tests need per-bin *ground
+# truth* about which latent regime generated each moment, which a recorder
+# database has no column for; building the changes directly, the way
+# tests/test_miners.py already does for several miner-level unit tests, is
+# the natural fit here, not a shortcut around anything.
+# ----------------------------------------------------------------------
+@dataclass
+class TwoRegimeFixture:
+    """A home with exactly two ground-truth behavioural regimes."""
+
+    changes: list[StateChange]
+    window: tuple[float, float]
+    bin_seconds: float
+    #: True regime (0 == quiet, 1 == busy) for every bin covering ``window``,
+    #: same bin grid ``amminer.learn.home_mode`` itself uses
+    #: (``floor(ts / bin_seconds)``).
+    regime_by_bin: list[int]
+
+
+#: Several entities, not one - a real "busy" period lights up more than a
+#: single light bulb, and amminer.learn.home_mode's feature vector has six
+#: dimensions to fill. A single-entity fixture leaves five of them
+#: identically zero forever, which starves the model of exactly the
+#: joint, multi-dimensional signal a real household's activity has.
+_TWO_REGIME_ENTITIES: tuple[str, ...] = (
+    "light.living",
+    "light.kitchen",
+    "switch.kettle",
+)
+
+
+def build_two_regime_activity(
+    days: int,
+    seed: int = 20240501,
+    bin_seconds: float = 900.0,
+    busy_start_hour: int = 8,
+    busy_end_hour: int = 22,
+    busy_p: float = 0.5,
+    quiet_p: float = 0.03,
+    entity_id: str | None = None,
+) -> TwoRegimeFixture:
+    """A home that is unambiguously either "busy" or "quiet", hour by hour.
+
+    Each *hour*, each of :data:`_TWO_REGIME_ENTITIES` independently gets one
+    human "on" (at a random moment, for 30-45 minutes) with probability
+    ``busy_p`` during ``[busy_start_hour, busy_end_hour)`` and ``quiet_p``
+    otherwise. Roughly binary per entity per bin, not a wide count
+    distribution, deliberately: a real Gaussian-mixture emission model fit on
+    a *skewed, spread-out* count (Poisson(3) events every 15 minutes, say)
+    always has some genuine appetite for extra components to approximate
+    that skew, which is real density estimation and not a bug (see
+    ``amminer/learn/home_mode.py``'s ``select_model`` docstring) - but it is
+    not what "how many behavioural regimes does this home have" is asking.
+    Several entities moving together, near-binary and sampled at a rate a
+    real switch could plausibly produce, is what an actually quiet or simple
+    home's habits mostly look like, and is what lets a state-count test mean
+    what it says.
+
+    ``entity_id`` is accepted for backward compatibility with a
+    single-entity fixture; passing it uses only that one entity instead of
+    :data:`_TWO_REGIME_ENTITIES` (weaker signal - most tests want the default).
+    """
+    entities = (entity_id,) if entity_id else _TWO_REGIME_ENTITIES
+    rng = random.Random(seed)
+    start_ts = 0.0
+    end_ts = days * 86400.0
+    changes: list[StateChange] = []
+    n_bins = int(end_ts // bin_seconds)
+    regime_by_bin = [0] * n_bins
+
+    for bin_idx in range(n_bins):
+        bin_start = bin_idx * bin_seconds
+        hour = int((bin_start % 86400.0) // 3600)
+        regime_by_bin[bin_idx] = 1 if busy_start_hour <= hour < busy_end_hour else 0
+
+    for day in range(days):
+        for hour in range(24):
+            hour_start = day * 86400.0 + hour * 3600.0
+            busy = busy_start_hour <= hour < busy_end_hour
+            p = busy_p if busy else quiet_p
+            # One Bernoulli draw per hour, shared by every entity, not one
+            # per entity - independent per-entity coin flips would create a
+            # genuine (if uninteresting) 2^len(entities)-way joint structure
+            # of "which subset happened to be on together" inside a single
+            # regime, which a state-count test then correctly finds and this
+            # test does not want to be about. Real household activity is
+            # correlated like this too: an evening with the TV on is more
+            # likely than not to also have a light on, not an independent
+            # coincidence.
+            if rng.random() >= p:
+                continue
+            # The same window for every entity, not independently randomised
+            # per entity: two lights and a switch turning on and off at
+            # slightly different moments each still creates its own
+            # bin-level joint structure (how many of the three happen to
+            # overlap in *this* bin) - a real, if uninteresting, source of
+            # extra sub-clusters this fixture does not want to hand the
+            # model.  One shared window keeps the intended contrast to
+            # exactly "something is happening" vs. "nothing is".
+            on_ts = hour_start + rng.uniform(0, 600.0)
+            off_ts = on_ts + rng.uniform(1800.0, 2700.0)
+            for entity in entities:
+                on = StateChange(entity, "on", on_ts, old_state="off")
+                on.cause = Cause.HUMAN
+                changes.append(on)
+                # amminer.learn.home_mode counts *currently active* entities,
+                # not raw transitions - an "on" with no matching "off" would
+                # register as active for the rest of the fixture's history,
+                # not just the burst this is meant to represent. The burst
+                # itself spans most of the hour (30-45 min) so it actually
+                # covers several consecutive 15-minute bins rather than
+                # landing in only one of them - at bin granularity, a five
+                # minute blip inside a busy hour is barely distinguishable
+                # from the same blip inside a quiet one.
+                off = StateChange(entity, "off", off_ts, old_state="on")
+                off.cause = Cause.HUMAN
+                changes.append(off)
+
+    return TwoRegimeFixture(changes, (start_ts, end_ts), bin_seconds, regime_by_bin)
+
+
+@dataclass
+class WindDownFixture:
+    """A three-regime home (quiet / busy / winding-down) with a planted habit.
+
+    The habit - turning ``habit_entity_id`` to ``habit_state`` - fires only on
+    days the household actually winds down, at a time spread *uniformly*
+    across the whole wind-down window rather than at one clock time. That
+    makes it exactly the case the mode model exists for: spread across two
+    hours, plain time-of-day clustering (``amminer.miners.time_of_day``,
+    default ``time_cluster_minutes=30``) can only ever capture a narrow slice
+    of it, while every single occurrence happens while the household's
+    inferred mode is "winding down" - a condition ``amminer.miners.conditional``
+    can find with high purity once that mode is an available signal.
+    """
+
+    changes: list[StateChange]
+    window: tuple[float, float]
+    bin_seconds: float
+    regime_by_bin: list[int]  # 0 quiet, 1 busy, 2 winding-down
+    habit_entity_id: str
+    habit_state: str
+    habit_hits: int
+    winddown_days: int
+    total_days: int
+
+
+def build_winddown_habit_activity(
+    days: int,
+    seed: int = 20240501,
+    bin_seconds: float = 900.0,
+    winddown_probability: float = 0.6,
+    habit_probability: float = 0.9,
+    habit_entity_id: str = "light.bedroom",
+) -> WindDownFixture:
+    """Plant the scenario from the module's own motivation: a real habit that
+    plain clock time cannot explain, but the inferred household mode can.
+
+    Day structure, per calendar day:
+
+    * ``[00:00, 08:00)`` - quiet: background entities rarely change.
+    * ``[08:00, 21:00)`` - busy: background entities change often.
+    * ``[21:00, 24:00)`` - on a randomly chosen ``winddown_probability`` share
+      of days, a *third*, distinct activity signature (``media_player`` busy,
+      ``light.living`` quiet - "watching something with the big light off");
+      on the rest, straight back to the quiet signature.
+
+    On winding-down days only, with probability ``habit_probability``, the
+    household also turns ``habit_entity_id`` on at a uniformly random moment
+    somewhere in ``[21:00, 23:00)``. It never fires on a day with no
+    wind-down at all - there being nothing to wind down from.
+    """
+    rng = random.Random(seed)
+    start_ts = 0.0
+    end_ts = days * 86400.0
+    n_bins = int(end_ts // bin_seconds)
+    regime_by_bin = [0] * n_bins
+    changes: list[StateChange] = []
+    habit_hits = 0
+    winddown_days = 0
+
+    def human(entity_id: str, state: str, ts: float) -> None:
+        change = StateChange(entity_id, state, ts, old_state="off")
+        change.cause = Cause.HUMAN
+        changes.append(change)
+
+    for day in range(days):
+        day_start = day * 86400.0
+        has_winddown = rng.random() < winddown_probability
+        if has_winddown:
+            winddown_days += 1
+
+        for bin_idx in range(int(86400.0 // bin_seconds)):
+            global_idx = int(day_start // bin_seconds) + bin_idx
+            bin_start = day_start + bin_idx * bin_seconds
+            hour = int((bin_start % 86400.0) // 3600)
+            if 8 <= hour < 21:
+                regime = 1
+            elif 21 <= hour < 24 and has_winddown:
+                regime = 2
+            else:
+                regime = 0
+            regime_by_bin[global_idx] = regime
+
+        # amminer.learn.home_mode counts *currently active* entities, not raw
+        # transitions (see build_feature_matrix's own docstring for why), so
+        # each burst below is paired with the "off"/"idle" that ends it -
+        # without that, "light.living turned on once, 40 days ago" would
+        # register as active in every bin from then on.
+        #
+        # One Bernoulli draw per *hour* for the daytime light, not per bin -
+        # see build_two_regime_activity's docstring for why a rate a real
+        # light switch could plausibly produce, rather than one every 15
+        # minutes, is what keeps this a state-count test rather than a
+        # density-estimation one.
+        for hour in range(8, 21):
+            if rng.random() < 0.45:
+                on_ts = day_start + hour * 3600.0 + rng.uniform(0, 3000.0)
+                human("light.living", "on", on_ts)
+                human("light.living", "off", on_ts + rng.uniform(300.0, 600.0))
+        for hour in list(range(0, 8)) + ([] if has_winddown else list(range(21, 24))):
+            if rng.random() < 0.02:
+                on_ts = day_start + hour * 3600.0 + rng.uniform(0, 3000.0)
+                human("light.living", "on", on_ts)
+                human("light.living", "off", on_ts + rng.uniform(300.0, 600.0))
+
+        if has_winddown:
+            # One continuous "watching something" session, not a burst per
+            # hour - a level feature needs the entity to actually *stay*
+            # active across the block for the block to look, to the model,
+            # like one sustained regime rather than scattered instants.
+            session_start = day_start + 21 * 3600.0 + rng.uniform(0, 3600.0)
+            session_length = rng.uniform(90 * 60.0, 150 * 60.0)
+            human("media_player.tv", "playing", session_start)
+            human("media_player.tv", "idle", session_start + session_length)
+
+            if rng.random() < habit_probability:
+                habit_ts = day_start + 21 * 3600 + rng.uniform(0, 2 * 3600)
+                human(habit_entity_id, "on", habit_ts)
+                human(habit_entity_id, "off", habit_ts + rng.uniform(300.0, 600.0))
+                habit_hits += 1
+
+    return WindDownFixture(
+        changes=changes,
+        window=(start_ts, end_ts),
+        bin_seconds=bin_seconds,
+        regime_by_bin=regime_by_bin,
+        habit_entity_id=habit_entity_id,
+        habit_state="on",
+        habit_hits=habit_hits,
+        winddown_days=winddown_days,
+        total_days=days,
+    )
 
 
 def main() -> None:  # pragma: no cover - developer convenience
