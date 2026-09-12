@@ -70,6 +70,28 @@ def test_holdout_options_default_and_clamp():
     assert options.backtest_min_train_days == 1
 
 
+def test_health_options_default_and_clamp():
+    assert Options().health_min_days == 7
+    assert Options().health_min_predicted_for_dormant == 3
+    assert Options().health_noisy_override_rate == 0.3
+    assert Options().health_overridden_override_rate == 0.6
+    options = Options(
+        health_min_days=0, health_min_predicted_for_dormant=0,
+        health_noisy_override_rate=1.5, health_overridden_override_rate=-1.0,
+    )
+    assert options.health_min_days == 1
+    assert options.health_min_predicted_for_dormant == 1
+    assert options.health_noisy_override_rate == 1.0
+    assert options.health_overridden_override_rate == 1.0
+
+
+def test_a_lower_overridden_threshold_than_noisy_is_raised_to_match():
+    """Otherwise every noisy automation would also read as overridden, and
+    the escalation this module recommends would never actually escalate."""
+    options = Options(health_noisy_override_rate=0.5, health_overridden_override_rate=0.2)
+    assert options.health_overridden_override_rate == 0.5
+
+
 def test_default_exclusions_are_always_applied():
     options = Options(excluded_entities=["light.mine"])
     assert options.is_excluded("sensor.time") is True

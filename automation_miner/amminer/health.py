@@ -15,12 +15,14 @@ rebuilt:
     replays the shipped rule's trigger/condition logic over real recorder
     history - exactly the same simulation the pre-apply backtest ran, now
     pointed at the period since it was applied.
-``amminer.recorderdb.causality``
-    every :class:`~amminer.recorderdb.models.StateChange` handed to this
-    module has already been classified by cause; the automation's *own*
-    recorded state rows (Home Assistant writes one every time it actually
-    fires, because ``last_triggered`` changes) are how many times it really
-    ran is counted.
+``amminer.recorderdb.queries`` (the ``automation_triggered`` events it already
+    loads for :mod:`amminer.recorderdb.causality`)
+    how many times the automation really ran is counted directly from these -
+    not from the automation entity's own recorded state. Home Assistant
+    re-asserts every enabled automation's state as "on" on every restart,
+    with a fresh context and no trigger behind it; counting that as a firing
+    would report a burst of activity every time Home Assistant restarts,
+    which is the opposite of what this module exists to be honest about.
 ``amminer.recorderdb.causality.detect_overrides``
     already run once per analysis, over the same window; this module only
     filters that list down to the one automation being judged.
@@ -42,7 +44,7 @@ from .automations import ExistingAutomation
 from .config import Options
 from .enrich.signals import SignalStore
 from .llm.equivalence import matches
-from .recorderdb.models import OverrideEvent, StateChange
+from .recorderdb.models import OverrideEvent, RecorderEvent
 
 STATUS_ACTIVE = "active"
 STATUS_DELETED = "deleted"
@@ -60,27 +62,14 @@ VERDICT_INSUFFICIENT = "insufficient_data"
 #: statuses: deleted, edited, disabled, unresolved).
 VERDICT_NA = "n/a"
 
-#: Below this many days of history since it was applied, a verdict would rest
-#: on almost nothing. Mirrors amminer.backtest's backtest_min_holdout_days
-#: reasoning: "not enough evidence yet" has to be said outright rather than
-#: folded into a confident-looking number.
-MIN_DAYS_FOR_VERDICT = 7
-
-#: Floor on predicted fires before "the pattern is still happening but the
-#: real automation never ran" is trusted as dormancy rather than as a quiet
-#: fortnight. The same reasoning as amminer.backtest's backtest_min_true_fires:
-#: one predicted fire is a single observation with a threshold's name on it.
-MIN_PREDICTED_FOR_DORMANT = 3
-
-#: Share of the automation's real fires a human reversed within the override
-#: window (amminer.recorderdb.causality.detect_overrides) before this counts
-#: as an active annoyance rather than an occasional, ordinary correction.
-NOISY_OVERRIDE_RATE = 0.3
-
-#: Share above which the automation is not "sometimes wrong" but "wrong most
-#: of the time it runs" - worth naming separately because the recommended
-#: action is stronger (retire, not retune).
-OVERRIDDEN_OVERRIDE_RATE = 0.6
+# The actual thresholds (how many days, how few predicted fires, which
+# override rates) are configurable Options - see config.py's
+# health_min_days / health_min_predicted_for_dormant /
+# health_noisy_override_rate / health_overridden_override_rate and their own
+# docstrings for the reasoning. They live there, not as module constants
+# here, for the same reason backtest_min_true_fires lives in Options rather
+# than in backtest.py: a threshold a user might reasonably want to loosen or
+# tighten belongs with the rest of the add-on's configuration.
 
 
 @dataclass
@@ -149,7 +138,7 @@ def _insufficient(health: AutomationHealth, evidence: str, recommendation: str) 
 def evaluate(
     applied_row: dict[str, Any],
     existing_by_id: dict[str, ExistingAutomation],
-    changes: Sequence[StateChange],
+    events: Sequence[RecorderEvent],
     signal_store: SignalStore,
     overrides: Sequence[OverrideEvent],
     options: Options,
@@ -157,9 +146,9 @@ def evaluate(
 ) -> AutomationHealth:
     """Judge one applied automation against history gathered since it shipped.
 
-    ``changes`` and ``overrides`` are exactly what one analysis run already
-    computed for backtesting and the audit page - this asks nothing new of
-    the recorder, it only looks at what was already read.
+    ``events`` and ``overrides`` are exactly what one analysis run already
+    loaded for causality classification and the audit page - this asks
+    nothing new of the recorder, it only looks at what was already read.
     """
     automation_id = str(applied_row["automation_id"])
     applied_ts = float(applied_row["applied_ts"])
@@ -233,12 +222,12 @@ def evaluate(
     days_evaluated = max((end_ts - start_ts) / 86400.0, 0.0)
     health.days_evaluated = days_evaluated
 
-    if days_evaluated < MIN_DAYS_FOR_VERDICT:
+    if days_evaluated < options.health_min_days:
         return _insufficient(
             health,
             f"Only {days_evaluated:.1f} days of history are available since it was "
             f"applied ({days_since_applied:.1f} days ago) - not enough to judge it yet "
-            f"(need at least {MIN_DAYS_FOR_VERDICT}).",
+            f"(need at least {options.health_min_days}).",
             "Check back once it has had more time to run.",
         )
 
@@ -257,15 +246,19 @@ def evaluate(
 
     predicted = len(fires)
     entity_id = existing.entity_id
-    # Home Assistant writes a new row for the automation entity itself every
-    # time it actually runs - last_triggered changes even when the state
-    # ("on") does not, so this is not restricted to StateChange.is_transition.
-    # This is the automation's own record of firing, independent of whether
-    # any downstream entity changed as a result.
-    actual_rows = [
-        c for c in changes if c.entity_id == entity_id and start_ts <= c.ts <= end_ts
-    ]
-    actual = len(actual_rows)
+    # "Did it really fire" is answered from Home Assistant's own
+    # automation_triggered events, not from the automation entity's recorded
+    # state: every enabled automation gets restated as "on" (a fresh context,
+    # no trigger behind it) on every Home Assistant restart, so counting that
+    # as a firing would report a burst of activity every time the box
+    # reboots - see this module's docstring.
+    actual = sum(
+        1
+        for event in events
+        if event.event_type == "automation_triggered"
+        and event.entity_id == entity_id
+        and start_ts <= event.ts <= end_ts
+    )
     matching_overrides = [
         o for o in overrides if o.automation_entity_id == entity_id and start_ts <= o.ts <= end_ts
     ]
@@ -279,7 +272,7 @@ def evaluate(
     health.predicted_fires_per_week = round(predicted * 7.0 / max(days_evaluated, 0.01), 2)
     health.actual_fires_per_week = round(actual * 7.0 / max(days_evaluated, 0.01), 2)
 
-    if actual == 0 and predicted < MIN_PREDICTED_FOR_DORMANT:
+    if actual == 0 and predicted < options.health_min_predicted_for_dormant:
         return _insufficient(
             health,
             f"Neither a real firing nor much sign of the pattern it was built from "
@@ -301,7 +294,7 @@ def evaluate(
         )
         return health
 
-    if override_rate is not None and override_rate >= OVERRIDDEN_OVERRIDE_RATE:
+    if override_rate is not None and override_rate >= options.health_overridden_override_rate:
         health.verdict = VERDICT_OVERRIDDEN
         health.evidence = (
             f"Fired {actual} time{'' if actual == 1 else 's'} in {days_evaluated:.0f} days "
@@ -310,7 +303,7 @@ def evaluate(
         health.recommendation = "Retire it - most of what it does is being reversed."
         return health
 
-    if override_rate is not None and override_rate >= NOISY_OVERRIDE_RATE:
+    if override_rate is not None and override_rate >= options.health_noisy_override_rate:
         health.verdict = VERDICT_NOISY
         health.evidence = (
             f"Fired {actual} time{'' if actual == 1 else 's'} in {days_evaluated:.0f} days "
@@ -338,7 +331,7 @@ def evaluate(
 def evaluate_all(
     store,
     existing: Sequence[ExistingAutomation],
-    changes: Sequence[StateChange],
+    events: Sequence[RecorderEvent],
     signal_store: SignalStore,
     overrides: Sequence[OverrideEvent],
     options: Options,
@@ -347,9 +340,9 @@ def evaluate_all(
     """Judge every automation this add-on has applied, and persist the result.
 
     Called once per analysis run, from :mod:`amminer.pipeline`, with exactly
-    the ``changes``/``signal_store``/``overrides`` that run already built for
-    backtesting - see this module's docstring for why nothing here re-queries
-    the recorder.
+    the ``events``/``signal_store``/``overrides`` that run already loaded for
+    causality classification and backtesting - see this module's docstring
+    for why nothing here re-queries the recorder.
     """
     # Keyed by id, not entity_id: that id is this add-on's stable marker (see
     # applied_automations' own comment in amminer.store.db), and it is what
@@ -358,7 +351,7 @@ def evaluate_all(
     existing_by_id = {a.id: a for a in existing if a.id}
     results: list[AutomationHealth] = []
     for row in store.list_applied_automations():
-        result = evaluate(row, existing_by_id, changes, signal_store, overrides, options, window)
+        result = evaluate(row, existing_by_id, events, signal_store, overrides, options, window)
         store.save_automation_health(
             result.automation_id, result.status, result.verdict, result.as_dict()
         )

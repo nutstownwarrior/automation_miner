@@ -682,15 +682,16 @@ def run_analysis(
         report.conflicted = conflicted or 0
 
         # --- automation health: does what we already shipped still perform? -
-        # Reuses exactly the changes/full_store/overrides this run already
-        # built for backtesting and the audit page - see amminer.health's own
-        # docstring for why nothing here re-queries the recorder.  `existing`
-        # is the same list conflict checking just used, keyed the same way.
+        # Reuses exactly the events/full_store/overrides this run already
+        # loaded for causality classification and backtesting - see
+        # amminer.health's own docstring for why nothing here re-queries the
+        # recorder.  `existing` is the same list conflict checking just used,
+        # keyed the same way.
         def _check_health() -> list[dict[str, Any]]:
             from . import health as health_module
 
             results = health_module.evaluate_all(
-                store, existing, changes, full_store, overrides, options, window
+                store, existing, events, full_store, overrides, options, window
             )
             return [r.as_dict() for r in results]
 

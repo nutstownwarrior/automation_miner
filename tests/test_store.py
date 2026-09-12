@@ -266,6 +266,94 @@ def test_listing_filters_and_orders(store):
     assert [s["id"] for s in store.list_suggestions(miner="association")] == ["b"]
 
 
+# --- applied automations & their health (amminer.health) ------------------
+def test_applied_automation_round_trips_with_no_health_yet(store):
+    store.record_applied_automation(
+        "amminer_1", "sugg1", "Kitchen light",
+        {"triggers": [], "actions": [{"service": "light.turn_on"}]},
+        {"id": "amminer_1", "trigger": [], "action": []},
+    )
+    applied = store.get_applied_automation("amminer_1")
+    assert applied["suggestion_id"] == "sugg1"
+    assert applied["title"] == "Kitchen light"
+    assert applied["candidate_payload"]["actions"][0]["service"] == "light.turn_on"
+    # No run has judged it yet - never a fabricated verdict standing in.
+    assert applied["health"] is None
+    assert [a["automation_id"] for a in store.list_applied_automations()] == ["amminer_1"]
+
+
+def test_re_applying_the_same_automation_refreshes_the_snapshot(store):
+    store.record_applied_automation("amminer_1", "sugg1", "v1", {"a": 1}, {"id": "amminer_1"})
+    store.record_applied_automation("amminer_1", "sugg1", "v2", {"a": 2}, {"id": "amminer_1"})
+    rows = store.list_applied_automations()
+    assert len(rows) == 1
+    assert rows[0]["title"] == "v2"
+    assert rows[0]["candidate_payload"]["a"] == 2
+
+
+def test_automation_health_round_trip(store):
+    store.record_applied_automation("amminer_1", "sugg1", "Kitchen light", {}, {})
+    store.save_automation_health(
+        "amminer_1", "active", "healthy", {"verdict": "healthy", "actual_fires": 9}
+    )
+    applied = store.get_applied_automation("amminer_1")
+    assert applied["health"]["status"] == "active"
+    assert applied["health"]["verdict"] == "healthy"
+    assert applied["health"]["payload"]["actual_fires"] == 9
+
+    # A later run overwrites it wholesale, the same way ranking_models does.
+    store.save_automation_health(
+        "amminer_1", "active", "dormant", {"verdict": "dormant", "actual_fires": 0}
+    )
+    applied = store.get_applied_automation("amminer_1")
+    assert applied["health"]["verdict"] == "dormant"
+    assert store.counts()["applied_automations"] == 1
+    assert store.counts()["automation_health"] == 1
+
+
+def test_an_old_database_gains_the_applied_automations_tables(tmp_path):
+    """A v3 database (this branch's earlier schema) has never heard of
+    applied_automations or automation_health.  Opening it must add both
+    without disturbing the data already in it - CREATE TABLE IF NOT EXISTS is
+    a genuine no-op here only because these are brand-new tables; the
+    existing ones must come through untouched."""
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(str(path))
+    conn.executescript(
+        """
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO meta(key, value) VALUES ('schema_version', '3');
+        CREATE TABLE suggestions (
+            id TEXT PRIMARY KEY, miner TEXT NOT NULL, title TEXT NOT NULL,
+            summary TEXT, score REAL NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'new',
+            payload TEXT NOT NULL, first_seen_ts REAL NOT NULL, last_seen_ts REAL NOT NULL,
+            seen_count INTEGER NOT NULL DEFAULT 1, run_id INTEGER
+        );
+        INSERT INTO suggestions(id, miner, title, summary, score, status, payload,
+            first_seen_ts, last_seen_ts)
+        VALUES ('old-sugg', 'time_of_day', 'Old suggestion', 'summary', 0.5, 'new', '{}', 0, 0);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    with Store(path) as store:
+        assert store.get_meta("schema_version") == "4"
+        # Pre-existing data survived the migration untouched.
+        assert store.get_suggestion("old-sugg")["title"] == "Old suggestion"
+        # And the new tables are not just present but fully usable end to end,
+        # on this same, previously-v3, database file - not only on a fresh one.
+        assert store.list_applied_automations() == []
+        store.record_applied_automation(
+            "amminer_1", "old-sugg", "Old suggestion", {"a": 1}, {"id": "amminer_1"}
+        )
+        store.save_automation_health("amminer_1", "active", "healthy", {"verdict": "healthy"})
+        applied = store.get_applied_automation("amminer_1")
+        assert applied["health"]["verdict"] == "healthy"
+
+
 def test_store_survives_reopen(tmp_path):
     path = tmp_path / "state.db"
     with Store(path) as store:

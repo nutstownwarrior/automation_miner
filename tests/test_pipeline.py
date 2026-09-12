@@ -81,6 +81,106 @@ def test_overrides_are_persisted(ha_config_dir, store, fake_client):
     assert "automation.bedtime_dim" in store.override_counts()
 
 
+# --- automation health (amminer.health), against the same real fixture ---
+# The synthetic dataset already contains, on every day of its 45: an
+# "automation.bedtime_dim" that fires and is overridden about 70% of the
+# time (Pattern 4), and an "automation.holiday_mode" that updates its own
+# state daily but never actually fires (no context - Pattern "stale
+# automation"). That is two of this feature's required scenarios for free,
+# through the real causality/override pipeline rather than hand-built data.
+def _record_applied(store, monkeypatch, automation_id, title, at, target_entity, applied_ts):
+    """Insert an applied_automations row stamped at *applied_ts*, not "now" -
+    record_applied_automation always uses time.time(), and the fixture's
+    history is fixed at a 2024 date far from any real current time."""
+    import time as time_module
+
+    from amminer.miners.base import Action, Candidate, Trigger
+
+    candidate = Candidate(
+        miner="time_of_day",
+        title=title,
+        triggers=[Trigger(kind="time", at=at)],
+        actions=[Action(service="light.turn_on", entity_id=target_entity)],
+    )
+    monkeypatch.setattr(time_module, "time", lambda: applied_ts)
+    try:
+        store.record_applied_automation(
+            automation_id, "sugg-" + automation_id, title, candidate.as_dict(),
+            {"id": automation_id},
+        )
+    finally:
+        monkeypatch.undo()
+
+
+def test_a_real_habit_the_user_keeps_overriding_is_flagged_by_a_real_run(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    _record_applied(
+        store, monkeypatch, "bedtime1", "Bedtime dim", "22:15:00", "light.bedroom",
+        applied_ts=0.0,  # long before the fixture's window: the whole thing is evaluated
+    )
+    report, _ = run(ha_config_dir, store, fake_client)
+    assert report.automations["checked"] == 1
+
+    applied = store.get_applied_automation("bedtime1")
+    payload = applied["health"]["payload"]
+    # It really did fire most days, and was overridden most of those times -
+    # both read from real causality classification and real detected
+    # overrides, not from anything this test constructed by hand.
+    assert payload["actual_fires"] > 30
+    assert payload["overrides"] > 15
+    assert payload["override_rate"] > 0.5
+    assert applied["health"]["verdict"] in ("overridden", "noisy")
+    assert "undid it" in payload["evidence"]
+
+
+def test_a_stale_automation_that_never_fires_is_reported_dormant_by_a_real_run(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    _record_applied(
+        store, monkeypatch, "holiday1", "Holiday mode", "03:00:00", "light.hallway",
+        applied_ts=0.0,
+    )
+    run(ha_config_dir, store, fake_client)
+
+    applied = store.get_applied_automation("holiday1")
+    payload = applied["health"]["payload"]
+    # The pattern it would fire on (every day, by the clock) is plainly there;
+    # Home Assistant's own record of this automation running is not.
+    assert payload["predicted_fires"] > 30
+    assert payload["actual_fires"] == 0
+    assert applied["health"]["verdict"] == "dormant"
+
+
+def test_an_automation_applied_two_days_ago_is_not_enough_data_from_a_real_run(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    first_report, _ = run(ha_config_dir, store, fake_client)
+    applied_ts = first_report.window[1] - 2 * 86400.0
+    _record_applied(
+        store, monkeypatch, "bedtime1", "Bedtime dim", "22:15:00", "light.bedroom", applied_ts
+    )
+    run(ha_config_dir, store, fake_client)
+
+    applied = store.get_applied_automation("bedtime1")
+    assert applied["health"]["verdict"] == "insufficient_data"
+    assert applied["health"]["status"] == "active"
+
+
+def test_a_deleted_automation_is_reported_gone_by_a_real_run(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    _record_applied(
+        store, monkeypatch, "never_existed", "Ghost automation", "22:15:00", "light.bedroom",
+        applied_ts=0.0,
+    )
+    run(ha_config_dir, store, fake_client)
+
+    applied = store.get_applied_automation("never_existed")
+    assert applied["health"]["status"] == "deleted"
+    assert applied["health"]["verdict"] == "n/a"
+
+
 def test_gap_suggestions_are_produced(ha_config_dir, store, fake_client):
     run(ha_config_dir, store, fake_client)
     gaps = store.list_gaps()
