@@ -428,7 +428,9 @@ def propose_and_verify(
             members=member_ids,
         )
         consolidated = _consolidate(scene.name, scene.reason, members, trigger)
-        outcome = backtest(consolidated, changes, store, options, window, overrides)
+        outcome = backtest(
+            consolidated, changes, store, options, window, overrides, validate_holdout=True
+        )
         consolidated.backtest = outcome.as_dict()
         # The same formula :func:`amminer.backtest.backtest_all` applies, from a
         # mined score of zero.  A scene therefore ranks below the parts it was

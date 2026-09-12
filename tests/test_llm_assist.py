@@ -247,9 +247,44 @@ def test_a_verified_hypothesis_rescues_a_rejected_rule(cold_evening_case):
     assert rescued.backtest["precision"] == 1.0
     assert rescued.backtest["passed"] is True
     assert rescued.miner.endswith("+hypothesis")
+    # An AI-proposed rule is measured the same as any other: gated on a real
+    # holdout when there is enough history for one, and never left with a
+    # backtest that looks unvalidated because nobody asked it to validate.
+    assert rescued.backtest["holdout_evaluated"] is True
+    assert rescued.backtest["validation"] == "holdout"
+    assert rescued.backtest["validation_note"]
     # Provenance must be visible: this came from a model, and it was measured.
     assert rescued.extra["hypothesis"]["reason"] == "people heat when it is cold outside"
     assert rescued.extra["hypothesis"]["origin_candidate"] == rejected[0].id
+
+
+def test_signal_catalogue_uses_the_training_store_not_the_full_one(cold_evening_case):
+    """A numeric threshold must never be chosen with the holdout's own values
+    in view.  When a training-only store is given, the model sees only it -
+    not the full one, which here holds a value that would betray a leak."""
+    changes, store, options, rejected = cold_evening_case
+    train_only = SignalStore()
+    training_range = SignalSeries("sensor.outdoor_temp", numeric=True)
+    training_range.add(START.timestamp(), -3.0)  # nowhere in the real fixture
+    train_only.add(training_range)
+    provider = StubLLM({"hypotheses": []})
+    hypothesis_mod.propose_and_verify(
+        rejected, changes, store, options, WINDOW, provider, train_store=train_only
+    )
+    prompt = provider.prompts[0]
+    assert '"min": -3.0' in prompt and '"max": -3.0' in prompt
+    assert '"min": 4.0' not in prompt  # the full store's real range
+
+
+def test_signal_catalogue_falls_back_to_the_measuring_store_without_one(cold_evening_case):
+    """Direct callers that pass no train_store (this module's other tests)
+    keep working exactly as before - the fallback is for them, not for a real
+    run, which always has a training slice to hand."""
+    changes, store, options, rejected = cold_evening_case
+    provider = StubLLM({"hypotheses": []})
+    hypothesis_mod.propose_and_verify(rejected, changes, store, options, WINDOW, provider)
+    prompt = provider.prompts[0]
+    assert '"min": 4.0' in prompt and '"max": 18.0' in prompt
 
 
 def test_a_useless_hypothesis_is_measured_and_discarded(cold_evening_case):

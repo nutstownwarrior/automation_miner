@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -136,16 +137,34 @@ class BacktestResult:
     #: result (``validate_holdout=True`` and there was a truth-bearing verdict
     #: to split in the first place).  ``False`` means ``validation`` above is
     #: not meaningful - there is nothing to be honest *about* yet, as for a
-    #: security refusal or a rule that never fired at all.
+    #: security refusal, an audit-only finding, or a rule that never fired and
+    #: was never done at all.
     holdout_evaluated: bool = False
+    #: Machine-checkable reason behind ``validation``, one of:
+    #: ``"evaluated"`` - gated on the holdout, real activity there to judge it
+    #:   against.
+    #: ``"behaviour_absent_in_holdout"`` - the rule would have fired during the
+    #:   holdout but the user never did the thing there any more; gated on the
+    #:   holdout and failed outright, precision 0.
+    #: ``"insufficient_history"`` - the window cannot support a trustworthy
+    #:   holdout at all (too little training or holdout history); fell back to
+    #:   judging the whole window.
+    #: ``"no_activity_in_holdout"`` - neither the rule nor the user did
+    #:   anything during the holdout, so there is genuinely nothing there to
+    #:   judge; fell back to judging the whole window.
+    #: ``""`` when ``holdout_evaluated`` is ``False`` - none of the above
+    #:   applies because a holdout split was never attempted.
+    holdout_reason: str = ""
     #: Days of training history the candidate was mined from, when validated.
     train_days: float = 0.0
     #: Days of held-out history this verdict was judged on, when validated -
     #: 0 when it was not (no split was viable, or none was attempted).
     holdout_days: float = 0.0
     #: The train/holdout/full breakdown behind a validated result, each a
-    #: plain :meth:`as_dict`.  ``None`` outside :func:`backtest`'s
-    #: ``validate_holdout`` path - nothing to break down.
+    #: plain :meth:`as_dict` (without the raw fire-sample timestamps - three
+    #: copies of those would needlessly multiply the stored payload).
+    #: ``None`` outside :func:`backtest`'s ``validate_holdout`` path - nothing
+    #: to break down.
     segments: dict[str, Any] | None = None
 
     @property
@@ -184,6 +203,7 @@ class BacktestResult:
             "risky_domains": self.risky_domains,
             "validation": self.validation,
             "holdout_evaluated": self.holdout_evaluated,
+            "holdout_reason": self.holdout_reason,
             "train_days": round(self.train_days, 1),
             "holdout_days": round(self.holdout_days, 1),
             "validation_note": self.validation_note(),
@@ -203,21 +223,29 @@ class BacktestResult:
         )
 
     def validation_note(self) -> str:
-        """One plain sentence about how trustworthy this verdict is, for the UI.
+        """One plain, always non-empty sentence about how trustworthy this
+        verdict is, for the UI.
 
-        Empty when holdout validation was never attempted on this result (a
-        plain :func:`backtest` call, or one refused/unsimulatable before there
-        was anything to split) - there is nothing to be honest *about* yet, and
-        the existing ``reason`` already explains why.
+        A suggestion must never be silently indistinguishable from one that
+        really was checked against real held-out history - a plain
+        :func:`backtest` call, a security refusal, an audit-only finding, and
+        an AI-proposed rule that skipped validation must all say so, not print
+        nothing where a validated card prints a sentence.
         """
         if not self.holdout_evaluated:
-            return ""
+            return "Not checked against held-out history."
         if self.validation == "holdout":
             days = int(round(self.holdout_days))
             return (
                 f"Validated on {days} day{'s' if days != 1 else ''} of your history "
                 "this rule was not mined from."
             )
+        if self.holdout_reason == "no_activity_in_holdout":
+            return (
+                "In-sample only: nothing happened in the held-out period to check "
+                "this rule against yet."
+            )
+        # holdout_reason == "insufficient_history"
         return (
             "In-sample only: not enough held-out history yet to check this "
             "independently of the data it was found in."
@@ -459,17 +487,56 @@ class WindowSplit:
         return max((self.holdout[1] - self.holdout[0]) / 86400.0, 0.0)
 
 
+def _snap_to_local_midnight(
+    split_ts: float, start: float, end: float, options: Options
+) -> float:
+    """Move *split_ts* to the nearest local-day boundary, when that is still valid.
+
+    A wall-clock split that lands mid-afternoon cuts a daily habit's day in
+    half - part of it trains the miners, part of it judges them - purely
+    because of what time of day the analysis happened to run.  Snapping to a
+    local midnight removes that, and it removes a timezone's DST clock change
+    as a way for ``train_days``/``holdout_days`` to drift across a configured
+    minimum: a day the clocks move on is still exactly one calendar day either
+    side of a midnight, whatever its wall-clock length was.
+
+    If snapping would leave either side below its configured minimum - which
+    the raw split may not have been - the raw, unsnapped split is used
+    instead: a boundary is not worth moving at the cost of a holdout the rest
+    of this module would then have refused to trust anyway.
+    """
+    tz = local_tz()
+    moment = dt.datetime.fromtimestamp(split_ts, tz)
+    midnight = dt.datetime.combine(moment.date(), dt.time(0, 0), tzinfo=tz)
+    next_midnight = midnight + dt.timedelta(days=1)
+    nearest = midnight if (moment - midnight) <= (next_midnight - moment) else next_midnight
+    snapped = min(max(nearest.timestamp(), start), end)
+
+    train_days = max((snapped - start) / 86400.0, 0.0)
+    holdout_days = max((end - snapped) / 86400.0, 0.0)
+    if (
+        train_days >= options.backtest_min_train_days
+        and holdout_days >= options.backtest_min_holdout_days
+    ):
+        return snapped
+    return split_ts
+
+
 def split_window(window: tuple[float, float], options: Options) -> WindowSplit:
     """Carve the *final* ``backtest_holdout_fraction`` of *window* off as a holdout.
 
     A real wall-clock split, not a row-count one: a habit that happened to be
     denser near the end of the window must not thereby buy itself a bigger
     holdout, and one denser near the start must not buy itself a smaller one.
+    The split point itself is then snapped to a local-day boundary - see
+    :func:`_snap_to_local_midnight`.
     """
     start, end = window
+    end = max(end, start)  # a reversed or zero-length window is not split at all
     span_days = max((end - start) / 86400.0, 0.0)
     holdout_days = span_days * options.backtest_holdout_fraction
     split_ts = min(max(end - holdout_days * 86400.0, start), end)
+    split_ts = _snap_to_local_midnight(split_ts, start, end, options)
     return WindowSplit(train=(start, split_ts), holdout=(split_ts, end))
 
 
@@ -480,6 +547,8 @@ def _backtest_window(
     options: Options,
     window: tuple[float, float],
     overrides: Sequence[OverrideEvent] = (),
+    min_true_fires_scale: float = 1.0,
+    risky_true_fires_reference: int | None = None,
 ) -> BacktestResult:
     """Replay one candidate over *window* and decide whether it may be surfaced.
 
@@ -487,6 +556,18 @@ def _backtest_window(
     holdout-validated one (:func:`backtest` with ``validate_holdout=True``) -
     the fire simulation, ground-truth matching and gate thresholds below are
     the same evaluation whichever window they are asked about.
+
+    *min_true_fires_scale* lets the caller preserve the RATE
+    ``backtest_min_true_fires`` represents when *window* is a slice of a
+    bigger one, rather than applying a floor tuned for a whole window
+    unchanged to a quarter of one.  It is ignored for a candidate on the
+    stricter, risky-domain thresholds: those are never scaled down.
+
+    *risky_true_fires_reference*, when given, replaces this call's own
+    ``true_fires`` for the risky-domain floor check only - so a risky
+    candidate's evidence requirement can still be judged against the whole
+    analysis window even while everything else about this call concerns one
+    slice of it.  Ignored for a non-risky candidate.
     """
     tz = local_tz()
     window_days = max((window[1] - window[0]) / 86400.0, 0.01)
@@ -520,8 +601,14 @@ def _backtest_window(
         result.passed = False
         return result
 
+    result.total_fires = len(fires)
     truth = ground_truth_actions(candidate, changes)
-    if not truth:
+    if not truth and not fires:
+        # Genuinely nothing here: the rule would never have fired, and the
+        # user is never on record doing the thing either.  Not "the habit
+        # stopped" (that needs the rule to have fired against nothing) and not
+        # "not enough evidence yet" (that needs some evidence) - there is
+        # simply nothing in this window to have an opinion about.
         result.simulated = False
         result.reason = "no manual occurrences of this action found to compare against"
         result.passed = False
@@ -551,7 +638,6 @@ def _backtest_window(
             unmatched_truth.pop(best_index)
 
     result.missed = len(unmatched_truth)
-    result.total_fires = len(fires)
 
     # A false fire on an entity the user has historically overridden is worse
     # than a merely unnecessary one - it is an active annoyance.
@@ -571,13 +657,24 @@ def _backtest_window(
     # thresholds to every domain, so the tiering has to happen here or nowhere.
     risky = risky_domains(candidate)
     min_precision = options.backtest_min_precision
-    min_true_fires = options.backtest_min_true_fires
     max_false_per_week = options.backtest_max_false_fires_per_week
+    true_fires_for_floor = result.true_fires
     if risky:
         min_precision = max(min_precision, RISKY_MIN_PRECISION)
-        min_true_fires = max(min_true_fires, RISKY_MIN_TRUE_FIRES)
+        # Never scaled down, and always judged against the whole analysis
+        # window when the caller says what that was - a lock or an alarm must
+        # not become easier to pass just because this call only concerns a
+        # slice of the window it was mined from.
+        min_true_fires = max(options.backtest_min_true_fires, RISKY_MIN_TRUE_FIRES)
+        if risky_true_fires_reference is not None:
+            true_fires_for_floor = risky_true_fires_reference
         max_false_per_week = min(max_false_per_week, RISKY_MAX_FALSE_FIRES_PER_WEEK)
         result.risky_domains = risky
+    else:
+        # A floor tuned for a whole window is roughly 4x too strict on a
+        # quarter of one.  Preserve the RATE the floor represents instead of
+        # applying its absolute count unchanged to a smaller slice.
+        min_true_fires = max(1, math.ceil(options.backtest_min_true_fires * min_true_fires_scale))
 
     # The floor comes before the ratios.  One correct fire and no wrong ones is
     # 100% precision, 0 nuisance fires per week, and one observation - it clears
@@ -585,14 +682,22 @@ def _backtest_window(
     if precision is None:
         reasons.append("the rule never fired in the analysed window")
     else:
-        if result.true_fires < min_true_fires:
-            reasons.append(
-                f"the rule was only right {result.true_fires} "
-                f"time{'' if result.true_fires == 1 else 's'} in "
-                f"{result.window_days:.0f} days, which is too little to judge it on "
-                f"(at least {min_true_fires} needed"
-                f"{' for a ' + '/'.join(risky) if risky else ''})"
-            )
+        if true_fires_for_floor < min_true_fires:
+            if risky_true_fires_reference is not None:
+                reasons.append(
+                    f"the rule was only right {true_fires_for_floor} time"
+                    f"{'' if true_fires_for_floor == 1 else 's'} across the whole analysis "
+                    f"window, which is too little to judge a {'/'.join(risky)} on "
+                    f"(at least {min_true_fires} needed)"
+                )
+            else:
+                reasons.append(
+                    f"the rule was only right {true_fires_for_floor} "
+                    f"time{'' if true_fires_for_floor == 1 else 's'} in "
+                    f"{result.window_days:.0f} days, which is too little to judge it on "
+                    f"(at least {min_true_fires} needed"
+                    f"{' for a ' + '/'.join(risky) if risky else ''})"
+                )
         if precision < min_precision:
             reasons.append(
                 f"precision {precision:.0%} is below the {min_precision:.0%} threshold"
@@ -638,6 +743,21 @@ def _backtest_window(
     return result
 
 
+def _segment_summary(result: BacktestResult) -> dict[str, Any]:
+    """A segment's own :meth:`BacktestResult.as_dict`, without the raw fire
+    timestamps.
+
+    Three of these are embedded in every validated result's own ``segments``
+    field.  Keeping the sample arrays in all three multiplies an already
+    persisted payload roughly fourfold for data nothing downstream reads back
+    out of a nested copy - the top-level result keeps its own.
+    """
+    data = result.as_dict()
+    data.pop("fire_samples", None)
+    data.pop("false_fire_samples", None)
+    return data
+
+
 def backtest(
     candidate: Candidate,
     changes: Sequence[StateChange],
@@ -656,49 +776,58 @@ def backtest(
     With it set, the verdict is instead based on a held-out final slice of
     *window* the candidate was not mined from - see :func:`split_window` and
     the ``backtest_holdout_fraction`` / ``backtest_min_holdout_days`` /
-    ``backtest_min_train_days`` options - whenever there is enough of one to
-    trust: at least ``backtest_min_train_days`` of training history, at least
-    ``backtest_min_holdout_days`` of holdout, and at least one real occurrence
-    of the candidate's action inside the holdout to judge it against.  A rule
-    that only ever happened before the split has nothing in the holdout to be
-    right or wrong about, and a "0 false fires" there would be silence, not
-    evidence.
+    ``backtest_min_train_days`` options.  What happens then is a decision
+    table over ``truth_n`` (real occurrences of the action during the
+    holdout) and ``sim_n`` (times the rule would have fired there):
 
-    Without enough of one, this falls back to exactly the plain, in-sample
-    verdict above - grading a rule on the data it was found in, same as
-    before this feature existed - and says so honestly: the returned
-    ``result.validation`` is ``"holdout"`` or ``"in_sample"``, ``holdout_days``
-    /``train_days`` say how much of each was available, and ``segments``
-    carries the train/holdout/full breakdown for anything that wants to show
-    its working.
+    * the window cannot support a trustworthy holdout at all (too little
+      training or holdout history) -> judge the whole window instead, marked
+      ``"in_sample"`` / ``"insufficient_history"``.
+    * ``truth_n == 0 and sim_n == 0`` -> genuinely nothing happened in the
+      holdout to judge the rule against either way -> judge the whole window
+      instead, marked ``"in_sample"`` / ``"no_activity_in_holdout"``.
+    * ``truth_n == 0 and sim_n > 0`` -> the rule would have fired during the
+      holdout against nothing real: the habit it was mined from has stopped.
+      Gated on the holdout and failed outright, marked ``"holdout"`` /
+      ``"behaviour_absent_in_holdout"``.  This is the case a rule that only
+      ever looked good in-sample must not be allowed to hide behind "not
+      enough evidence yet".
+    * ``truth_n > 0`` -> real activity to judge against; gated on the holdout
+      by the ordinary thresholds, marked ``"holdout"`` / ``"evaluated"``.
+
+    Whichever branch is taken, ``result.holdout_reason`` names it,
+    ``holdout_days``/``train_days`` say how much of each was available, and
+    ``segments`` carries the train/holdout/full breakdown for anything that
+    wants to show its working.
     """
     result = _backtest_window(candidate, changes, store, options, window, overrides)
     if not validate_holdout or not result.simulated:
         # Nothing to split: no action to judge, refused outright, unsimulatable,
-        # or no ground truth at all in the whole window - the same reason would
-        # apply to every slice of it.
+        # or no ground truth and no fires at all in the whole window - the same
+        # reason would apply to every slice of it.
         return result
 
     split = split_window(window, options)
+    full_window_days = max((window[1] - window[0]) / 86400.0, 0.01)
+    train_scale = split.train_days / full_window_days
+    holdout_scale = split.holdout_days / full_window_days
     train_changes = [c for c in changes if c.ts < split.train[1]]
     holdout_changes = [c for c in changes if c.ts >= split.train[1]]
     train_result = _backtest_window(
-        candidate, train_changes, store, options, split.train, overrides
+        candidate, train_changes, store, options, split.train, overrides,
+        min_true_fires_scale=train_scale, risky_true_fires_reference=result.true_fires,
     )
     holdout_result = _backtest_window(
-        candidate, holdout_changes, store, options, split.holdout, overrides
+        candidate, holdout_changes, store, options, split.holdout, overrides,
+        min_true_fires_scale=holdout_scale, risky_true_fires_reference=result.true_fires,
     )
 
-    # "At least one opportunity" - not "at least one true fire" - because a
-    # holdout with real occurrences the rule missed entirely is exactly the
-    # kind of failure this feature exists to catch, not a reason to look away
-    # from it and grade the whole window instead.
-    opportunities = holdout_result.true_fires + holdout_result.missed
-    viable = (
-        holdout_result.simulated
-        and split.train_days >= options.backtest_min_train_days
+    truth_n = holdout_result.true_fires + holdout_result.missed
+    sim_n = holdout_result.total_fires
+
+    duration_ok = (
+        split.train_days >= options.backtest_min_train_days
         and split.holdout_days >= options.backtest_min_holdout_days
-        and opportunities >= 1
     )
 
     # Captured before any of the three is mutated below: a validated result's
@@ -706,12 +835,33 @@ def backtest(
     # itself in ``segments`` should read as the plain, unannotated verdict on
     # that slice - not repeat the annotation it is nested inside.
     segments = {
-        "train": train_result.as_dict(),
-        "holdout": holdout_result.as_dict(),
-        "full": result.as_dict(),
+        "train": _segment_summary(train_result),
+        "holdout": _segment_summary(holdout_result),
+        "full": _segment_summary(result),
     }
-    chosen = holdout_result if viable else result
-    chosen.validation = "holdout" if viable else "in_sample"
+
+    if not duration_ok:
+        chosen, validation, reason_code = result, "in_sample", "insufficient_history"
+    elif truth_n == 0 and sim_n == 0:
+        chosen, validation, reason_code = result, "in_sample", "no_activity_in_holdout"
+    elif truth_n == 0:  # and sim_n > 0
+        chosen, validation, reason_code = holdout_result, "holdout", "behaviour_absent_in_holdout"
+        # The ordinary floor already guarantees this fails - true_fires is 0,
+        # and every floor in this module requires at least 1 - but the point
+        # of this branch is to say exactly what happened rather than let a
+        # generic "too little evidence" reason stand in for "this stopped
+        # working", so both are made explicit here rather than left implicit.
+        chosen.passed = False
+        chosen.reason = (
+            f"this would have fired {sim_n} time{'' if sim_n == 1 else 's'} during the "
+            "held-out period against nothing you actually did there - the habit it was "
+            "found in appears to have stopped"
+        )
+    else:
+        chosen, validation, reason_code = holdout_result, "holdout", "evaluated"
+
+    chosen.validation = validation
+    chosen.holdout_reason = reason_code
     chosen.holdout_evaluated = True
     chosen.train_days = round(split.train_days, 1)
     chosen.holdout_days = round(split.holdout_days, 1)

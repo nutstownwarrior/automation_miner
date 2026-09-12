@@ -353,7 +353,7 @@ def test_a_verified_hypothesis_is_surfaced_and_supersedes_its_origin(
     captured: dict[str, object] = {}
 
     def fake_propose(rejected, changes, signal_store, options, window, provider,
-                     resolver=None, overrides=()):
+                     resolver=None, overrides=(), train_store=None):
         assert rejected, "the pipeline must hand over the rejected candidates"
         origin = rejected[0]
         captured["origin_id"] = origin.id
@@ -841,3 +841,94 @@ def test_short_history_falls_back_to_in_sample_validation_and_says_so(
         if backtest.get("holdout_evaluated"):
             assert backtest["validation"] == "in_sample"
             assert "not enough held-out history" in backtest["validation_note"]
+
+
+def test_miners_never_see_a_state_change_from_the_holdout(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    """The structural fix this whole feature depends on: a miner that could
+    see the holdout would be mining the answer, not a habit."""
+    import amminer.miners.time_of_day as tod_module
+    from amminer.backtest import split_window
+
+    captured: dict = {}
+    original = tod_module.mine
+
+    def spy(changes, options, window, resolver):
+        captured["changes"] = list(changes)
+        captured["window"] = window
+        return original(changes, options, window, resolver)
+
+    monkeypatch.setattr(tod_module, "mine", spy)
+    report, _candidates = run(ha_config_dir, store, fake_client)
+    assert "changes" in captured, "the time_of_day miner must have run"
+
+    split = split_window(report.window, Options())
+    assert captured["window"] == split.train
+    assert all(c.ts < split.train[1] for c in captured["changes"]), (
+        "a state change at or after the split point reached a miner"
+    )
+
+
+def test_train_store_never_holds_a_holdout_timestamp(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    """The signal store handed to miners must be as clean of the holdout as
+    the raw state changes are - a leaked signal value would let a miner
+    choose a threshold using data it was never supposed to see."""
+    import amminer.miners.motif as motif_module
+    from amminer.backtest import split_window
+
+    captured: dict = {}
+    original = motif_module.mine
+
+    def spy(changes, options, sig_store, window, resolver):
+        captured["store"] = sig_store
+        return original(changes, options, sig_store, window, resolver)
+
+    monkeypatch.setattr(motif_module, "mine", spy)
+    report, _candidates = run(ha_config_dir, store, fake_client)
+    assert "store" in captured, "the motif miner must have run"
+
+    split = split_window(report.window, Options())
+    train_store = captured["store"]
+    assert train_store.series, "the training store must not be empty"
+    for entity_id, series in train_store.series.items():
+        assert all(ts < split.train[1] for ts in series.times), (
+            entity_id, [ts for ts in series.times if ts >= split.train[1]],
+        )
+
+
+def test_no_suggestion_ever_shows_a_blank_validation_line(ha_config_dir, store, fake_client):
+    """A missing validation sentence would be indistinguishable from a
+    validated one - every suggestion with a backtest must say something."""
+    run(ha_config_dir, store, fake_client)
+    checked = 0
+    for suggestion in store.list_suggestions():
+        backtest = suggestion["payload"].get("backtest")
+        if not backtest:
+            continue
+        checked += 1
+        assert backtest.get("validation_note"), suggestion["id"]
+    assert checked > 0, "this run must have produced at least one backtested suggestion"
+
+
+def test_no_activity_in_holdout_is_reported_as_a_run_level_degradation(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    """Distinct from the window-too-short note: the window can be plenty
+    long and a particular candidate can still have nothing in its holdout to
+    judge it against - that is worth telling the user too."""
+    import amminer.pipeline as pipeline_module
+
+    original = pipeline_module.backtest_all
+
+    def stub(candidates, changes, store_arg, options, window, overrides=()):
+        passed, rejected = original(candidates, changes, store_arg, options, window, overrides)
+        if passed:
+            passed[0].backtest["holdout_reason"] = "no_activity_in_holdout"
+        return passed, rejected
+
+    monkeypatch.setattr(pipeline_module, "backtest_all", stub)
+    report, _candidates = run(ha_config_dir, store, fake_client)
+    assert any("no activity in the held-out period" in d for d in report.degradations)

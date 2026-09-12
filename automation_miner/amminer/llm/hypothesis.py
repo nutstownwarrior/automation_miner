@@ -265,12 +265,23 @@ def propose_and_verify(
     provider: BaseProvider,
     resolver=None,
     overrides: Sequence[Any] = (),
+    train_store=None,
 ) -> HypothesisResult:
-    """Ask for explanations of rejected candidates, then measure each.  Never raises."""
+    """Ask for explanations of rejected candidates, then measure each.  Never raises.
+
+    *store* is asked for the whole analysis window and is what each proposal is
+    finally measured against, via :func:`backtest`'s holdout validation.
+    *train_store* is what the model is shown to choose a threshold from
+    (:func:`_signal_catalogue`) - it defaults to *store* only for callers that
+    do not have a train-only store to hand (this module's own direct unit
+    tests); a real run always passes the training slice, so a numeric bound is
+    never picked with the holdout's own values in view.
+    """
     result = HypothesisResult()
     if not provider.enabled:
         result.error = "no LLM provider configured"
         return result
+    catalogue_store = train_store if train_store is not None else store
 
     workable = [
         candidate
@@ -287,7 +298,7 @@ def propose_and_verify(
     if not workable:
         return result
 
-    catalogue = _signal_catalogue(store, resolver)
+    catalogue = _signal_catalogue(catalogue_store, resolver)
     if not catalogue:
         result.error = "no signals available to build a hypothesis from"
         return result
@@ -342,7 +353,9 @@ def propose_and_verify(
                 conditions=conditions,
             )
             variant = _variant(candidate, hypothesis)
-            outcome = backtest(variant, changes, store, options, window, overrides)
+            outcome = backtest(
+                variant, changes, store, options, window, overrides, validate_holdout=True
+            )
             hypothesis.backtest = outcome.as_dict()
             hypothesis.accepted = outcome.passed
             variant.backtest = hypothesis.backtest

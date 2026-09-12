@@ -386,6 +386,12 @@ def run_analysis(
         # up by id and never enumerate it, so they see exactly what they did.
         all_entities = sorted({c.entity_id for c in changes} | set(signals.all_entities))
         window = (start_ts, end_ts)
+        # The full window, used below for the backtest step (which needs to
+        # see the holdout to judge candidates against it) and for the audit
+        # miner (see the note by that call): unlike everything mined for a
+        # suggestion, staleness is a fact about age and configuration, not a
+        # statistical pattern being generalised, so there is nothing for it to
+        # leak by seeing the whole window.
         full_store = build_signal_store(changes, all_entities, queries, window)
 
         # --- train/holdout split ---------------------------------------
@@ -468,6 +474,11 @@ def run_analysis(
                 "Switch the recorder to MariaDB and raise purge_keep_days to enable them."
             )
 
+        # Deliberately the full window, not train_changes/train_window: a stale
+        # or unused automation is found by its age and configuration
+        # (last_triggered, whether anything still references it), not by
+        # mining a behavioural pattern that then has to generalise.  There is
+        # no train/holdout split to leak across here.
         audit_findings = run_miner(
             "audit", stale.mine, changes, resolver, options, window, override_counts
         )
@@ -498,6 +509,19 @@ def run_analysis(
             passed, rejected = [], list(mined)
         else:
             passed, rejected = backtested
+            # holdout validation is per-candidate: the window can be long
+            # enough for a trustworthy split and a particular candidate can
+            # still have had nothing happen in it either way (see
+            # BacktestResult.holdout_reason).  That is worth a run-level note
+            # too, distinct from "the window itself was too short" above.
+            if any(
+                (c.backtest or {}).get("holdout_reason") == "no_activity_in_holdout"
+                for c in passed + rejected
+            ):
+                report.degradations.append(
+                    "Some suggestions had no activity in the held-out period to check them "
+                    "against, so they were graded on the whole analysis window instead."
+                )
         # --- AI hypotheses: propose, then measure with the same gate ---
         if provider is not None and options.llm_hypotheses and rejected:
             hypotheses = run_ai(
@@ -511,6 +535,7 @@ def run_analysis(
                 provider,
                 resolver,
                 overrides,
+                train_store,
             )
             if hypotheses is not None and hypotheses.accepted:
                 accepted_origins = {

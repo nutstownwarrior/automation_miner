@@ -233,6 +233,21 @@ def build_signal_store(
                 except Exception as err:  # noqa: BLE001
                     _LOGGER.debug("Could not read statistics: %s", err)
                     rows = []
+                if end_ts is not None:
+                    # The query itself only requires a bucket to *start*
+                    # before end_ts, so the final bucket's mean can cover up
+                    # to fifty-nine minutes past it.  That is invisible to
+                    # value_at() (which never looks past the ts it is asked
+                    # about) but not to code that reads a series' values
+                    # wholesale (amminer.miners.motif, amminer.miners.energy)
+                    # - and past a train/holdout split, those are minutes of
+                    # holdout readings inside a value handed to the miners as
+                    # training data.  Require the whole bucket to have closed
+                    # at or before the boundary instead.
+                    rows = [
+                        row for row in rows
+                        if float(row["start_ts"]) + STATISTICS_INTERVAL_SECONDS <= end_ts
+                    ]
                 by_entity: dict[str, SignalSeries] = {}
                 for row in rows:
                     value = row.get("mean")

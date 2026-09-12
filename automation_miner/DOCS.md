@@ -129,13 +129,16 @@ held back: nothing is mined from it, and it is used only to judge what was
 mined from the rest.
 
 When there is enough of both - at least `backtest_min_holdout_days` (default
-`7`) of holdout, at least `backtest_min_train_days` (default `14`) of training
-history, and at least one real occurrence to compare against in the holdout -
-a suggestion is gated on how it did on history it never saw, and its card says
-so ("validated on N days of held-out history"). With too little history for
-that, it falls back to being judged on the whole window, and says so plainly
-too ("in-sample only - not enough history yet"). Either way, the same
-thresholds above decide pass or fail.
+`7`) of holdout and at least `backtest_min_train_days` (default `14`) of
+training history - a suggestion is gated on how it did on history it never
+saw, and its card says so ("validated on N days of held-out history"). If the
+rule would have fired during that period but the user never actually did the
+thing any more, that is treated as the habit having stopped - the suggestion
+is rejected outright, not given the benefit of the doubt. With too little
+history to trust a holdout at all, or with genuinely nothing having happened
+in it either way, it falls back to being judged on the whole window instead,
+and says so plainly ("in-sample only"). Either way, the same thresholds above
+decide pass or fail.
 
 ### `llm_gaps`
 Off by default. Lets the model propose integrations or hardware the built-in

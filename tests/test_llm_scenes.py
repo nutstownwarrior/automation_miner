@@ -94,6 +94,12 @@ def test_a_real_grouping_is_consolidated_and_measured(bedtime):
     }
     assert len(scene.triggers) == 1
     assert scene.backtest["passed"] is True
+    # A consolidated scene is measured the same way any other candidate is:
+    # gated on a real holdout when there is enough history, never silently
+    # left looking unvalidated.
+    assert scene.backtest["holdout_evaluated"] is True
+    assert scene.backtest["validation"] == "holdout"
+    assert scene.backtest["validation_note"]
 
 
 def test_the_scene_does_not_inherit_its_members_scores(bedtime):
