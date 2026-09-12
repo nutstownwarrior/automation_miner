@@ -19,7 +19,7 @@ from typing import Any
 
 _LOGGER = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 STATUS_NEW = "new"
 STATUS_DISMISSED = "dismissed"
@@ -91,6 +91,12 @@ CREATE TABLE IF NOT EXISTS backtests (
     missed               INTEGER,
     false_fires_per_week REAL,
     passed               INTEGER NOT NULL DEFAULT 0,
+    -- 'holdout' when passed/precision/etc above were judged on history the
+    -- candidate was not mined from, 'in_sample' when there was not enough of
+    -- it and the whole analysis window was judged instead.
+    validation            TEXT NOT NULL DEFAULT 'in_sample',
+    train_days            REAL,
+    holdout_days          REAL,
     payload              TEXT
 );
 
@@ -171,6 +177,9 @@ class Store:
     _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
         ("preferences", "source", "TEXT NOT NULL DEFAULT 'learned'"),
         ("preferences", "edited", "INTEGER NOT NULL DEFAULT 0"),
+        ("backtests", "validation", "TEXT NOT NULL DEFAULT 'in_sample'"),
+        ("backtests", "train_days", "REAL"),
+        ("backtests", "holdout_days", "REAL"),
     )
 
     def _migrate(self) -> None:
@@ -677,13 +686,16 @@ class Store:
     def save_backtest(self, suggestion_id: str, result: dict[str, Any]) -> None:
         self._execute(
             "INSERT INTO backtests(suggestion_id, ts, precision_score, recall_score, true_fires,"
-            " false_fires, missed, false_fires_per_week, passed, payload)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?)"
+            " false_fires, missed, false_fires_per_week, passed, validation, train_days,"
+            " holdout_days, payload)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)"
             " ON CONFLICT(suggestion_id) DO UPDATE SET ts=excluded.ts,"
             " precision_score=excluded.precision_score, recall_score=excluded.recall_score,"
             " true_fires=excluded.true_fires, false_fires=excluded.false_fires,"
             " missed=excluded.missed, false_fires_per_week=excluded.false_fires_per_week,"
-            " passed=excluded.passed, payload=excluded.payload",
+            " passed=excluded.passed, validation=excluded.validation,"
+            " train_days=excluded.train_days, holdout_days=excluded.holdout_days,"
+            " payload=excluded.payload",
             (
                 suggestion_id,
                 time.time(),
@@ -694,6 +706,9 @@ class Store:
                 result.get("missed"),
                 result.get("false_fires_per_week"),
                 1 if result.get("passed") else 0,
+                result.get("validation", "in_sample"),
+                result.get("train_days"),
+                result.get("holdout_days"),
                 _json(result),
             ),
         )

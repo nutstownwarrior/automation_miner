@@ -12,7 +12,7 @@ def add(store, suggestion_id="s1", miner="time_of_day", score=0.8, run_id=1):
 
 
 def test_schema_is_created_and_counts_start_empty(store):
-    assert store.get_meta("schema_version") == "1"
+    assert store.get_meta("schema_version") == "2"
     assert all(count == 0 for count in store.counts().values())
 
 
@@ -80,8 +80,66 @@ def test_backtest_round_trip(store):
     assert stored["precision_score"] == 0.9
     assert stored["passed"] == 1
     assert stored["payload"]["summary"] == "good"
+    # No validation was recorded: a plain backtest, not a holdout-checked one.
+    assert stored["validation"] == "in_sample"
+    assert stored["train_days"] is None
     # It is also attached when the suggestion is read.
     assert store.get_suggestion("s1")["backtest"]["precision_score"] == 0.9
+
+
+def test_backtest_round_trip_carries_holdout_validation(store):
+    add(store)
+    store.save_backtest("s1", {"precision": 0.95, "recall": 0.8, "true_fires": 7,
+                               "false_fires": 0, "missed": 1, "false_fires_per_week": 0.0,
+                               "passed": True, "summary": "good", "validation": "holdout",
+                               "train_days": 33.8, "holdout_days": 11.2})
+    stored = store.get_backtest("s1")
+    assert stored["validation"] == "holdout"
+    assert stored["train_days"] == 33.8
+    assert stored["holdout_days"] == 11.2
+
+
+def test_an_old_database_migrates_the_backtest_validation_columns(tmp_path):
+    """A database from before this feature existed has no holdout columns at
+    all; opening it must add them rather than fail."""
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(str(path))
+    conn.executescript(
+        """
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO meta(key, value) VALUES ('schema_version', '1');
+        CREATE TABLE backtests (
+            suggestion_id        TEXT PRIMARY KEY,
+            ts                   REAL NOT NULL,
+            precision_score      REAL,
+            recall_score         REAL,
+            true_fires           INTEGER,
+            false_fires          INTEGER,
+            missed               INTEGER,
+            false_fires_per_week REAL,
+            passed               INTEGER NOT NULL DEFAULT 0,
+            payload              TEXT
+        );
+        INSERT INTO backtests(suggestion_id, ts, precision_score, passed, payload)
+        VALUES ('old-one', 0.0, 0.6, 1, '{}');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    with Store(path) as store:
+        assert store.get_meta("schema_version") == "2"
+        old = store.get_backtest("old-one")
+        assert old["precision_score"] == 0.6
+        assert old["validation"] == "in_sample"  # the new column's default
+        assert old["train_days"] is None
+        # And the store is fully usable afterwards, not just readable.
+        store.save_backtest(
+            "old-one", {"precision": 0.9, "passed": True, "validation": "holdout"}
+        )
+        assert store.get_backtest("old-one")["validation"] == "holdout"
 
 
 def test_overrides_are_deduplicated(store):

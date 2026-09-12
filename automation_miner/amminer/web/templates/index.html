@@ -49,6 +49,9 @@
 
     {% if p.backtest and p.backtest.summary %}
     <p class="small {{ 'ok' if p.backtest.passed else 'warn' }}">Backtest: {{ p.backtest.summary }}</p>
+    {% if p.backtest.validation_note %}
+    <p class="small muted">{{ p.backtest.validation_note }}</p>
+    {% endif %}
     {% endif %}
     {% if p.evidence and p.evidence.summary %}
     <p class="small muted">Evidence: {{ p.evidence.summary }}</p>

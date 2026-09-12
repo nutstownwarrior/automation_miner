@@ -5,7 +5,13 @@ from __future__ import annotations
 import datetime as dt
 
 import pytest
-from amminer.backtest import backtest, backtest_all, ground_truth_actions, simulate_fires
+from amminer.backtest import (
+    backtest,
+    backtest_all,
+    ground_truth_actions,
+    simulate_fires,
+    split_window,
+)
 from amminer.config import Options
 from amminer.enrich.signals import SignalSeries, SignalStore
 from amminer.miners.base import Action, Candidate, Condition, Trigger
@@ -681,3 +687,111 @@ def test_the_refusal_can_be_lifted_deliberately():
     assert result.simulated is True
     assert result.risky_domains == ["lock"]  # still on the stricter thresholds
     assert result.passed is True, result.reason
+
+
+# --- temporal holdout validation -----------------------------------------
+def test_split_window_is_a_wall_clock_split_of_the_final_fraction():
+    """A row-count split would let a habit that got denser near the end of the
+    window buy itself a bigger holdout; this must not move with the data."""
+    split = split_window(WINDOW, Options(backtest_holdout_fraction=0.25))
+    assert split.train == (WINDOW[0], WINDOW[0] + 21 * 86400.0)
+    assert split.holdout == (WINDOW[0] + 21 * 86400.0, WINDOW[1])
+    assert split.train_days == pytest.approx(21.0)
+    assert split.holdout_days == pytest.approx(7.0)
+
+
+def test_plain_backtest_never_validates_on_a_holdout():
+    """Without asking for it, backtest() is exactly what it always was."""
+    changes = [
+        human("light.kitchen", "on", (START + dt.timedelta(days=d, hours=6, minutes=30)).timestamp())
+        for d in range(DAYS)
+    ]
+    result = backtest(daily_candidate(), changes, SignalStore(), Options(), WINDOW)
+    assert result.validation == "in_sample"
+    assert result.holdout_evaluated is False
+    assert result.segments is None
+
+
+def test_a_habit_that_only_held_up_in_sample_is_rejected_by_holdout_gating():
+    """The point of the whole feature: precision measured on the data a rule
+    was mined from is not evidence it would hold up on data it was not - and
+    a rule that only looks good in-sample must not be surfaced as if it does."""
+    # The training slice (the first 21 days): a perfect daily habit.
+    changes = [
+        human("light.kitchen", "on", (START + dt.timedelta(days=d, hours=6, minutes=30)).timestamp())
+        for d in range(21)
+    ]
+    # The holdout (the final 7 days): the habit has all but stopped.  The rule
+    # itself is an unconditional daily trigger, so it keeps firing every one
+    # of those 7 days regardless; the user only actually did it once.
+    changes.append(
+        human("light.kitchen", "on", (START + dt.timedelta(days=21, hours=6, minutes=30)).timestamp())
+    )
+
+    options = Options()
+    in_sample = backtest(daily_candidate(), changes, SignalStore(), options, WINDOW)
+    assert in_sample.passed is True, in_sample.reason
+    assert in_sample.precision == pytest.approx(22 / 28)
+
+    validated = backtest(
+        daily_candidate(), changes, SignalStore(), options, WINDOW, validate_holdout=True
+    )
+    assert validated.validation == "holdout"
+    assert validated.holdout_days == pytest.approx(7.0)
+    assert validated.train_days == pytest.approx(21.0)
+    assert validated.true_fires == 1  # only the one real occurrence in the holdout
+    assert validated.false_fires == 6
+    assert validated.passed is False
+    assert "too little to judge" in validated.reason
+    # The train/holdout/full breakdown is there for anyone who wants to see
+    # that this did look fine in-sample - it just is not what gated it.
+    assert validated.segments["full"]["passed"] is True
+    assert validated.segments["holdout"]["true_fires"] == 1
+
+
+def test_too_little_history_falls_back_to_in_sample_and_says_so():
+    """A window too short for a trustworthy holdout must not silently pass
+    (nor silently fail) on one - it falls back, and the fallback is labelled."""
+    short_window = (START.timestamp(), (START + dt.timedelta(days=10)).timestamp())
+    changes = [
+        human("light.kitchen", "on", (START + dt.timedelta(days=d, hours=6, minutes=30)).timestamp())
+        for d in range(10)
+    ]
+    options = Options()  # backtest_holdout_fraction=0.25 -> 2.5 days, below the 7-day floor
+    plain = backtest(daily_candidate(), changes, SignalStore(), options, short_window)
+    validated = backtest(
+        daily_candidate(), changes, SignalStore(), options, short_window, validate_holdout=True
+    )
+    assert validated.validation == "in_sample"
+    assert validated.holdout_evaluated is True
+    assert validated.holdout_days == pytest.approx(2.5)
+    assert validated.train_days == pytest.approx(7.5)
+    # Falling back means exactly that: the same verdict a plain backtest gives.
+    assert validated.passed == plain.passed
+    assert validated.true_fires == plain.true_fires
+    assert "not enough held-out history" in validated.validation_note()
+
+
+def test_a_real_habit_with_enough_history_is_validated_on_the_holdout():
+    changes = [
+        human("light.kitchen", "on", (START + dt.timedelta(days=d, hours=6, minutes=30)).timestamp())
+        for d in range(DAYS)
+    ]
+    result = backtest(
+        daily_candidate(), changes, SignalStore(), Options(), WINDOW, validate_holdout=True
+    )
+    assert result.validation == "holdout"
+    assert result.holdout_days == pytest.approx(7.0)
+    assert result.passed is True, result.reason
+    assert result.true_fires == 7  # only the holdout week counts now
+    assert "Validated on 7 days" in result.validation_note()
+
+
+def test_backtest_all_defaults_to_holdout_validation():
+    good = daily_candidate()
+    changes = [
+        human("light.kitchen", "on", (START + dt.timedelta(days=d, hours=6, minutes=30)).timestamp())
+        for d in range(DAYS)
+    ]
+    passed, _rejected = backtest_all([good], changes, SignalStore(), Options(), WINDOW)
+    assert passed[0].backtest["validation"] == "holdout"

@@ -800,3 +800,44 @@ def test_a_dismissed_scene_is_not_surfaced_again(
     second, _ = run(ha_config_dir, store, fake_client, llm_provider="ollama", llm_scenes=True)
     assert scene.id not in {s["id"] for s in store.list_suggestions(status="new")}
     assert second.surfaced == first.surfaced - 1
+
+
+# --- temporal holdout validation ------------------------------------------
+def test_a_real_habit_is_validated_on_a_holdout_it_was_not_mined_from(
+    ha_config_dir, store, fake_client
+):
+    """The default fixture has 45 days of history - enough for a real holdout."""
+    report, _candidates = run(ha_config_dir, store, fake_client)
+    assert report.status == "ok"
+
+    validated = [
+        s for s in store.list_suggestions(status="new")
+        if (s["payload"].get("backtest") or {}).get("validation") == "holdout"
+    ]
+    assert validated, "at least the strong 06:30 habit should clear a real holdout"
+    for suggestion in validated:
+        backtest = suggestion["payload"]["backtest"]
+        assert backtest["holdout_days"] >= Options().backtest_min_holdout_days
+        assert "Validated on" in backtest["validation_note"]
+    assert not any("held out to validate" in d for d in report.degradations), (
+        "45 days is enough history; this run must not claim otherwise"
+    )
+
+
+def test_short_history_falls_back_to_in_sample_validation_and_says_so(
+    tmp_path, store, fake_client
+):
+    """Too little history for a trustworthy holdout: fall back, and say so."""
+    (tmp_path / ".storage").mkdir(parents=True)
+    (tmp_path / "configuration.yaml").write_text("recorder:\n  purge_keep_days: 60\n")
+    build_default_fixture(tmp_path / "home-assistant_v2.db", days=10, seed=3)
+
+    report, _candidates = run(tmp_path, store, fake_client)
+    assert report.status == "ok"
+    assert any("held out to validate" in d for d in report.degradations)
+
+    for suggestion in store.list_suggestions(status="new"):
+        backtest = suggestion["payload"].get("backtest") or {}
+        if backtest.get("holdout_evaluated"):
+            assert backtest["validation"] == "in_sample"
+            assert "not enough held-out history" in backtest["validation_note"]

@@ -147,6 +147,23 @@ class Options:
     #: they land exactly where the user has already said no.
     backtest_max_nuisance_fires: int = 0
 
+    # --- temporal holdout validation ---
+    #: How much of the *end* of the analysis window is carved off as a holdout:
+    #: mined from by nothing, and used only to judge what was mined from the
+    #: rest.  A rule graded on the data it was found in is not being tested,
+    #: it is being re-described.
+    backtest_holdout_fraction: float = 0.25
+    #: Below this many days of held-out history, a verdict on it is not
+    #: trustworthy enough to gate on - too few days makes "no false fires in
+    #: the holdout" mean "the holdout barely happened" rather than "the rule
+    #: holds up".  The candidate falls back to being judged in-sample, and is
+    #: honestly labelled as such rather than silently passed either way.
+    backtest_min_holdout_days: int = 7
+    #: Below this many days of *training* history, there is not enough left to
+    #: mine a candidate from once its holdout has been carved out of the
+    #: window - a short window should shrink the holdout, not starve mining.
+    backtest_min_train_days: int = 14
+
     #: Allow suggestions whose action unlocks, opens or disarms something.  Off
     #: by default: these are security decisions, not conveniences.
     allow_security_actions: bool = False
@@ -241,6 +258,9 @@ class Options:
         self.backtest_min_true_fires = max(int(self.backtest_min_true_fires), 1)
         self.backtest_max_nuisance_fires = max(int(self.backtest_max_nuisance_fires), 0)
         self.backtest_match_tolerance_seconds = max(int(self.backtest_match_tolerance_seconds), 1)
+        self.backtest_holdout_fraction = min(max(float(self.backtest_holdout_fraction), 0.0), 0.9)
+        self.backtest_min_holdout_days = max(int(self.backtest_min_holdout_days), 1)
+        self.backtest_min_train_days = max(int(self.backtest_min_train_days), 1)
         self.sequence_min_occurrences = max(int(self.sequence_min_occurrences), 2)
         self.association_window_seconds = max(int(self.association_window_seconds), 1)
         self.stale_automation_days = max(int(self.stale_automation_days), 1)

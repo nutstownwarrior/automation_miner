@@ -220,7 +220,12 @@ def cold_evening_case():
         score=0.6,
     )
     options = Options(llm_hypotheses=True)
-    passed, rejected = backtest_all([candidate], changes, store, options, WINDOW)
+    # This fixture is about the rescue, not about holdout validation - the
+    # exact 0.5 baseline precision below is what the hypothesis is rescuing it
+    # from, and only holds over the whole alternating cold/warm window.
+    passed, rejected = backtest_all(
+        [candidate], changes, store, options, WINDOW, validate_holdout=False
+    )
     assert not passed and rejected, "the baseline rule must be rejected for this test"
     return changes, store, options, rejected
 

@@ -40,6 +40,9 @@ options:
   backtest_min_true_fires: 4
   backtest_max_false_fires_per_week: 3
   backtest_max_nuisance_fires: 0
+  backtest_holdout_fraction: 0.25
+  backtest_min_holdout_days: 7
+  backtest_min_train_days: 14
   allow_security_actions: false
   notify_on_new_suggestions: true
   notify_service: ""
@@ -77,6 +80,9 @@ schema:
   backtest_min_true_fires: int(1,1000)?
   backtest_max_false_fires_per_week: float(0.0,1000.0)?
   backtest_max_nuisance_fires: int(0,1000)?
+  backtest_holdout_fraction: float(0.0,0.9)?
+  backtest_min_holdout_days: int(1,3650)?
+  backtest_min_train_days: int(1,3650)?
   allow_security_actions: bool?
   notify_on_new_suggestions: bool?
   notify_service: str?

@@ -126,6 +126,27 @@ class BacktestResult:
     burst_fires: int = 0
     #: Action domains that put this candidate on the stricter thresholds.
     risky_domains: list[str] = field(default_factory=list)
+    #: ``"holdout"`` when this result was gated on history the candidate was
+    #: not mined from, ``"in_sample"`` when there was not enough of it and the
+    #: whole window was judged instead.  Set by :func:`backtest` only when
+    #: asked to validate; a plain backtest is always ``"in_sample"`` because
+    #: nothing here was withheld from anything.
+    validation: str = "in_sample"
+    #: Whether :func:`backtest` actually attempted a holdout split for this
+    #: result (``validate_holdout=True`` and there was a truth-bearing verdict
+    #: to split in the first place).  ``False`` means ``validation`` above is
+    #: not meaningful - there is nothing to be honest *about* yet, as for a
+    #: security refusal or a rule that never fired at all.
+    holdout_evaluated: bool = False
+    #: Days of training history the candidate was mined from, when validated.
+    train_days: float = 0.0
+    #: Days of held-out history this verdict was judged on, when validated -
+    #: 0 when it was not (no split was viable, or none was attempted).
+    holdout_days: float = 0.0
+    #: The train/holdout/full breakdown behind a validated result, each a
+    #: plain :meth:`as_dict`.  ``None`` outside :func:`backtest`'s
+    #: ``validate_holdout`` path - nothing to break down.
+    segments: dict[str, Any] | None = None
 
     @property
     def precision(self) -> float | None:
@@ -161,6 +182,12 @@ class BacktestResult:
             "false_fire_samples": self.false_fire_samples[:20],
             "burst_fires": self.burst_fires,
             "risky_domains": self.risky_domains,
+            "validation": self.validation,
+            "holdout_evaluated": self.holdout_evaluated,
+            "train_days": round(self.train_days, 1),
+            "holdout_days": round(self.holdout_days, 1),
+            "validation_note": self.validation_note(),
+            "segments": self.segments,
             "summary": self.summary(),
         }
 
@@ -173,6 +200,27 @@ class BacktestResult:
             f"{self.true_fires} correct, {self.false_fires} unwanted "
             f"({self.false_fires_per_week:.1f}/week), {self.missed} missed - "
             f"precision {precision}, recall {recall}"
+        )
+
+    def validation_note(self) -> str:
+        """One plain sentence about how trustworthy this verdict is, for the UI.
+
+        Empty when holdout validation was never attempted on this result (a
+        plain :func:`backtest` call, or one refused/unsimulatable before there
+        was anything to split) - there is nothing to be honest *about* yet, and
+        the existing ``reason`` already explains why.
+        """
+        if not self.holdout_evaluated:
+            return ""
+        if self.validation == "holdout":
+            days = int(round(self.holdout_days))
+            return (
+                f"Validated on {days} day{'s' if days != 1 else ''} of your history "
+                "this rule was not mined from."
+            )
+        return (
+            "In-sample only: not enough held-out history yet to check this "
+            "independently of the data it was found in."
         )
 
 
@@ -393,7 +441,39 @@ def ground_truth_actions(
     )
 
 
-def backtest(
+@dataclass(frozen=True)
+class WindowSplit:
+    """A wall-clock split of an analysis window into training and holdout."""
+
+    #: Everything up to the split point - what miners and a plain backtest see.
+    train: tuple[float, float]
+    #: The final slice - held back from mining, used only to judge it.
+    holdout: tuple[float, float]
+
+    @property
+    def train_days(self) -> float:
+        return max((self.train[1] - self.train[0]) / 86400.0, 0.0)
+
+    @property
+    def holdout_days(self) -> float:
+        return max((self.holdout[1] - self.holdout[0]) / 86400.0, 0.0)
+
+
+def split_window(window: tuple[float, float], options: Options) -> WindowSplit:
+    """Carve the *final* ``backtest_holdout_fraction`` of *window* off as a holdout.
+
+    A real wall-clock split, not a row-count one: a habit that happened to be
+    denser near the end of the window must not thereby buy itself a bigger
+    holdout, and one denser near the start must not buy itself a smaller one.
+    """
+    start, end = window
+    span_days = max((end - start) / 86400.0, 0.0)
+    holdout_days = span_days * options.backtest_holdout_fraction
+    split_ts = min(max(end - holdout_days * 86400.0, start), end)
+    return WindowSplit(train=(start, split_ts), holdout=(split_ts, end))
+
+
+def _backtest_window(
     candidate: Candidate,
     changes: Sequence[StateChange],
     store: SignalStore,
@@ -401,7 +481,13 @@ def backtest(
     window: tuple[float, float],
     overrides: Sequence[OverrideEvent] = (),
 ) -> BacktestResult:
-    """Replay one candidate and decide whether it may be surfaced."""
+    """Replay one candidate over *window* and decide whether it may be surfaced.
+
+    Shared by the plain, single-window backtest and each segment of a
+    holdout-validated one (:func:`backtest` with ``validate_holdout=True``) -
+    the fire simulation, ground-truth matching and gate thresholds below are
+    the same evaluation whichever window they are asked about.
+    """
     tz = local_tz()
     window_days = max((window[1] - window[0]) / 86400.0, 0.01)
     result = BacktestResult(window_days=window_days)
@@ -552,6 +638,87 @@ def backtest(
     return result
 
 
+def backtest(
+    candidate: Candidate,
+    changes: Sequence[StateChange],
+    store: SignalStore,
+    options: Options,
+    window: tuple[float, float],
+    overrides: Sequence[OverrideEvent] = (),
+    validate_holdout: bool = False,
+) -> BacktestResult:
+    """Replay one candidate and decide whether it may be surfaced.
+
+    With *validate_holdout* left off (the default, and every direct call in
+    this module's own tests), this is exactly :func:`_backtest_window`: one
+    verdict over the whole of *window*.
+
+    With it set, the verdict is instead based on a held-out final slice of
+    *window* the candidate was not mined from - see :func:`split_window` and
+    the ``backtest_holdout_fraction`` / ``backtest_min_holdout_days`` /
+    ``backtest_min_train_days`` options - whenever there is enough of one to
+    trust: at least ``backtest_min_train_days`` of training history, at least
+    ``backtest_min_holdout_days`` of holdout, and at least one real occurrence
+    of the candidate's action inside the holdout to judge it against.  A rule
+    that only ever happened before the split has nothing in the holdout to be
+    right or wrong about, and a "0 false fires" there would be silence, not
+    evidence.
+
+    Without enough of one, this falls back to exactly the plain, in-sample
+    verdict above - grading a rule on the data it was found in, same as
+    before this feature existed - and says so honestly: the returned
+    ``result.validation`` is ``"holdout"`` or ``"in_sample"``, ``holdout_days``
+    /``train_days`` say how much of each was available, and ``segments``
+    carries the train/holdout/full breakdown for anything that wants to show
+    its working.
+    """
+    result = _backtest_window(candidate, changes, store, options, window, overrides)
+    if not validate_holdout or not result.simulated:
+        # Nothing to split: no action to judge, refused outright, unsimulatable,
+        # or no ground truth at all in the whole window - the same reason would
+        # apply to every slice of it.
+        return result
+
+    split = split_window(window, options)
+    train_changes = [c for c in changes if c.ts < split.train[1]]
+    holdout_changes = [c for c in changes if c.ts >= split.train[1]]
+    train_result = _backtest_window(
+        candidate, train_changes, store, options, split.train, overrides
+    )
+    holdout_result = _backtest_window(
+        candidate, holdout_changes, store, options, split.holdout, overrides
+    )
+
+    # "At least one opportunity" - not "at least one true fire" - because a
+    # holdout with real occurrences the rule missed entirely is exactly the
+    # kind of failure this feature exists to catch, not a reason to look away
+    # from it and grade the whole window instead.
+    opportunities = holdout_result.true_fires + holdout_result.missed
+    viable = (
+        holdout_result.simulated
+        and split.train_days >= options.backtest_min_train_days
+        and split.holdout_days >= options.backtest_min_holdout_days
+        and opportunities >= 1
+    )
+
+    # Captured before any of the three is mutated below: a validated result's
+    # own top-level fields already say which one won, so its nested copy of
+    # itself in ``segments`` should read as the plain, unannotated verdict on
+    # that slice - not repeat the annotation it is nested inside.
+    segments = {
+        "train": train_result.as_dict(),
+        "holdout": holdout_result.as_dict(),
+        "full": result.as_dict(),
+    }
+    chosen = holdout_result if viable else result
+    chosen.validation = "holdout" if viable else "in_sample"
+    chosen.holdout_evaluated = True
+    chosen.train_days = round(split.train_days, 1)
+    chosen.holdout_days = round(split.holdout_days, 1)
+    chosen.segments = segments
+    return chosen
+
+
 def shadow_evaluate(
     candidate: Candidate,
     changes: Sequence[StateChange],
@@ -599,12 +766,21 @@ def backtest_all(
     options: Options,
     window: tuple[float, float],
     overrides: Sequence[OverrideEvent] = (),
+    validate_holdout: bool = True,
 ) -> tuple[list[Candidate], list[Candidate]]:
-    """Backtest every candidate; return ``(passed, rejected)``."""
+    """Backtest every candidate; return ``(passed, rejected)``.
+
+    Gated on out-of-sample history by default - see :func:`backtest` - since
+    this is what decides what a real user is shown.  Pass ``validate_holdout=
+    False`` for a plain, in-sample backtest instead.
+    """
     passed: list[Candidate] = []
     rejected: list[Candidate] = []
     for candidate in candidates:
-        result = backtest(candidate, changes, store, options, window, overrides)
+        result = backtest(
+            candidate, changes, store, options, window, overrides,
+            validate_holdout=validate_holdout,
+        )
         candidate.backtest = result.as_dict()
         if result.passed:
             # A well-backtested rule deserves to outrank a merely frequent one.
