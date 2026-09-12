@@ -243,10 +243,13 @@ def build_signal_store(
                     # - and past a train/holdout split, those are minutes of
                     # holdout readings inside a value handed to the miners as
                     # training data.  Require the whole bucket to have closed
-                    # at or before the boundary instead.
+                    # strictly before the boundary instead: a point stamped
+                    # exactly at end_ts is itself holdout, by the same ``ts <
+                    # split`` convention amminer.pipeline uses to split the
+                    # raw state changes.
                     rows = [
                         row for row in rows
-                        if float(row["start_ts"]) + STATISTICS_INTERVAL_SECONDS <= end_ts
+                        if float(row["start_ts"]) + STATISTICS_INTERVAL_SECONDS < end_ts
                     ]
                 by_entity: dict[str, SignalSeries] = {}
                 for row in rows:

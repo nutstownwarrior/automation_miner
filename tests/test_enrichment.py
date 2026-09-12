@@ -171,11 +171,13 @@ class _StubStatisticsQueries:
         ]
 
 
-def test_a_bucket_that_closes_past_the_boundary_is_not_used():
+def test_a_bucket_that_closes_at_or_past_the_boundary_is_not_used():
     """A hunt for train/holdout leakage: an hourly mean is a training-time
-    value only if the WHOLE hour it covers ended at or before the boundary -
-    the query's own start_ts < end_ts filter alone lets in a bucket whose mean
-    covers up to fifty-nine minutes past it."""
+    value only if the WHOLE hour it covers closed STRICTLY before the
+    boundary - the query's own start_ts < end_ts filter alone lets in a
+    bucket whose mean covers up to fifty-nine minutes past it, and a bucket
+    landing exactly on the boundary is itself holdout by the same ``ts <
+    split`` convention the raw state changes are split on."""
     from amminer.enrich.signals import STATISTICS_INTERVAL_SECONDS
 
     boundary = 1_000_000.0
@@ -185,12 +187,17 @@ def test_a_bucket_that_closes_past_the_boundary_is_not_used():
         # Starts before the boundary but its hour only closes after it: must
         # not be used as training data.
         {"statistic_id": "sensor.temp", "start_ts": boundary - 1800, "mean": 99.0},
+        # Closes exactly on the boundary: the point it would be stamped at is
+        # itself the first holdout instant, not the last training one.
+        {"statistic_id": "sensor.temp",
+         "start_ts": boundary - STATISTICS_INTERVAL_SECONDS, "mean": 77.0},
     ])
     store = build_signal_store([], ["sensor.temp"], queries, (boundary - 86400, boundary))
     series = store.get("sensor.temp")
     assert series is not None
-    assert all(ts <= boundary for ts in series.times), series.times
+    assert all(ts < boundary for ts in series.times), series.times
     assert 99.0 not in series.values
+    assert 77.0 not in series.values
     assert series.numeric_at(boundary - 7200 + STATISTICS_INTERVAL_SECONDS) == 10.0
 
 

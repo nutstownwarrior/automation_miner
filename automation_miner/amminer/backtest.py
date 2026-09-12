@@ -487,6 +487,27 @@ class WindowSplit:
         return max((self.holdout[1] - self.holdout[0]) / 86400.0, 0.0)
 
 
+def _local_midnight(date: dt.date, tz: dt.tzinfo) -> dt.datetime:
+    """The start of *date* in *tz*, tolerant of a local midnight that does not
+    exist at all.
+
+    A handful of zones (Brazil before 2019, among others) used to start
+    daylight saving exactly at midnight, so a naive "00:00 that date" is never
+    on the wall clock: ``zoneinfo`` still resolves it to *some* instant, but
+    silently the wrong one - round-tripping it back through the same zone
+    reads a different hour, an hour this function's caller would otherwise
+    hand out as "midnight" without ever having looked.  When that happens, the
+    resolved instant is used instead: since nothing between 00:00 and the
+    jump ever happened on this date's clock, it genuinely is the first moment
+    the date exists.
+    """
+    candidate = dt.datetime.combine(date, dt.time(0, 0), tzinfo=tz)
+    resolved = dt.datetime.fromtimestamp(candidate.timestamp(), tz)
+    if resolved.date() == date and resolved.hour == 0 and resolved.minute == 0:
+        return candidate
+    return resolved
+
+
 def _snap_to_local_midnight(
     split_ts: float, start: float, end: float, options: Options
 ) -> float:
@@ -507,8 +528,8 @@ def _snap_to_local_midnight(
     """
     tz = local_tz()
     moment = dt.datetime.fromtimestamp(split_ts, tz)
-    midnight = dt.datetime.combine(moment.date(), dt.time(0, 0), tzinfo=tz)
-    next_midnight = midnight + dt.timedelta(days=1)
+    midnight = _local_midnight(moment.date(), tz)
+    next_midnight = _local_midnight(moment.date() + dt.timedelta(days=1), tz)
     nearest = midnight if (moment - midnight) <= (next_midnight - moment) else next_midnight
     snapped = min(max(nearest.timestamp(), start), end)
 
@@ -548,7 +569,6 @@ def _backtest_window(
     window: tuple[float, float],
     overrides: Sequence[OverrideEvent] = (),
     min_true_fires_scale: float = 1.0,
-    risky_true_fires_reference: int | None = None,
 ) -> BacktestResult:
     """Replay one candidate over *window* and decide whether it may be surfaced.
 
@@ -560,14 +580,11 @@ def _backtest_window(
     *min_true_fires_scale* lets the caller preserve the RATE
     ``backtest_min_true_fires`` represents when *window* is a slice of a
     bigger one, rather than applying a floor tuned for a whole window
-    unchanged to a quarter of one.  It is ignored for a candidate on the
-    stricter, risky-domain thresholds: those are never scaled down.
-
-    *risky_true_fires_reference*, when given, replaces this call's own
-    ``true_fires`` for the risky-domain floor check only - so a risky
-    candidate's evidence requirement can still be judged against the whole
-    analysis window even while everything else about this call concerns one
-    slice of it.  Ignored for a non-risky candidate.
+    unchanged to a quarter of one - never below 2, because a floor of 1 is no
+    floor at all.  It is ignored for a candidate on the stricter, risky-domain
+    thresholds: those are never scaled down, on either side of a holdout split
+    - see :func:`backtest`, which additionally requires every risky threshold
+    to still clear the whole, unscaled analysis window as well.
     """
     tz = local_tz()
     window_days = max((window[1] - window[0]) / 86400.0, 0.01)
@@ -658,23 +675,19 @@ def _backtest_window(
     risky = risky_domains(candidate)
     min_precision = options.backtest_min_precision
     max_false_per_week = options.backtest_max_false_fires_per_week
-    true_fires_for_floor = result.true_fires
     if risky:
         min_precision = max(min_precision, RISKY_MIN_PRECISION)
-        # Never scaled down, and always judged against the whole analysis
-        # window when the caller says what that was - a lock or an alarm must
-        # not become easier to pass just because this call only concerns a
-        # slice of the window it was mined from.
+        # Never scaled down: see the module-level note on backtest().
         min_true_fires = max(options.backtest_min_true_fires, RISKY_MIN_TRUE_FIRES)
-        if risky_true_fires_reference is not None:
-            true_fires_for_floor = risky_true_fires_reference
         max_false_per_week = min(max_false_per_week, RISKY_MAX_FALSE_FIRES_PER_WEEK)
         result.risky_domains = risky
     else:
         # A floor tuned for a whole window is roughly 4x too strict on a
         # quarter of one.  Preserve the RATE the floor represents instead of
-        # applying its absolute count unchanged to a smaller slice.
-        min_true_fires = max(1, math.ceil(options.backtest_min_true_fires * min_true_fires_scale))
+        # applying its absolute count unchanged to a smaller slice - but never
+        # all the way down to 1, which is not a floor, it is a single
+        # observation with a threshold's name on it.
+        min_true_fires = max(2, math.ceil(options.backtest_min_true_fires * min_true_fires_scale))
 
     # The floor comes before the ratios.  One correct fire and no wrong ones is
     # 100% precision, 0 nuisance fires per week, and one observation - it clears
@@ -682,21 +695,13 @@ def _backtest_window(
     if precision is None:
         reasons.append("the rule never fired in the analysed window")
     else:
-        if true_fires_for_floor < min_true_fires:
-            if risky_true_fires_reference is not None:
-                reasons.append(
-                    f"the rule was only right {true_fires_for_floor} time"
-                    f"{'' if true_fires_for_floor == 1 else 's'} across the whole analysis "
-                    f"window, which is too little to judge a {'/'.join(risky)} on "
-                    f"(at least {min_true_fires} needed)"
-                )
-            else:
-                reasons.append(
-                    f"the rule was only right {true_fires_for_floor} "
-                    f"time{'' if true_fires_for_floor == 1 else 's'} in "
-                    f"{result.window_days:.0f} days, which is too little to judge it on "
-                    f"(at least {min_true_fires} needed"
-                    f"{' for a ' + '/'.join(risky) if risky else ''})"
+        if result.true_fires < min_true_fires:
+            reasons.append(
+                f"the rule was only right {result.true_fires} "
+                f"time{'' if result.true_fires == 1 else 's'} in "
+                f"{result.window_days:.0f} days, which is too little to judge it on "
+                f"(at least {min_true_fires} needed"
+                f"{' for a ' + '/'.join(risky) if risky else ''})"
                 )
         if precision < min_precision:
             reasons.append(
@@ -773,12 +778,23 @@ def backtest(
     this module's own tests), this is exactly :func:`_backtest_window`: one
     verdict over the whole of *window*.
 
-    With it set, the verdict is instead based on a held-out final slice of
-    *window* the candidate was not mined from - see :func:`split_window` and
-    the ``backtest_holdout_fraction`` / ``backtest_min_holdout_days`` /
-    ``backtest_min_train_days`` options.  What happens then is a decision
-    table over ``truth_n`` (real occurrences of the action during the
-    holdout) and ``sim_n`` (times the rule would have fired there):
+    With it set, the holdout is *additive*, never a replacement: a candidate
+    must clear the full-window gates exactly as it always did - unscaled,
+    unconditional, the same evaluation a plain :func:`backtest` call would
+    give - and, when the holdout is viable, must *also* clear the holdout's
+    own gates.  This is deliberate and load-bearing: it is what makes "never
+    easier to pass than before this feature existed" true by construction
+    rather than something that has to be re-argued for every threshold
+    (including, and especially, the risky-domain ones - a lock or an alarm's
+    thresholds are checked against the whole window as they always were, with
+    the holdout adding a second, independent hurdle on top, never standing in
+    for the first).
+
+    See :func:`split_window` and the ``backtest_holdout_fraction`` /
+    ``backtest_min_holdout_days`` / ``backtest_min_train_days`` options for
+    the split itself.  What happens then is a decision table over ``truth_n``
+    (real occurrences of the action during the holdout) and ``sim_n`` (times
+    the rule would have fired there):
 
     * the window cannot support a trustworthy holdout at all (too little
       training or holdout history) -> judge the whole window instead, marked
@@ -788,12 +804,15 @@ def backtest(
       instead, marked ``"in_sample"`` / ``"no_activity_in_holdout"``.
     * ``truth_n == 0 and sim_n > 0`` -> the rule would have fired during the
       holdout against nothing real: the habit it was mined from has stopped.
-      Gated on the holdout and failed outright, marked ``"holdout"`` /
+      Failed outright regardless of the full window, marked ``"holdout"`` /
       ``"behaviour_absent_in_holdout"``.  This is the case a rule that only
       ever looked good in-sample must not be allowed to hide behind "not
-      enough evidence yet".
-    * ``truth_n > 0`` -> real activity to judge against; gated on the holdout
-      by the ordinary thresholds, marked ``"holdout"`` / ``"evaluated"``.
+      enough evidence yet" - an additional way to fail, not a replacement for
+      the ones below.
+    * ``truth_n > 0`` -> real activity to judge against; passes only if BOTH
+      the full window and the holdout (its floor scaled to the rate the
+      full-window one represents, for a non-risky candidate) clear every
+      threshold, marked ``"holdout"`` / ``"evaluated"``.
 
     Whichever branch is taken, ``result.holdout_reason`` names it,
     ``holdout_days``/``train_days`` say how much of each was available, and
@@ -815,11 +834,11 @@ def backtest(
     holdout_changes = [c for c in changes if c.ts >= split.train[1]]
     train_result = _backtest_window(
         candidate, train_changes, store, options, split.train, overrides,
-        min_true_fires_scale=train_scale, risky_true_fires_reference=result.true_fires,
+        min_true_fires_scale=train_scale,
     )
     holdout_result = _backtest_window(
         candidate, holdout_changes, store, options, split.holdout, overrides,
-        min_true_fires_scale=holdout_scale, risky_true_fires_reference=result.true_fires,
+        min_true_fires_scale=holdout_scale,
     )
 
     truth_n = holdout_result.true_fires + holdout_result.missed
@@ -858,7 +877,22 @@ def backtest(
             "found in appears to have stopped"
         )
     else:
+        # Additive, not a replacement: the full-window verdict is the pre-PR
+        # bar, unscaled and unconditional, and holds regardless of what the
+        # holdout alone would have said.  A candidate that would not have
+        # been surfaced before this feature existed - a risky false-fire
+        # budget blown entirely during training, say - must not be surfaced
+        # now just because its holdout slice happens to look clean in
+        # isolation.
         chosen, validation, reason_code = holdout_result, "holdout", "evaluated"
+        chosen.passed = result.passed and holdout_result.passed
+        if not chosen.passed:
+            reasons = []
+            if not result.passed:
+                reasons.append(f"fails the full-window check ({result.reason})")
+            if not holdout_result.passed:
+                reasons.append(f"fails the holdout check ({holdout_result.reason})")
+            chosen.reason = "; ".join(reasons)
 
     chosen.validation = validation
     chosen.holdout_reason = reason_code

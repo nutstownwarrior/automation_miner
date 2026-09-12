@@ -33,7 +33,7 @@
     </dl>
     {% endif %}
     {% if backtest.validation_note %}
-    <p class="small {{ 'ok' if backtest.validation == 'holdout' else 'warn' }}">
+    <p class="small {{ 'ok' if backtest.passed else 'warn' }}">
       {{ backtest.validation_note }}
     </p>
     {% endif %}
