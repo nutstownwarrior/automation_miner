@@ -258,6 +258,14 @@ def condition_entities(signals: SignalSet) -> list[str]:
         signals.workday,
         signals.holiday,
         signals.occupancy,
+        # The inferred household mode (amminer.learn.home_mode) - not
+        # detected by any regex heuristic like the groups above, but the same
+        # SignalSeries shape, tested through the exact same search below.
+        # This is the whole point of exposing it as a signal at all: no
+        # special case needed here beyond listing it. See SignalSet.home_mode
+        # for the one caveat that does *not* apply to any other entry in this
+        # function - nothing in Home Assistant's registry backs this id yet.
+        signals.home_mode,
         signals.price_level,
         signals.energy_price,
         signals.carbon_intensity,

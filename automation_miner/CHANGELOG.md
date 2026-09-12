@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.8.0
+
+**Added: inferred household mode — `home_mode_enabled` (on by default)**
+
+The single most predictive variable in a home has never had an entity: whether
+the household is asleep, out, winding down, cooking, hosting guests. Without
+it, a real habit that is actually driven by that unobserved state looks like
+noisy clock behaviour to every miner - a light that goes on inconsistently
+around 22:00-23:00 on "winding down" evenings clears neither the time-of-day
+miner's consistency bar nor the conditional miner's, when conditioned on the
+right latent state it would clear both easily.
+
+A small hidden Markov model, fit nightly with EM (pure numpy - no
+scikit-learn, no hmmlearn) on binned human activity from **training-window
+data only**, now infers a handful of such household modes and exposes the
+result as an ordinary signal (`amminer/learn/home_mode.py`) in exactly the
+shape `amminer/enrich/signals.py` already produces - `amminer.miners.conditional`
+tests it exactly like it tests outdoor temperature or a workday sensor,
+through the code path that already existed.
+
+- The number of modes is never hardcoded: it is selected per household, from
+  a small range, by held-out likelihood on a slice of training data the fit
+  never saw (falling back to BIC when there is not enough history to spare
+  the slice) - a quiet or simple home legitimately comes back with two.
+- States are unlabelled and unsupervised. Nothing claims a mode is "asleep" or
+  "away" - each is described by what was actually observed while the model
+  was in it (typical hours, most active domains and areas), and a fitted
+  model that turns out weakly separated says so rather than presenting a
+  confident-looking split that is not really there. An optional, clearly
+  marked LLM-proposed label (`llm_home_mode_labels`, off by default) can
+  suggest a friendlier name - advisory only, and the feature works
+  identically with no LLM configured.
+- Fitted on the same training window every other miner mines from, never the
+  holdout carved off to validate suggestions against - the mode signal is an
+  input to mining, so leaking the holdout into it would reopen exactly the
+  leak PR #9 exists to prevent.
+- Bounded for a nightly cron on a Raspberry Pi: at most 60 days of 15-minute
+  activity bins, a handful of candidate state counts, a handful of restarts,
+  a capped iteration count - see the module's own docstring for the exact
+  figures and the reasoning behind each one.
+- Like the ranking model, this only ever adds a conditionable signal. It
+  cannot change whether a candidate passes its backtest or conflict checks.
+
+Known limitation, stated plainly rather than papered over: the inferred mode
+is not (yet) published as a live Home Assistant entity, so a suggestion
+whose only distinguishing condition is the household's mode cannot be
+one-click-applied today - `amminer.llm.validate` correctly refuses to ship a
+trigger or condition naming an entity Home Assistant does not have. The
+signal is already useful for mining, scoring and explaining habits; making it
+literally appliable needs a follow-up that publishes the current mode into
+Home Assistant as a helper entity kept up to date between nightly runs.
+
 ## 0.7.0
 
 **Added: learned ordering — `ranking_enabled` (on by default)**

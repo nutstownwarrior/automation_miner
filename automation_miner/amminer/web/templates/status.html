@@ -157,6 +157,57 @@
 </section>
 
 <section class="panel">
+  <h3>Household modes</h3>
+  {% if report and report.home_mode and report.home_mode.fitted %}
+  <p class="muted small">
+    Inferred from your own activity, fit only on history before the held-out
+    period used to validate suggestions. These are <strong>unlabelled,
+    unsupervised patterns</strong>, not known facts - each is described by what
+    was actually observed while the model was in it, never a guess at what it
+    "means" like "asleep" or "away", unless you can see that for yourself below.
+  </p>
+  <dl class="metrics wide">
+    <div><dt>Modes found</dt><dd>{{ report.home_mode.n_states }}</dd></div>
+    <div><dt>Chosen by</dt>
+      <dd>{{ 'held-out likelihood' if report.home_mode.selection_method == 'held_out_likelihood' else 'in-sample fit (BIC) - not enough history yet for a held-out check' }}</dd></div>
+    <div><dt>Trained on</dt><dd>{{ (report.home_mode.train_bins * report.home_mode.bin_seconds / 86400) | round(1) }} days of activity</dd></div>
+  </dl>
+  {% if report.home_mode.weakly_separated %}
+  <p class="muted small">
+    <strong>These modes overlap heavily.</strong> The activity while in one is
+    not clearly different from another, so treat the split below as tentative
+    rather than as real, distinguishable household patterns yet.
+  </p>
+  {% endif %}
+  <ul class="plain small">
+    {% for state in report.home_mode.state_summaries %}
+    <li>
+      <strong>{{ state.label }}</strong>
+      {% if state.llm_label %} - "{{ state.llm_label }}" (AI-suggested name, not a known fact){% endif %}:
+      active {{ (state.occupancy_share * 100) | round(1) }}% of observed time{% if state.typical_time %},
+      typically around {{ state.typical_time[:5] }} (±{{ state.typical_spread_minutes | round(0) }} min){% endif %}{% if state.top_domains %},
+      mostly {{ state.top_domains | join(', ') }} activity{% endif %}{% if state.top_areas %}
+      in {{ state.top_areas | join(', ') }}{% endif %}.
+    </li>
+    {% endfor %}
+  </ul>
+  <p class="muted small">
+    Used only as a signal the conditional miner can test suggestions against
+    (like outdoor temperature or a workday sensor) - it cannot rescue a
+    suggestion that failed its backtest. It is not yet published as a Home
+    Assistant entity, so a suggestion that depends only on it cannot be
+    applied as a live automation until that exists.
+  </p>
+  {% elif report and report.home_mode %}
+  <p class="muted">No household mode could be inferred yet: {{ report.home_mode.fallback_reason }}</p>
+  {% elif options.home_mode_enabled %}
+  <p class="muted">Not yet trained - it runs during the next analysis.</p>
+  {% else %}
+  <p class="muted">Off. No mode signal is offered to the conditional miner.</p>
+  {% endif %}
+</section>
+
+<section class="panel">
   <h3>Recent runs</h3>
   <table class="grid">
     <thead><tr><th>Started</th><th>Status</th><th>Surfaced</th><th>Rejected</th><th>Window</th></tr></thead>
