@@ -577,14 +577,18 @@ def _backtest_window(
     the fire simulation, ground-truth matching and gate thresholds below are
     the same evaluation whichever window they are asked about.
 
-    *min_true_fires_scale* lets the caller preserve the RATE
-    ``backtest_min_true_fires`` represents when *window* is a slice of a
-    bigger one, rather than applying a floor tuned for a whole window
-    unchanged to a quarter of one - never below 2, because a floor of 1 is no
-    floor at all.  It is ignored for a candidate on the stricter, risky-domain
-    thresholds: those are never scaled down, on either side of a holdout split
-    - see :func:`backtest`, which additionally requires every risky threshold
-    to still clear the whole, unscaled analysis window as well.
+    *min_true_fires_scale* lets the caller preserve the RATE a true-fires
+    floor represents when *window* is a slice of a bigger one, rather than
+    applying a floor tuned for a whole window unchanged to a quarter of one -
+    never below 2 once scaled, because a floor of 1 is no floor at all.  Left
+    at its default of ``1.0`` (every full-window call, including every direct
+    call in this module's own tests), the floor is exactly the configured
+    value, unscaled and unfloored - a user who asks for
+    ``backtest_min_true_fires: 1`` gets exactly that on the whole window,
+    byte-for-byte the pre-holdout-feature behaviour.  This applies to a risky
+    domain's stricter floor too: :func:`backtest` additionally requires every
+    risky threshold to still clear the whole, unscaled analysis window
+    (``min_true_fires_scale=1.0`` there) as well as its scaled holdout one.
     """
     tz = local_tz()
     window_days = max((window[1] - window[0]) / 86400.0, 0.01)
@@ -675,19 +679,33 @@ def _backtest_window(
     risky = risky_domains(candidate)
     min_precision = options.backtest_min_precision
     max_false_per_week = options.backtest_max_false_fires_per_week
+    # The false-fires-per-week budget is already a RATE, not a count, so it
+    # needs no scaling either way - a risky domain's zero tolerance is
+    # absolute on the full window and on the holdout alike; a lock may never
+    # misfire, whatever slice of history is being asked about.
     if risky:
         min_precision = max(min_precision, RISKY_MIN_PRECISION)
-        # Never scaled down: see the module-level note on backtest().
-        min_true_fires = max(options.backtest_min_true_fires, RISKY_MIN_TRUE_FIRES)
         max_false_per_week = min(max_false_per_week, RISKY_MAX_FALSE_FIRES_PER_WEEK)
         result.risky_domains = risky
+        base_min_true_fires = max(options.backtest_min_true_fires, RISKY_MIN_TRUE_FIRES)
+    else:
+        base_min_true_fires = options.backtest_min_true_fires
+
+    if min_true_fires_scale == 1.0:
+        # The full-window floor: exactly the configured (or risky-tiered)
+        # value, unscaled and unfloored - this is the pre-holdout-feature
+        # bar, and it must stay byte-for-byte that regardless of what a
+        # holdout slice separately requires.
+        min_true_fires = base_min_true_fires
     else:
         # A floor tuned for a whole window is roughly 4x too strict on a
-        # quarter of one.  Preserve the RATE the floor represents instead of
-        # applying its absolute count unchanged to a smaller slice - but never
-        # all the way down to 1, which is not a floor, it is a single
-        # observation with a threshold's name on it.
-        min_true_fires = max(2, math.ceil(options.backtest_min_true_fires * min_true_fires_scale))
+        # quarter of one - true for an ordinary floor and equally true for a
+        # risky-tiered one, whose 12-fires bar was never meant to be met
+        # inside a single week.  Preserve the RATE the floor represents
+        # instead of applying its absolute count unchanged to a smaller slice
+        # - but never all the way down to 1, which is not a floor, it is a
+        # single observation with a threshold's name on it.
+        min_true_fires = max(2, math.ceil(base_min_true_fires * min_true_fires_scale))
 
     # The floor comes before the ratios.  One correct fire and no wrong ones is
     # 100% precision, 0 nuisance fires per week, and one observation - it clears

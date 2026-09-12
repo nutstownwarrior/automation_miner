@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import random
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -1064,6 +1065,129 @@ def test_a_risky_rules_true_fires_floor_is_checked_against_the_full_window():
     assert validated.passed is False, "10 total fires must still fail the unscaled 12-fire floor"
     assert "at least 12 needed" in validated.reason
     assert validated.risky_domains == ["lock"]
+
+
+def test_a_risky_rule_with_genuine_evidence_can_still_surface():
+    """RISKY_MIN_TRUE_FIRES (12) unscaled on BOTH the full window and a
+    7-day holdout demanded nearly two correct lock-fires a day - practically
+    unreachable, and a real product regression.  The holdout-side floor is
+    scaled to the rate the full-window one represents (same as an ordinary
+    rule), so a lock with real, consistent evidence across the whole window
+    can surface; the full-window floor stays the unscaled 12 it always was."""
+    candidate, changes, store = _repeating("lock.lock", "lock.front_door", days=28)
+    validated = backtest(candidate, changes, store, Options(), WINDOW, validate_holdout=True)
+    assert validated.validation == "holdout"
+    assert validated.risky_domains == ["lock"]
+    assert validated.passed is True, validated.reason
+
+
+def test_a_risky_rule_with_too_little_evidence_never_becomes_easier():
+    """The same shape of rule, but with only 10 correct fires (all inside
+    training, so the holdout falls back to in-sample) - below the unscaled
+    12-fire floor, exactly as it always was.  Holdout validation must never
+    make this pass when a plain backtest would not have."""
+    candidate, changes, store = _repeating("lock.lock", "lock.front_door", days=10)
+    plain = backtest(candidate, changes, store, Options(), WINDOW)
+    assert plain.passed is False
+    validated = backtest(candidate, changes, store, Options(), WINDOW, validate_holdout=True)
+    assert validated.passed is False, "must never be easier to pass than the plain backtest"
+
+
+def test_a_configured_min_true_fires_of_one_is_honoured_on_the_full_window():
+    """backtest_min_true_fires: 1 is schema-permitted.  The full-window floor
+    must use it exactly - not silently raised to the holdout side's minimum
+    of 2, which exists only to keep a SCALED floor meaningful."""
+    once = (START + dt.timedelta(days=3, hours=6, minutes=30)).timestamp()
+    candidate = Candidate(
+        miner="test",
+        title="single occurrence",
+        triggers=[Trigger(kind="state", entity_id="binary_sensor.door", to_state="on")],
+        actions=[Action(service="light.turn_on", entity_id="light.kitchen")],
+    )
+    store = SignalStore()
+    series = SignalSeries("binary_sensor.door")
+    series.add(once - 30, "on")
+    store.add(series)
+    changes = [human("light.kitchen", "on", once)]
+
+    options = Options(backtest_min_true_fires=1)
+    plain = backtest(candidate, changes, store, options, WINDOW)
+    assert plain.true_fires == 1
+    assert plain.passed is True, plain.reason
+
+    # And the same full-window floor applies unmodified inside the additive
+    # holdout path - this candidate has no holdout activity at all, so it
+    # falls back to exactly this verdict.
+    validated = backtest(candidate, changes, store, options, WINDOW, validate_holdout=True)
+    assert validated.holdout_reason == "no_activity_in_holdout"
+    assert validated.passed is True, validated.reason
+
+
+# --- a structural invariant: holdout validation is additive, never easier -
+def test_holdout_validation_never_passes_what_the_full_window_would_reject():
+    """Randomised regression guard for the property the additive design exists
+    to guarantee: passing with ``validate_holdout=True`` must always imply the
+    plain, full-window backtest also passes.  This is a direct consequence of
+    ``chosen.passed = result.passed and holdout_result.passed`` (and every
+    other branch either returning the plain result outright or forcing an
+    extra failure) - not a search for a counterexample so much as a standing
+    guard against a future change to this file quietly breaking it, which
+    matters more here than in most modules: three more PRs build on this one.
+
+    Deliberately in-memory and seeded: no recorder, no I/O, so it stays fast
+    and exactly repeatable.
+    """
+    rng = random.Random(20240912)
+    options_pool = [
+        Options(),
+        Options(backtest_min_true_fires=1),
+        Options(backtest_min_true_fires=2),
+        Options(backtest_holdout_fraction=0.3),
+        Options(backtest_holdout_fraction=0.1),
+        Options(backtest_min_precision=0.5),
+        Options(backtest_max_false_fires_per_week=1.0),
+    ]
+    densities = (0.9, 0.7, 0.5, 0.3, 0.1, 0.0, 1.0)
+    services = (
+        ("light.turn_on", "light.kitchen"),
+        ("lock.lock", "lock.front_door"),
+    )
+
+    checked = 0
+    for _ in range(200):
+        service, entity_id = rng.choice(services)
+        target = "locked" if service == "lock.lock" else "on"
+        fire_days = {d for d in range(28) if rng.random() < rng.choice(densities)}
+        truth_days = {d for d in range(28) if rng.random() < rng.choice(densities)}
+
+        store = SignalStore()
+        series = SignalSeries("binary_sensor.trigger")
+        for day in sorted(fire_days):
+            ts = (START + dt.timedelta(days=day, hours=12)).timestamp()
+            series.add(ts - 30, "on")
+            series.add(ts - 20, "off")
+        store.add(series)
+        changes = [
+            human(entity_id, target, (START + dt.timedelta(days=day, hours=12)).timestamp())
+            for day in sorted(truth_days)
+        ]
+        candidate = Candidate(
+            miner="test",
+            title="property",
+            triggers=[Trigger(kind="state", entity_id="binary_sensor.trigger", to_state="on")],
+            actions=[Action(service=service, entity_id=entity_id)],
+        )
+        options = rng.choice(options_pool)
+
+        plain = backtest(candidate, changes, store, options, WINDOW)
+        validated = backtest(candidate, changes, store, options, WINDOW, validate_holdout=True)
+        checked += 1
+        if validated.passed:
+            assert plain.passed, (
+                "holdout validation passed a candidate the full window would not",
+                vars(options), sorted(fire_days), sorted(truth_days),
+            )
+    assert checked == 200
 
 
 # --- the split point is a local-day boundary, and survives DST ----------
