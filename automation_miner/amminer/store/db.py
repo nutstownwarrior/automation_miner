@@ -19,7 +19,7 @@ from typing import Any
 
 _LOGGER = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 STATUS_NEW = "new"
 STATUS_DISMISSED = "dismissed"
@@ -149,6 +149,22 @@ CREATE TABLE IF NOT EXISTS gap_suggestions (
     first_seen_ts REAL NOT NULL,
     last_seen_ts  REAL NOT NULL
 );
+
+-- A single row (id fixed at 1) holding whatever acceptance-probability model
+-- (see amminer.learn.ranking) is currently trained.  Retrained wholesale each
+-- run from amminer.learn.ranking, never patched in place - there is nothing
+-- incremental about the fit, so there is nothing to migrate row by row.
+CREATE TABLE IF NOT EXISTS ranking_models (
+    id                     INTEGER PRIMARY KEY CHECK (id = 1),
+    feature_schema_version INTEGER NOT NULL,
+    n_labels               INTEGER NOT NULL,
+    trained_ts             REAL NOT NULL,
+    fallback_to_prior      INTEGER NOT NULL DEFAULT 1,
+    fallback_reason        TEXT,
+    prior_k                INTEGER NOT NULL,
+    bias                   REAL NOT NULL,
+    weights                TEXT NOT NULL
+);
 """
 
 
@@ -180,6 +196,11 @@ class Store:
         ("backtests", "validation", "TEXT NOT NULL DEFAULT 'in_sample'"),
         ("backtests", "train_days", "REAL"),
         ("backtests", "holdout_days", "REAL"),
+        # NULL until amminer.learn.ranking has scored a suggestion at least
+        # once - list_suggestions orders by this first, and NULL sorting last
+        # (SQLite's default) is exactly "fall back to score" for a suggestion
+        # ranking has never touched, with nothing else to special-case.
+        ("suggestions", "accept_probability", "REAL"),
     )
 
     def _migrate(self) -> None:
@@ -288,8 +309,16 @@ class Store:
         score: float,
         payload: dict[str, Any],
         run_id: int | None = None,
+        accept_probability: float | None = None,
     ) -> str:
-        """Insert or refresh a suggestion; never resurrects a dismissed one."""
+        """Insert or refresh a suggestion; never resurrects a dismissed one.
+
+        ``accept_probability`` is the ranking model's estimate (see
+        :mod:`amminer.learn.ranking`) - ``None`` when ranking is off or has no
+        model yet, which leaves the column NULL and, per the index below,
+        sorts that suggestion after everything ranking *has* scored rather
+        than at either extreme.
+        """
         now = time.time()
         with self._lock:
             existing = self._conn.execute(
@@ -298,8 +327,8 @@ class Store:
             if existing is None:
                 self._conn.execute(
                     "INSERT INTO suggestions(id, miner, title, summary, score, status, payload,"
-                    " first_seen_ts, last_seen_ts, seen_count, run_id)"
-                    " VALUES(?,?,?,?,?,?,?,?,?,1,?)",
+                    " first_seen_ts, last_seen_ts, seen_count, run_id, accept_probability)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,1,?,?)",
                     (
                         suggestion_id,
                         miner,
@@ -311,6 +340,7 @@ class Store:
                         now,
                         now,
                         run_id,
+                        accept_probability,
                     ),
                 )
                 status = STATUS_NEW
@@ -319,7 +349,8 @@ class Store:
                 # A dismissed suggestion keeps its status: dismissals are sticky.
                 self._conn.execute(
                     "UPDATE suggestions SET miner=?, title=?, summary=?, score=?, payload=?,"
-                    " last_seen_ts=?, seen_count=seen_count+1, run_id=? WHERE id=?",
+                    " last_seen_ts=?, seen_count=seen_count+1, run_id=?, accept_probability=?"
+                    " WHERE id=?",
                     (
                         miner,
                         title,
@@ -328,6 +359,7 @@ class Store:
                         _json(payload),
                         now,
                         run_id,
+                        accept_probability,
                         suggestion_id,
                     ),
                 )
@@ -345,7 +377,7 @@ class Store:
         """
         rows = self._query(
             "SELECT * FROM suggestions WHERE run_id = ? AND seen_count = 1"
-            " AND status = ? ORDER BY score DESC",
+            " AND status = ? ORDER BY accept_probability DESC, score DESC",
             (run_id, STATUS_NEW),
         )
         return [self._row_to_suggestion(row) for row in rows]
@@ -389,7 +421,11 @@ class Store:
         params.append(limit)
         rows = self._query(
             f"SELECT * FROM suggestions WHERE {' AND '.join(clauses)}"
-            " ORDER BY score DESC, last_seen_ts DESC LIMIT ?",
+            # accept_probability is NULL until amminer.learn.ranking has scored
+            # a suggestion - SQLite sorts NULL last in DESC order, so with
+            # ranking off (or no model yet) every row ties on it and ordering
+            # falls straight through to score, exactly today's behaviour.
+            " ORDER BY accept_probability DESC, score DESC, last_seen_ts DESC LIMIT ?",
             params,
         )
         return [self._row_to_suggestion(row) for row in rows]
@@ -411,14 +447,53 @@ class Store:
         return cursor.rowcount or 0
 
     # --- dismissals & feedback ---------------------------------------
+    def _decision_snapshot(self, suggestion_id: str) -> dict[str, Any]:
+        """What this suggestion looked like right now, for a decision about to happen.
+
+        amminer.learn.ranking trains on this snapshot, never on the live
+        ``suggestions`` row.  A suggestion that gets accepted usually keeps
+        being re-mined and re-backtested every night - its live payload keeps
+        being overwritten with evidence and backtest numbers the user never
+        saw when they actually made the decision this snapshot is attached
+        to.  Training on the live row instead would let the model see
+        information that only exists *after* the label it is meant to
+        explain, which is a more dangerous kind of leakage than it looks: a
+        model that "predicts" acceptance from a strong backtest measured
+        after acceptance is not modelling the user's taste at all.
+        """
+        rows = self._query(
+            "SELECT seen_count, payload FROM suggestions WHERE id = ?", (suggestion_id,)
+        )
+        if not rows:
+            return {"seen_count_at_decision": None, "payload_at_decision": None}
+        row = rows[0]
+        try:
+            payload = json.loads(row["payload"])
+        except (json.JSONDecodeError, TypeError):
+            payload = None
+        return {"seen_count_at_decision": row["seen_count"], "payload_at_decision": payload}
+
     def dismiss(self, suggestion_id: str, reason: str | None = None, signature: str | None = None) -> None:
+        snapshot = self._decision_snapshot(suggestion_id)
         self._execute(
             "INSERT INTO dismissals(suggestion_id, ts, reason, signature) VALUES(?,?,?,?)"
             " ON CONFLICT(suggestion_id) DO UPDATE SET ts=excluded.ts, reason=excluded.reason",
             (suggestion_id, time.time(), reason, signature),
         )
         self.set_status(suggestion_id, STATUS_DISMISSED)
-        self.add_feedback(suggestion_id, "dismissed", {"reason": reason})
+        self.add_feedback(suggestion_id, "dismissed", {"reason": reason, **snapshot})
+
+    def accept(self, suggestion_id: str, extra: dict[str, Any] | None = None) -> None:
+        """Mark a suggestion accepted, snapshotting it the same way a dismissal does.
+
+        Replaces the previous direct ``set_status(..., STATUS_ACCEPTED)`` +
+        ``add_feedback`` pair in the apply endpoint, so an acceptance carries
+        the same decision-time snapshot a dismissal does - without it, only
+        half of this project's own training labels would be leak-proof.
+        """
+        snapshot = self._decision_snapshot(suggestion_id)
+        self.set_status(suggestion_id, STATUS_ACCEPTED)
+        self.add_feedback(suggestion_id, "accepted", {**(extra or {}), **snapshot})
 
     def restore(self, suggestion_id: str) -> bool:
         """Undo a dismissal, including the record the next run consults.
@@ -724,6 +799,113 @@ class Store:
             data["payload"] = {}
         return data
 
+    # --- ranking model (amminer.learn.ranking) -------------------------
+    def seen_counts(self, ids: Sequence[str]) -> dict[str, int]:
+        """Current ``seen_count`` for each id, for scoring candidates about to be shown.
+
+        Unlike the decision-time snapshot :meth:`ranking_labels` reads, this
+        is deliberately the *live* count - a candidate being scored right now
+        has no decision behind it yet to leak from.
+        """
+        ids = list(ids)
+        if not ids:
+            return {}
+        placeholders = ",".join("?" * len(ids))
+        rows = self._query(
+            f"SELECT id, seen_count FROM suggestions WHERE id IN ({placeholders})", ids
+        )
+        return {row["id"]: int(row["seen_count"]) for row in rows}
+
+    def ranking_labels(self) -> list[dict[str, Any]]:
+        """Past decisions with a clear accept/dismiss verdict, for training the ranking model.
+
+        Only STATUS_ACCEPTED and STATUS_DISMISSED are a judgement on merit:
+        STATUS_SUPPRESSED means a standing preference hid the suggestion
+        before the user ever saw it, and STATUS_SHADOW means they asked to
+        watch it fire, not to judge it - training on either would treat a
+        decision nobody made as if someone had.
+
+        The payload returned for each is the one captured in the feedback
+        entry made *at the moment of that decision* (see
+        :meth:`_decision_snapshot`), not the suggestion's current row - which,
+        for a rule still being re-mined after acceptance, keeps being
+        overwritten with numbers from after the fact.  A decision made before
+        that snapshot existed has no such record and is left out entirely
+        rather than trained on the live row as a stand-in.
+        """
+        rows = self._query(
+            "SELECT id, miner, status FROM suggestions WHERE status IN (?, ?)",
+            (STATUS_ACCEPTED, STATUS_DISMISSED),
+        )
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            kind = "accepted" if row["status"] == STATUS_ACCEPTED else "dismissed"
+            decisions = self._query(
+                "SELECT payload FROM feedback WHERE suggestion_id = ? AND kind = ?"
+                " ORDER BY ts DESC LIMIT 1",
+                (row["id"], kind),
+            )
+            if not decisions:
+                continue
+            try:
+                decision_payload = json.loads(decisions[0]["payload"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            payload_at_decision = decision_payload.get("payload_at_decision")
+            if not payload_at_decision:
+                continue
+            out.append(
+                {
+                    "id": row["id"],
+                    "miner": row["miner"],
+                    "status": row["status"],
+                    "payload": payload_at_decision,
+                    "seen_count_at_decision": decision_payload.get("seen_count_at_decision"),
+                }
+            )
+        return out
+
+    def save_ranking_model(self, model: dict[str, Any]) -> None:
+        """Persist the singleton ranking model row (id=1), for the Status page.
+
+        Overwritten wholesale on every run: the fit itself is redone from
+        scratch each time (see amminer.learn.ranking.train_from_labels), so
+        there is nothing here to migrate incrementally, only the latest
+        result to remember between runs.
+        """
+        self._execute(
+            "INSERT INTO ranking_models(id, feature_schema_version, n_labels, trained_ts,"
+            " fallback_to_prior, fallback_reason, prior_k, bias, weights)"
+            " VALUES(1,?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(id) DO UPDATE SET feature_schema_version=excluded.feature_schema_version,"
+            " n_labels=excluded.n_labels, trained_ts=excluded.trained_ts,"
+            " fallback_to_prior=excluded.fallback_to_prior,"
+            " fallback_reason=excluded.fallback_reason, prior_k=excluded.prior_k,"
+            " bias=excluded.bias, weights=excluded.weights",
+            (
+                int(model["feature_schema_version"]),
+                int(model["n_labels"]),
+                float(model["trained_ts"]),
+                1 if model["fallback_to_prior"] else 0,
+                model.get("fallback_reason"),
+                int(model["prior_k"]),
+                float(model["bias"]),
+                _json(model["weights"]),
+            ),
+        )
+
+    def get_ranking_model(self) -> dict[str, Any] | None:
+        rows = self._query("SELECT * FROM ranking_models WHERE id = 1")
+        if not rows:
+            return None
+        data = dict(rows[0])
+        try:
+            data["weights"] = json.loads(data["weights"])
+        except (json.JSONDecodeError, TypeError):
+            return None
+        data["fallback_to_prior"] = bool(data["fallback_to_prior"])
+        return data
+
     # --- overrides ----------------------------------------------------
     def record_overrides(self, overrides: Iterable[Any]) -> int:
         inserted = 0
@@ -879,6 +1061,7 @@ class Store:
             "generations",
             "preferences",
             "gap_suggestions",
+            "ranking_models",
         ):
             rows = self._query(f"SELECT COUNT(*) AS c FROM {table}")
             out[table] = int(rows[0]["c"]) if rows else 0

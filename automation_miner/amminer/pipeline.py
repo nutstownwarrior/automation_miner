@@ -29,6 +29,7 @@ from .enrich.detect import detect_signals
 from .enrich.signals import SignalStore, build_signal_store
 from .entities import build_resolver
 from .ha_api import HAClient
+from .learn import ranking as ranking_module
 from .llm import areas as llm_areas
 from .llm import audit as llm_audit
 from .llm import classify as llm_classify
@@ -85,6 +86,10 @@ class RunReport:
     #: Suggestions hidden because they match a preference learned from the
     #: reasons the user gave when dismissing things before.
     suppressed: int = 0
+    #: The acceptance-ranking model's own stats (n_labels, whether it fell
+    #: back to the prior and why), never including the weights themselves -
+    #: for the Status page, not for reconstructing the model.
+    ranking: dict[str, Any] = field(default_factory=dict)
     degradations: list[str] = field(default_factory=list)
     state_rows: int = 0
 
@@ -113,6 +118,7 @@ class RunReport:
             "notified": self.notified,
             "shadow_fires": self.shadow_fires,
             "suppressed": self.suppressed,
+            "ranking": self.ranking,
             "degradations": self.degradations,
             "state_rows": self.state_rows,
         }
@@ -670,11 +676,42 @@ def run_analysis(
             )
         report.conflicted = conflicted or 0
 
+        # --- ranking: a calibrated ordering, never a gate ---------------
+        # Retrained from scratch every run from the user's own accept/dismiss
+        # history so far - amminer/learn/ranking.py documents why that is
+        # cheap, why it is safe with zero history (a hand-set prior), and why
+        # a noisy handful of decisions cannot make the ordering worse than
+        # that prior (a cross-validated guard falls back to it otherwise).
+        #
+        # This runs after backtesting and conflict checking and is only ever
+        # given `passed` - it has no way to rescue a candidate `backtest_all`
+        # rejected or to hide one that has a blocking conflict, because it
+        # never sees `rejected` and never touches `conflicts` or the
+        # `passed`/`rejected` split itself, only `candidate.extra`.
+        if options.ranking_enabled and passed:
+            def _rank() -> dict[str, Any]:
+                examples = ranking_module.labels_from_rows(store.ranking_labels())
+                model = ranking_module.train_from_labels(examples, k=options.ranking_prior_k)
+                store.save_ranking_model(model.as_dict())
+                seen_counts = store.seen_counts([c.id for c in passed])
+                ranking_module.rank_candidates(passed, model, seen_counts)
+                return {k: v for k, v in model.as_dict().items() if k != "weights"}
+
+            ranking_summary = run_stage("ranking", _rank)
+            if ranking_summary is None:
+                report.degradations.append(
+                    "Learning your acceptance patterns failed this run; suggestions are "
+                    "ordered by each miner's own score instead."
+                )
+            else:
+                report.ranking = ranking_summary
+
         # --- persist ---------------------------------------------------
         # Per candidate, not per loop: one candidate whose payload will not
         # serialise must not take the other forty with it.
         for candidate in passed:
             def _save(candidate=candidate) -> bool:
+                ranking_info = candidate.extra.get("ranking") or {}
                 store.upsert_suggestion(
                     candidate.id,
                     candidate.miner,
@@ -683,6 +720,7 @@ def run_analysis(
                     candidate.score,
                     candidate.as_dict(resolver),
                     run_id,
+                    accept_probability=ranking_info.get("probability"),
                 )
                 if candidate.backtest:
                     store.save_backtest(candidate.id, candidate.backtest)

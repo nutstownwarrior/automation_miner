@@ -376,8 +376,7 @@ def create_app(
         if result is None:
             raise HTTPException(status_code=404, detail="unknown suggestion")
         if result.get("ok"):
-            store.set_status(suggestion_id, STATUS_ACCEPTED)
-            store.add_feedback(suggestion_id, "accepted", result)
+            store.accept(suggestion_id, result)
         elif result.get("needs_confirmation"):
             # Not a failure: the user has not answered yet.
             store.add_feedback(suggestion_id, "apply_needs_confirmation", result)

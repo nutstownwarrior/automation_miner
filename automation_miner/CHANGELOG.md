@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.7.0
+
+**Added: learned ordering — `ranking_enabled` (on by default)**
+
+Every miner has always scored its own candidates with its own arithmetic -
+association rules by `confidence * lift`, time-of-day habits by `consistency *
+hits`, staleness by raw age. `Evidence`'s own docstring has said for a while
+that these numbers are not comparable across miners, and the index page sorted
+them against each other anyway.
+
+Suggestions are now ordered by one calibrated number instead: the estimated
+probability that *you* accept this particular suggestion, learned from your own
+accept/dismiss history. Each miner's own score and evidence stay on the card
+exactly as before - this replaces the ordering, not the explanation.
+
+- A brand-new instance has no history to learn from, so a hand-set prior
+  (documented, weight by weight, in `amminer/learn/ranking.py`) provides a
+  sane starting order: a holdout-validated candidate outranks an in-sample
+  one, more conflicts and riskier action domains rank lower, and so on.
+- As you accept and dismiss things, a personal model is fit and blended in,
+  more so the more decisions you have made (`ranking_prior_k` controls how
+  fast - lower means your own decisions take over sooner).
+- The personal fit is cross-validated against the prior before it is ever
+  used. If a handful of noisy decisions would make the ordering *worse* than
+  the prior alone, the prior is used instead and the card says so.
+- This is ranking and display only. It cannot rescue a suggestion that failed
+  its backtest, and it cannot hide one that passed - those gates are entirely
+  unaffected, the same way the existing AI triage and classification features
+  can only demote or add, never decide.
+- Every card says plainly how much its number rests on general patterns versus
+  your own decisions, rather than showing a precise-looking percentage earned
+  by three data points.
+
+Turn it off with `ranking_enabled: false` to go back to sorting by each
+miner's own score, unchanged.
+
 ## 0.6.0
 
 Four more optional AI features, all `false` by default and all requiring

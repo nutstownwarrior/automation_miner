@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
-from amminer.store.db import STATUS_ACCEPTED, STATUS_DISMISSED, STATUS_NEW, Store
+from amminer.store.db import (
+    STATUS_ACCEPTED,
+    STATUS_DISMISSED,
+    STATUS_NEW,
+    STATUS_SHADOW,
+    STATUS_SUPPRESSED,
+    Store,
+)
 
 
 def add(store, suggestion_id="s1", miner="time_of_day", score=0.8, run_id=1):
@@ -12,7 +19,7 @@ def add(store, suggestion_id="s1", miner="time_of_day", score=0.8, run_id=1):
 
 
 def test_schema_is_created_and_counts_start_empty(store):
-    assert store.get_meta("schema_version") == "2"
+    assert store.get_meta("schema_version") == "3"
     assert all(count == 0 for count in store.counts().values())
 
 
@@ -130,7 +137,7 @@ def test_an_old_database_migrates_the_backtest_validation_columns(tmp_path):
     conn.close()
 
     with Store(path) as store:
-        assert store.get_meta("schema_version") == "2"
+        assert store.get_meta("schema_version") == "3"
         old = store.get_backtest("old-one")
         assert old["precision_score"] == 0.6
         assert old["validation"] == "in_sample"  # the new column's default
@@ -217,3 +224,103 @@ def test_restore_undoes_the_dismissal_the_next_run_reads(store):
 
 def test_restoring_an_unknown_suggestion_reports_failure(store):
     assert store.restore("never-existed") is False
+
+
+# --- ranking labels (amminer.learn.ranking) --------------------------
+def test_ranking_labels_excludes_suppressed_and_shadow_suggestions(store):
+    for suggestion_id, status in (
+        ("accepted1", STATUS_ACCEPTED),
+        ("dismissed1", STATUS_DISMISSED),
+        ("suppressed1", STATUS_SUPPRESSED),
+        ("shadow1", STATUS_SHADOW),
+    ):
+        add(store, suggestion_id)
+        store.set_status(suggestion_id, status)
+
+    # Only accept()/dismiss() record the decision-time snapshot ranking needs;
+    # a bare set_status (as used above for suppressed/shadow, which have no
+    # "decision" of their own) leaves nothing for ranking_labels to find, so
+    # accepted1/dismissed1 need their own real calls to produce one.
+    store.upsert_suggestion("accepted2", "time_of_day", "T", "s", 0.9, {"actions": [1]}, 1)
+    store.accept("accepted2")
+    store.upsert_suggestion("dismissed2", "association", "T", "s", 0.9, {"actions": [1]}, 1)
+    store.dismiss("dismissed2", "not useful")
+
+    labels = {row["id"]: row["status"] for row in store.ranking_labels()}
+    assert labels == {"accepted2": STATUS_ACCEPTED, "dismissed2": STATUS_DISMISSED}
+
+
+def test_ranking_labels_use_the_payload_as_of_the_decision_not_the_live_row(store):
+    store.upsert_suggestion(
+        "s1", "time_of_day", "T", "s", 0.5, {"score": 0.5, "evidence": {"occurrences": 1}}, 1
+    )
+    store.dismiss("s1", "meh")
+    # A later run re-mines the same rule with very different numbers - as
+    # would happen to an *accepted* rule kept being re-mined every night.
+    store.upsert_suggestion(
+        "s1", "time_of_day", "T", "s", 0.99, {"score": 0.99, "evidence": {"occurrences": 999}}, 2
+    )
+
+    labels = store.ranking_labels()
+    assert len(labels) == 1
+    assert labels[0]["payload"]["evidence"]["occurrences"] == 1
+
+
+def test_ranking_labels_records_seen_count_as_of_the_decision(store):
+    store.upsert_suggestion("s1", "time_of_day", "T", "s", 0.5, {"score": 0.5}, 1)
+    store.upsert_suggestion("s1", "time_of_day", "T", "s", 0.5, {"score": 0.5}, 2)  # seen_count -> 2
+    store.dismiss("s1", "meh")
+    store.upsert_suggestion("s1", "time_of_day", "T", "s", 0.5, {"score": 0.5}, 3)  # after the decision
+
+    labels = store.ranking_labels()
+    assert labels[0]["seen_count_at_decision"] == 2
+
+
+def test_seen_counts_reads_the_live_row(store):
+    add(store, "a")
+    add(store, "a")  # seen_count -> 2
+    add(store, "b")
+    assert store.seen_counts(["a", "b", "missing"]) == {"a": 2, "b": 1}
+    assert store.seen_counts([]) == {}
+
+
+def test_ranking_model_round_trips(store):
+    assert store.get_ranking_model() is None
+    model = {
+        "feature_schema_version": 1,
+        "weights": {"consistency": 1.2},
+        "bias": -1.0,
+        "n_labels": 10,
+        "prior_k": 20,
+        "trained_ts": 12345.0,
+        "fallback_to_prior": False,
+        "fallback_reason": None,
+    }
+    store.save_ranking_model(model)
+    stored = store.get_ranking_model()
+    assert stored["n_labels"] == 10
+    assert stored["fallback_to_prior"] is False
+    assert stored["weights"] == {"consistency": 1.2}
+
+    # Overwritten wholesale on the next run, not appended.
+    model["n_labels"] = 20
+    model["fallback_to_prior"] = True
+    model["fallback_reason"] = "cold start"
+    store.save_ranking_model(model)
+    stored = store.get_ranking_model()
+    assert stored["n_labels"] == 20
+    assert stored["fallback_to_prior"] is True
+
+
+def test_accept_probability_orders_suggestions_ahead_of_score(store):
+    store.upsert_suggestion("low", "time_of_day", "T", "s", 0.9, {}, 1, accept_probability=0.1)
+    store.upsert_suggestion("high", "time_of_day", "T", "s", 0.1, {}, 1, accept_probability=0.9)
+    ordered = [s["id"] for s in store.list_suggestions(status=STATUS_NEW)]
+    assert ordered == ["high", "low"]
+
+
+def test_without_accept_probability_ordering_falls_back_to_score(store):
+    store.upsert_suggestion("low_score", "time_of_day", "T", "s", 0.1, {}, 1)
+    store.upsert_suggestion("high_score", "time_of_day", "T", "s", 0.9, {}, 1)
+    ordered = [s["id"] for s in store.list_suggestions(status=STATUS_NEW)]
+    assert ordered == ["high_score", "low_score"]
