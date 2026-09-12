@@ -90,6 +90,10 @@ class RunReport:
     #: back to the prior and why), never including the weights themselves -
     #: for the Status page, not for reconstructing the model.
     ranking: dict[str, Any] = field(default_factory=dict)
+    #: Post-deployment health of automations this add-on has applied (see
+    #: amminer.health) - how many were checked and their verdicts, never the
+    #: full detail (that lives in the store, for the automations page).
+    automations: dict[str, Any] = field(default_factory=dict)
     degradations: list[str] = field(default_factory=list)
     state_rows: int = 0
 
@@ -119,6 +123,7 @@ class RunReport:
             "shadow_fires": self.shadow_fires,
             "suppressed": self.suppressed,
             "ranking": self.ranking,
+            "automations": self.automations,
             "degradations": self.degradations,
             "state_rows": self.state_rows,
         }
@@ -675,6 +680,31 @@ def run_analysis(
                 "against the automations you already have."
             )
         report.conflicted = conflicted or 0
+
+        # --- automation health: does what we already shipped still perform? -
+        # Reuses exactly the changes/full_store/overrides this run already
+        # built for backtesting and the audit page - see amminer.health's own
+        # docstring for why nothing here re-queries the recorder.  `existing`
+        # is the same list conflict checking just used, keyed the same way.
+        def _check_health() -> list[dict[str, Any]]:
+            from . import health as health_module
+
+            results = health_module.evaluate_all(
+                store, existing, changes, full_store, overrides, options, window
+            )
+            return [r.as_dict() for r in results]
+
+        health_results = run_stage("automation health", _check_health)
+        if health_results is None:
+            report.degradations.append(
+                "Could not check the health of automations already applied; last "
+                "known status is shown instead."
+            )
+        else:
+            by_verdict: dict[str, int] = {}
+            for entry in health_results:
+                by_verdict[entry["verdict"]] = by_verdict.get(entry["verdict"], 0) + 1
+            report.automations = {"checked": len(health_results), "by_verdict": by_verdict}
 
         # --- ranking: a calibrated ordering, never a gate ---------------
         # Retrained from scratch every run from the user's own accept/dismiss
