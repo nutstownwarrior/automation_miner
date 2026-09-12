@@ -64,6 +64,26 @@ class SignalSet:
     deferrable_loads: list[str] = field(default_factory=list)
     ev_charger: list[str] = field(default_factory=list)
     thermostat: list[str] = field(default_factory=list)
+    #: The inferred household mode (amminer.learn.home_mode), when a model
+    #: was fit this run. Not found by this module's own regex heuristics
+    #: below like every other field here - amminer.pipeline sets it directly
+    #: once home_mode.fit succeeds, after detect_signals() has already run.
+    #: Kept on SignalSet anyway (rather than threaded through every miner
+    #: call separately) so amminer.miners.conditional's condition_entities()
+    #: can offer it to the same discriminative-signal search every other
+    #: signal already goes through, as either a trigger or a condition.
+    #:
+    #: One honest caveat that is *not* enforced here, deliberately: unlike
+    #: every other entry on this dataclass, nothing in Home Assistant's own
+    #: registry backs this id (see amminer.learn.home_mode's module
+    #: docstring, "What this deliberately does not do") - so a candidate
+    #: that ends up conditioned on it is real, mined, backtested evidence
+    #: about the household, but amminer.llm.validate.validate_references
+    #: will (correctly) refuse to let it be applied as a live automation
+    #: until a follow-up feature actually publishes the current mode into
+    #: Home Assistant as an entity. That refusal is the right, existing
+    #: safety net for this - not a bug to route around here.
+    home_mode: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, list[str]]:
         return {k: v for k, v in self.__dict__.items() if v}
