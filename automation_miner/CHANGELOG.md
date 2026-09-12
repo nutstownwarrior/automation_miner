@@ -19,12 +19,16 @@ exactly as before - this replaces the ordering, not the explanation.
   (documented, weight by weight, in `amminer/learn/ranking.py`) provides a
   sane starting order: a holdout-validated candidate outranks an in-sample
   one, more conflicts and riskier action domains rank lower, and so on.
-- As you accept and dismiss things, a personal model is fit and blended in,
-  more so the more decisions you have made (`ranking_prior_k` controls how
-  fast - lower means your own decisions take over sooner).
-- The personal fit is cross-validated against the prior before it is ever
-  used. If a handful of noisy decisions would make the ordering *worse* than
-  the prior alone, the prior is used instead and the card says so.
+- As you accept and dismiss things, a personal model is fit *towards* that
+  prior rather than towards zero, so with little data the fit barely moves
+  and it takes real, consistent evidence to pull it away
+  (`ranking_prior_strength` controls how hard - lower means your own
+  decisions move things sooner).
+- On top of that, the personal fit is cross-validated against the prior
+  before it is ever used, with a statistical test rather than a bare
+  smaller-number comparison. If a handful of noisy decisions would not
+  *clearly* make the ordering better than the prior alone, the prior is used
+  instead and the card says so.
 - This is ranking and display only. It cannot rescue a suggestion that failed
   its backtest, and it cannot hide one that passed - those gates are entirely
   unaffected, the same way the existing AI triage and classification features

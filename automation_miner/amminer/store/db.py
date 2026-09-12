@@ -161,9 +161,15 @@ CREATE TABLE IF NOT EXISTS ranking_models (
     trained_ts             REAL NOT NULL,
     fallback_to_prior      INTEGER NOT NULL DEFAULT 1,
     fallback_reason        TEXT,
-    prior_k                INTEGER NOT NULL,
+    l2                     REAL NOT NULL,
     bias                   REAL NOT NULL,
-    weights                TEXT NOT NULL
+    weights                TEXT NOT NULL,
+    -- Per-feature mean/std used to standardise before the weights above are
+    -- applied (amminer.learn.ranking.Scaler) - versioned with the feature
+    -- schema exactly like the weights, since a scaler fit under an older
+    -- feature vector would standardise the wrong number against the wrong
+    -- column.
+    scaler                 TEXT NOT NULL
 );
 """
 
@@ -833,8 +839,15 @@ class Store:
         that snapshot existed has no such record and is left out entirely
         rather than trained on the live row as a stand-in.
         """
+        # Ordered explicitly: SQLite makes no promise about row order absent
+        # one, and amminer.learn.ranking's fit is sensitive at the ~1e-15
+        # level to the order these arrive in (floating-point summation is not
+        # associative). Harmless on its own, but a near-tied guard decision
+        # (the CV comparison in train_from_labels) could in principle land on
+        # either side of its threshold depending on it - a fit should not be
+        # able to change merely because SQLite's default ordering did.
         rows = self._query(
-            "SELECT id, miner, status FROM suggestions WHERE status IN (?, ?)",
+            "SELECT id, miner, status FROM suggestions WHERE status IN (?, ?) ORDER BY id",
             (STATUS_ACCEPTED, STATUS_DISMISSED),
         )
         out: list[dict[str, Any]] = []
@@ -875,22 +888,23 @@ class Store:
         """
         self._execute(
             "INSERT INTO ranking_models(id, feature_schema_version, n_labels, trained_ts,"
-            " fallback_to_prior, fallback_reason, prior_k, bias, weights)"
-            " VALUES(1,?,?,?,?,?,?,?,?)"
+            " fallback_to_prior, fallback_reason, l2, bias, weights, scaler)"
+            " VALUES(1,?,?,?,?,?,?,?,?,?)"
             " ON CONFLICT(id) DO UPDATE SET feature_schema_version=excluded.feature_schema_version,"
             " n_labels=excluded.n_labels, trained_ts=excluded.trained_ts,"
             " fallback_to_prior=excluded.fallback_to_prior,"
-            " fallback_reason=excluded.fallback_reason, prior_k=excluded.prior_k,"
-            " bias=excluded.bias, weights=excluded.weights",
+            " fallback_reason=excluded.fallback_reason, l2=excluded.l2,"
+            " bias=excluded.bias, weights=excluded.weights, scaler=excluded.scaler",
             (
                 int(model["feature_schema_version"]),
                 int(model["n_labels"]),
                 float(model["trained_ts"]),
                 1 if model["fallback_to_prior"] else 0,
                 model.get("fallback_reason"),
-                int(model["prior_k"]),
+                float(model["l2"]),
                 float(model["bias"]),
                 _json(model["weights"]),
+                _json(model["scaler"]),
             ),
         )
 
@@ -901,6 +915,7 @@ class Store:
         data = dict(rows[0])
         try:
             data["weights"] = json.loads(data["weights"])
+            data["scaler"] = json.loads(data["scaler"])
         except (json.JSONDecodeError, TypeError):
             return None
         data["fallback_to_prior"] = bool(data["fallback_to_prior"])

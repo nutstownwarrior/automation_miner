@@ -63,7 +63,7 @@ options:
   llm_scenes: false
   llm_areas: false
   ranking_enabled: true
-  ranking_prior_k: 20
+  ranking_prior_strength: 30.0
 schema:
   log_level: list(trace|debug|info|notice|warning|error|fatal)?
   schedule: str?
@@ -112,4 +112,4 @@ schema:
   llm_hypotheses_per_candidate: int(0,10)?
   llm_triage_penalty: float(0.0,1.0)?
   ranking_enabled: bool?
-  ranking_prior_k: int(1,1000)?
+  ranking_prior_strength: float(0.01,1000.0)?

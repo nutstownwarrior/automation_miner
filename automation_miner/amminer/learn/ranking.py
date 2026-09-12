@@ -13,18 +13,28 @@ accept/dismiss history.
 
 Two things make this safe to turn on for an install with no history at all:
 
-**A hand-set prior.**  A brand-new instance has zero labels, and the ordering
-has to start somewhere sane rather than random.  :data:`PRIOR_WEIGHTS` encodes
-beliefs this project already holds elsewhere in the codebase (a holdout-
-validated candidate is better than an in-sample one, more conflicts are worse,
-a risky-domain action deserves more caution) as a starting point, shrunk
-towards the personal fit as decisions accumulate.
+**A hand-set prior, used as an actual Bayesian prior.**  A brand-new instance
+has zero labels, and the ordering has to start somewhere sane rather than
+random.  :data:`PRIOR_WEIGHTS` encodes beliefs this project already holds
+elsewhere in the codebase (a holdout-validated candidate is better than an
+in-sample one, more conflicts are worse, a risky-domain action deserves more
+caution). The personal fit is a MAP estimate that is regularised *towards*
+this prior, not towards zero: minimising ``loss + l2 * ||w - prior||^2``
+rather than ``loss + l2 * ||w||^2`` means that with little data the penalty
+for moving away from the prior dominates and the fit barely moves, and as
+real evidence accumulates the data term takes over - automatically, per
+feature, with no separate blending step needed afterwards. Features are
+standardised before the penalty is applied so one uniform ``l2`` does not
+punish a 0-1 ratio like ``consistency`` and a log-scaled count differently
+just because of their raw scales.
 
-**A guard that never lets a personal model be worse than doing nothing.**  A
-few noisy labels can easily fit worse than the prior they are meant to
-improve on, so the personal model has to beat the prior on held-out log-loss
-before it is used at all; otherwise the prior stands, honestly labelled as
-such.
+**A guard that never lets a personal model be worse than doing nothing.**  As
+a second line of defence on top of MAP regularisation, leave-one-out
+cross-validated log-loss is compared against the prior's own - not with a
+bare "did it get a lower number", which at these sample sizes is well within
+noise, but by requiring the mean improvement to clear one standard error of
+the paired per-example differences. Falling short of that bar uses the prior
+outright, honestly labelled as such.
 
 The one rule that matters most: **this number is for ranking and display
 only.**  Nothing here may decide whether a suggestion may be surfaced or
@@ -350,50 +360,140 @@ def _sigmoid(z: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-np.clip(z, -30.0, 30.0)))
 
 
-def shrinkage_lambda(n_labels: int, k: int) -> float:
-    """How much weight the personal fit gets, out of prior-and-personal.
+@dataclass(frozen=True)
+class Scaler:
+    """Per-feature standardisation (mean/std), fit on one specific set of labels.
 
-    ``n_labels=0`` gives 0 (pure prior); ``n_labels == k`` gives exactly 0.5;
-    ``n_labels >> k`` approaches 1 (mostly personal).  ``k`` is the number of
-    labels at which the two are trusted equally - the add-on option that
-    controls it is documented as such.
+    Standardising *before* the L2 penalty is applied is what stops one flat
+    ``l2`` from penalising a 0-1 ratio like ``consistency`` and a heavy-tailed
+    log-count differently just because of their raw scales - a review of the
+    first version of this module found that inconsistency was quietly doing
+    more of "did the personal fit hold up" than the cross-validation guard
+    was, by making some features nearly free to move and others nearly
+    frozen regardless of how much data actually supported moving them.
     """
-    if n_labels <= 0:
-        return 0.0
-    return n_labels / (n_labels + max(k, 1))
+
+    center: dict[str, float]
+    scale: dict[str, float]
+
+    @classmethod
+    def fit(cls, x: np.ndarray) -> Scaler:
+        mean = x.mean(axis=0)
+        std = x.std(axis=0)
+        # A feature that has not varied at all across these labels (every
+        # candidate seen so far happens to have a backtest, say) has nothing
+        # to standardise; leaving its scale at 1 makes it a no-op instead of
+        # a division by (near) zero blowing its standardised value up.
+        std = np.where(std < 1e-8, 1.0, std)
+        return cls(
+            center=dict(zip(_FEATURE_NAMES, (float(v) for v in mean), strict=True)),
+            scale=dict(zip(_FEATURE_NAMES, (float(v) for v in std), strict=True)),
+        )
+
+    @classmethod
+    def identity(cls) -> Scaler:
+        """A no-op scaler, for the prior-only model.
+
+        :data:`PRIOR_WEIGHTS` is already expressed in raw feature units, so
+        applying it through a scaler that changes nothing keeps
+        :meth:`RankingModel.probability` a single code path for every model,
+        fitted or not, rather than a special case for the fallback.
+        """
+        return cls(center=dict.fromkeys(_FEATURE_NAMES, 0.0), scale=dict.fromkeys(_FEATURE_NAMES, 1.0))
+
+    def _vectors(self) -> tuple[np.ndarray, np.ndarray]:
+        return (
+            np.array([self.center[name] for name in _FEATURE_NAMES]),
+            np.array([self.scale[name] for name in _FEATURE_NAMES]),
+        )
+
+    def transform(self, x: np.ndarray) -> np.ndarray:
+        mean, std = self._vectors()
+        return (x - mean) / std
+
+    def prior_in_this_space(self) -> tuple[np.ndarray, float]:
+        """:data:`PRIOR_WEIGHTS`/:data:`PRIOR_BIAS`, re-expressed for standardised features.
+
+        A linear model is scale-covariant: ``b + sum(w_j * x_j)`` equals
+        ``b' + sum(w'_j * x_std_j)`` when ``x_std_j = (x_j - mean_j) / std_j``,
+        ``w'_j = w_j * std_j`` and ``b' = b + sum(w_j * mean_j)``.  Skipping
+        this conversion and regularising a standardised fit towards the raw
+        prior numbers directly would pull it towards the wrong target
+        entirely - the whole point of a prior-centred penalty is that it
+        predicts *identically* to the plain prior when the data has not
+        moved the fit away from it, and only this conversion keeps that true.
+        """
+        mean, std = self._vectors()
+        w_std = PRIOR_VECTOR * std
+        b_std = PRIOR_BIAS + float(np.dot(PRIOR_VECTOR, mean))
+        return w_std, b_std
+
+    def as_dict(self) -> dict[str, dict[str, float]]:
+        return {"center": dict(self.center), "scale": dict(self.scale)}
+
+    @classmethod
+    def from_row(cls, row: Any) -> Scaler | None:
+        """Rebuild a scaler from a persisted row, discarding it if stale.
+
+        Versioned with the feature schema the same way the weights are: a
+        scaler fit under an old feature vector has entries for columns that
+        may no longer exist, or be missing ones that now do, and applying it
+        would silently standardise the wrong number against the wrong
+        feature.
+        """
+        if not isinstance(row, dict):
+            return None
+        center, scale = row.get("center"), row.get("scale")
+        if not isinstance(center, dict) or not isinstance(scale, dict):
+            return None
+        if set(center) != set(_FEATURE_NAMES) or set(scale) != set(_FEATURE_NAMES):
+            return None
+        return cls(
+            center={k: float(v) for k, v in center.items()},
+            scale={k: float(v) for k, v in scale.items()},
+        )
 
 
 class _RidgeLogisticRegression:
-    """L2-regularised logistic regression, fit by Newton's method (IRLS).
+    """MAP logistic regression: minimises ``loss + l2 * ||w - prior||^2``.
 
-    Deterministic on purpose: weights always start at zero, the update rule
-    involves no randomness, and the number of iterations is fixed - the same
-    ``(X, y)`` always converges to the same coefficients.  That matters twice
-    over here: this runs nightly and feeds an ordering people see, and the
-    test suite pins an exact result.
+    Regularising *towards the prior* rather than towards zero is what makes
+    :data:`PRIOR_WEIGHTS` an actual Bayesian prior and this fit a MAP
+    estimate: at low n the penalty for moving away from the prior dominates
+    the loss term, so the fit stays close to it automatically and in every
+    direction at once - not through a post-hoc scalar blend applied to a fit
+    that was pulled towards zero regardless of whether zero meant anything.
+    That earlier version penalised ``||w||^2``, which pulled a personal fit
+    away from a well-calibrated prior exactly as hard as it pulled it away
+    from an uninformative one, and needed a separate shrinkage step bolted on
+    to compensate. A Monte-Carlo review of that version found it did not
+    actually protect against noisy labels in realistic conditions; this does.
 
-    Pure numpy, per this project's constraint that scikit-learn is
+    Deterministic on purpose: Newton's method is *initialised* at the prior
+    itself (not zero - the prior is a far better first guess, and if the
+    data does not move the fit, the prior is exactly where it converges to
+    stay), the update rule involves no randomness, and the iteration count is
+    fixed.  Pure numpy, per this project's constraint that scikit-learn is
     deliberately not a dependency (musllinux wheels for aarch64 do not exist
     for it).
     """
 
-    def __init__(self, l2: float = 1.0, max_iter: int = 50, tol: float = 1e-8) -> None:
+    def __init__(self, l2: float, max_iter: int = 50, tol: float = 1e-8) -> None:
         self.l2 = l2
         self.max_iter = max_iter
         self.tol = tol
         self.intercept_: float = 0.0
         self.coef_: np.ndarray = np.zeros(0)
 
-    def fit(self, x: np.ndarray, y: np.ndarray) -> _RidgeLogisticRegression:
+    def fit(self, x: np.ndarray, y: np.ndarray, prior_full: np.ndarray) -> _RidgeLogisticRegression:
         n_samples, n_features = x.shape
         design = np.hstack([np.ones((n_samples, 1)), x])
-        w = np.zeros(n_features + 1)
+        w = prior_full.copy()
         reg = np.eye(n_features + 1) * self.l2
-        reg[0, 0] = 0.0  # never shrink the intercept towards 0
         for _ in range(self.max_iter):
             z = design @ w
             p = _sigmoid(z)
-            grad = design.T @ (p - y) + reg @ w
+            grad = design.T @ (p - y) + reg @ (w - prior_full)
             weight = np.clip(p * (1.0 - p), 1e-6, None)
             hessian = design.T @ (design * weight[:, None]) + reg
             try:
@@ -404,8 +504,9 @@ class _RidgeLogisticRegression:
             # the same class, easy with a dozen samples) drives Newton's
             # method towards an infinite intercept.  Clipping keeps the fit
             # finite and deterministic without meaningfully changing any
-            # well-conditioned result, where weights are of order 1.
-            w_new = np.clip(w - step, -25.0, 25.0)
+            # well-conditioned result, where standardised weights are of
+            # order 1.
+            w_new = np.clip(w - step, -50.0, 50.0)
             if np.max(np.abs(w_new - w)) < self.tol:
                 w = w_new
                 break
@@ -418,8 +519,11 @@ class _RidgeLogisticRegression:
         return _sigmoid(self.intercept_ + x @ self.coef_)
 
 
-def _blend(prior: np.ndarray, personal: np.ndarray, lam: float) -> np.ndarray:
-    return (1.0 - lam) * prior + lam * personal
+def _fit_map(
+    x: np.ndarray, y: np.ndarray, prior_full: np.ndarray, l2: float
+) -> tuple[np.ndarray, float]:
+    model = _RidgeLogisticRegression(l2=l2).fit(x, y, prior_full)
+    return model.coef_, model.intercept_
 
 
 def _log_loss(y: np.ndarray, p: np.ndarray) -> float:
@@ -446,13 +550,20 @@ class LabelExample:
 
 @dataclass
 class RankingModel:
-    """A fitted (or prior-only) acceptance model, ready to score candidates."""
+    """A fitted (or prior-only) acceptance model, ready to score candidates.
+
+    ``weights``/``bias`` live in the *standardised* space ``scaler`` maps raw
+    features into - for the prior-only model, ``scaler`` is
+    :meth:`Scaler.identity` and ``weights`` is exactly :data:`PRIOR_WEIGHTS`,
+    so :meth:`probability` needs no special case for either.
+    """
 
     feature_schema_version: int
     weights: dict[str, float]
     bias: float
+    scaler: Scaler
     n_labels: int
-    prior_k: int
+    l2: float
     trained_ts: float = field(default_factory=time.time)
     fallback_to_prior: bool = True
     fallback_reason: str | None = None
@@ -466,16 +577,22 @@ class RankingModel:
         promote a candidate into ``passed`` or push one out of it, because it
         is never called with the ``rejected`` list at all.
         """
-        x = extract_features(candidate, seen_count)
+        x = extract_features(candidate, seen_count).reshape(1, -1)
+        x_std = self.scaler.transform(x)[0]
         w = np.array([self.weights[name] for name in _FEATURE_NAMES])
-        return float(_sigmoid(np.array([self.bias + float(x @ w)]))[0])
+        return float(_sigmoid(np.array([self.bias + float(x_std @ w)]))[0])
 
     def confidence_note(self) -> str:
         """One honest sentence about how much this rests on the prior vs you.
 
         Never a bare number with no context: two decisions and two hundred
         must not read the same way, and a fallback must say why it fell back
-        rather than presenting the prior as if it were personalised.
+        rather than presenting the prior as if it were personalised. The
+        thresholds below are a plain label count, not a literal blend
+        fraction - MAP regularisation means how far the fit actually moved
+        from the prior depends on the labels themselves, not only how many
+        there are, so this is deliberately an honest-but-approximate bucket
+        rather than a number this module cannot cheaply compute per card.
         """
         if self.n_labels == 0:
             return "based entirely on general patterns - you have not accepted or dismissed anything yet"
@@ -485,10 +602,9 @@ class RankingModel:
                 f"based on general patterns - your {self.n_labels} decision{plural} did not "
                 "yet make the ordering more accurate, so they were not used"
             )
-        lam = shrinkage_lambda(self.n_labels, self.prior_k)
-        if lam < 0.25:
+        if self.n_labels < 10:
             return f"mostly general patterns, lightly adjusted by {self.n_labels} of your decisions"
-        if lam < 0.6:
+        if self.n_labels < 30:
             return f"a mix of general patterns and {self.n_labels} of your own decisions"
         return f"based mainly on your own {self.n_labels} accept/dismiss decisions"
 
@@ -497,8 +613,9 @@ class RankingModel:
             "feature_schema_version": self.feature_schema_version,
             "weights": dict(self.weights),
             "bias": self.bias,
+            "scaler": self.scaler.as_dict(),
             "n_labels": self.n_labels,
-            "prior_k": self.prior_k,
+            "l2": self.l2,
             "trained_ts": self.trained_ts,
             "fallback_to_prior": self.fallback_to_prior,
             "fallback_reason": self.fallback_reason,
@@ -508,11 +625,11 @@ class RankingModel:
     def from_row(cls, row: dict[str, Any] | None) -> RankingModel | None:
         """Rebuild a model from a persisted row, discarding it if stale.
 
-        A weight vector fit under an earlier :data:`FEATURE_SCHEMA_VERSION` is
-        not stale data to patch around, it is meaningless: the same index
-        could have named a different feature.  Any mismatch here must be
-        treated exactly like there being no model at all, never "close
-        enough".
+        A weight vector (or scaler) fit under an earlier
+        :data:`FEATURE_SCHEMA_VERSION` is not stale data to patch around, it
+        is meaningless: the same index could have named a different feature.
+        Any mismatch here must be treated exactly like there being no model
+        at all, never "close enough".
         """
         if not row:
             return None
@@ -521,12 +638,16 @@ class RankingModel:
         weights = row.get("weights")
         if not isinstance(weights, dict) or set(weights) != set(_FEATURE_NAMES):
             return None
+        scaler = Scaler.from_row(row.get("scaler"))
+        if scaler is None:
+            return None
         return cls(
             feature_schema_version=FEATURE_SCHEMA_VERSION,
             weights={k: float(v) for k, v in weights.items()},
             bias=float(row.get("bias", PRIOR_BIAS)),
+            scaler=scaler,
             n_labels=int(row.get("n_labels", 0)),
-            prior_k=int(row.get("prior_k", DEFAULT_PRIOR_K)),
+            l2=float(row.get("l2", DEFAULT_L2)),
             trained_ts=float(row.get("trained_ts", 0.0)),
             fallback_to_prior=bool(row.get("fallback_to_prior", True)),
             fallback_reason=row.get("fallback_reason"),
@@ -540,50 +661,58 @@ class RankingModel:
 #: was never really in.
 MIN_LABELS_TO_FIT = 4
 
-#: Default label count at which the personal fit and the prior are trusted
-#: equally.  Overridable via the ``ranking_prior_k`` add-on option.
-DEFAULT_PRIOR_K = 20
+#: Default L2 strength, in *standardised* feature units, pulling the personal
+#: fit towards the prior (see :class:`_RidgeLogisticRegression`). Chosen by
+#: Monte-Carlo simulation against a realistic candidate mix (a handful of
+#: miners, a wide spread of evidence/backtest quality so the ordering being
+#: tested is not a near-tie among uniformly excellent candidates, 15-50%
+#: accept rates, occasional conflicts and missing backtests): at this value,
+#: purely random labels keep the ordering within a Spearman correlation of
+#: roughly 0.7+ of the prior's own even at n=25 (see
+#: ``tests/test_ranking.py``'s permanent null-case test), while a real,
+#: consistent preference over ~40-60 labels still separates candidates by a
+#: wide, clearly visible margin (see the "recovers a known preference" test).
+#: An earlier, much smaller value looked fine on a narrower simulation but a
+#: review found it did not actually hold up once the evaluated candidates
+#: were not all near-certain accepts - this value was picked against that
+#: harder, more realistic test instead.  Overridable via the
+#: ``ranking_prior_strength`` add-on option - higher pulls harder towards the
+#: prior (slower to personalise), lower moves faster and trusts fewer labels
+#: more.
+DEFAULT_L2 = 30.0
 
 
-def _fit_blended(
-    x: np.ndarray, y: np.ndarray, k: int, l2: float
-) -> tuple[np.ndarray, float]:
-    """Fit the personal model on (x, y) and shrink it towards the prior."""
-    model = _RidgeLogisticRegression(l2=l2).fit(x, y)
-    personal = np.concatenate(([model.intercept_], model.coef_))
-    prior_full = np.concatenate(([PRIOR_BIAS], PRIOR_VECTOR))
-    lam = shrinkage_lambda(len(y), k)
-    blended = _blend(prior_full, personal, lam)
-    return blended[1:], float(blended[0])
-
-
-def _prior_only_model(n_labels: int, k: int, reason: str) -> RankingModel:
+def _prior_only_model(n_labels: int, l2: float, reason: str) -> RankingModel:
     return RankingModel(
         feature_schema_version=FEATURE_SCHEMA_VERSION,
         weights=dict(PRIOR_WEIGHTS),
         bias=PRIOR_BIAS,
+        scaler=Scaler.identity(),
         n_labels=n_labels,
-        prior_k=k,
+        l2=l2,
         fallback_to_prior=True,
         fallback_reason=reason,
     )
 
 
-def train_from_labels(
-    examples: Sequence[LabelExample], k: int = DEFAULT_PRIOR_K, l2: float = 1.0
-) -> RankingModel:
+def train_from_labels(examples: Sequence[LabelExample], l2: float = DEFAULT_L2) -> RankingModel:
     """Fit a personal ranking model, or fall back to the prior.
 
-    Fitting happens in two stages:
+    Two independent safeguards, not one relying on the other:
 
-    1. Shrink a personal logistic-regression fit towards :data:`PRIOR_WEIGHTS`
-       by :func:`shrinkage_lambda`, so a handful of labels nudges the ordering
-       gently and a large history dominates it.
-    2. Leave-one-out cross-validate that *shrunk* model's held-out log-loss
-       against the prior's alone.  If the personal fit does not beat the
-       prior, the prior is used outright and this is recorded - a noisy
-       handful of labels must never be allowed to produce a worse ordering
-       than the add-on shipped with.
+    1. The fit itself is MAP-regularised towards :data:`PRIOR_WEIGHTS` (see
+       :class:`_RidgeLogisticRegression`) - with few or uninformative labels
+       it barely moves, regardless of whether the guard below fires.
+    2. Leave-one-out cross-validated log-loss against the prior's own is
+       compared with a paired, significance-aware test: the *mean* per-example
+       improvement must exceed one standard error of the paired differences,
+       not merely be a smaller number, which at a dozen or two labels is easy
+       to satisfy by chance alone. Falling short uses the prior outright.
+
+    Every fold - in cross-validation and in the final fit - standardises
+    features and re-expresses the prior in that fold's standardised space
+    independently, using only that fold's training rows, so no fold's
+    standardisation is informed by the point it is being judged against.
     """
     n = len(examples)
     if n < MIN_LABELS_TO_FIT:
@@ -592,41 +721,57 @@ def train_from_labels(
         else:
             plural = "s" if n != 1 else ""
             reason = f"only {n} labelled decision{plural} so far - too few to fit a personal model"
-        return _prior_only_model(n, k, reason)
+        return _prior_only_model(n, l2, reason)
 
     x = np.vstack([extract_features(e.candidate, e.seen_count) for e in examples])
     y = np.array([float(e.label) for e in examples])
 
     personal_losses = np.empty(n)
     prior_losses = np.empty(n)
-    prior_full = np.concatenate(([PRIOR_BIAS], PRIOR_VECTOR))
     for i in range(n):
         mask = np.ones(n, dtype=bool)
         mask[i] = False
-        w_i, b_i = _fit_blended(x[mask], y[mask], k, l2)
-        p_personal = _sigmoid(np.array([b_i + x[i] @ w_i]))
-        p_prior = _sigmoid(np.array([prior_full[0] + x[i] @ prior_full[1:]]))
+        fold_scaler = Scaler.fit(x[mask])
+        fold_prior_w, fold_prior_b = fold_scaler.prior_in_this_space()
+        fold_prior_full = np.concatenate(([fold_prior_b], fold_prior_w))
+        w_i, b_i = _fit_map(fold_scaler.transform(x[mask]), y[mask], fold_prior_full, l2)
+        x_i_std = fold_scaler.transform(x[i : i + 1])[0]
+        p_personal = _sigmoid(np.array([b_i + x_i_std @ w_i]))
+        # The prior needs no scaler at all: it always operates directly on
+        # raw features, in every fold and at inference, so this is exactly
+        # what the shipped fallback model would have predicted for point i.
+        p_prior = _sigmoid(np.array([PRIOR_BIAS + x[i] @ PRIOR_VECTOR]))
         personal_losses[i] = _log_loss(y[i : i + 1], p_personal)
         prior_losses[i] = _log_loss(y[i : i + 1], p_prior)
 
-    personal_cv_loss = float(np.mean(personal_losses))
-    prior_cv_loss = float(np.mean(prior_losses))
+    # Positive means the personal (MAP-fitted) model did better on the point
+    # its own fold never trained on.
+    diffs = prior_losses - personal_losses
+    mean_diff = float(np.mean(diffs))
+    se_diff = float(np.std(diffs, ddof=1) / np.sqrt(n)) if n > 1 else 0.0
+    significant = mean_diff > se_diff if se_diff > 0 else mean_diff > 0
 
-    if personal_cv_loss >= prior_cv_loss:
+    if not significant:
         return _prior_only_model(
             n,
-            k,
-            f"the personal model's held-out log-loss ({personal_cv_loss:.3f}) did not beat "
-            f"the prior's ({prior_cv_loss:.3f}) over {n} labels",
+            l2,
+            f"the personal model's held-out improvement ({mean_diff:.3f} nats/example) was "
+            f"not clearly bigger than sampling noise (standard error {se_diff:.3f}) over "
+            f"{n} labels",
         )
 
-    weights_vector, bias = _fit_blended(x, y, k, l2)
+    final_scaler = Scaler.fit(x)
+    prior_w_std, prior_b_std = final_scaler.prior_in_this_space()
+    prior_full_std = np.concatenate(([prior_b_std], prior_w_std))
+    coef, intercept = _fit_map(final_scaler.transform(x), y, prior_full_std, l2)
+
     return RankingModel(
         feature_schema_version=FEATURE_SCHEMA_VERSION,
-        weights={name: float(weights_vector[i]) for i, name in enumerate(_FEATURE_NAMES)},
-        bias=bias,
+        weights={name: float(coef[i]) for i, name in enumerate(_FEATURE_NAMES)},
+        bias=float(intercept),
+        scaler=final_scaler,
         n_labels=n,
-        prior_k=k,
+        l2=l2,
         fallback_to_prior=False,
         fallback_reason=None,
     )

@@ -290,8 +290,9 @@ def test_ranking_model_round_trips(store):
         "feature_schema_version": 1,
         "weights": {"consistency": 1.2},
         "bias": -1.0,
+        "scaler": {"center": {"consistency": 0.5}, "scale": {"consistency": 0.2}},
         "n_labels": 10,
-        "prior_k": 20,
+        "l2": 15.0,
         "trained_ts": 12345.0,
         "fallback_to_prior": False,
         "fallback_reason": None,
@@ -301,6 +302,7 @@ def test_ranking_model_round_trips(store):
     assert stored["n_labels"] == 10
     assert stored["fallback_to_prior"] is False
     assert stored["weights"] == {"consistency": 1.2}
+    assert stored["scaler"] == {"center": {"consistency": 0.5}, "scale": {"consistency": 0.2}}
 
     # Overwritten wholesale on the next run, not appended.
     model["n_labels"] = 20

@@ -691,7 +691,7 @@ def run_analysis(
         if options.ranking_enabled and passed:
             def _rank() -> dict[str, Any]:
                 examples = ranking_module.labels_from_rows(store.ranking_labels())
-                model = ranking_module.train_from_labels(examples, k=options.ranking_prior_k)
+                model = ranking_module.train_from_labels(examples, l2=options.ranking_prior_strength)
                 store.save_ranking_model(model.as_dict())
                 seen_counts = store.seen_counts([c.id for c in passed])
                 ranking_module.rank_candidates(passed, model, seen_counts)

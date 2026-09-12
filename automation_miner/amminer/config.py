@@ -245,10 +245,15 @@ class Options:
     #: Never affects the backtest gate or conflict checking; disabling it only
     #: returns to sorting by each miner's own score.
     ranking_enabled: bool = True
-    #: Label count at which the personal fit and the prior are trusted
-    #: equally (``lambda = n / (n + k)``). Higher means new decisions move the
-    #: ordering more slowly; lower means they take over sooner.
-    ranking_prior_k: int = 20
+    #: How strongly the personal fit is pulled towards the hand-set prior
+    #: (an L2 penalty, in standardised feature units, centred on the prior
+    #: rather than on zero - see amminer/learn/ranking.py). Higher means a
+    #: given amount of your own history moves the ordering less; lower means
+    #: it moves faster and trusts fewer decisions more. The default was
+    #: chosen so that decisions genuinely uncorrelated with anything leave
+    #: the ordering close to the prior's even at two dozen of them, while a
+    #: real, consistent preference over ~40 decisions still moves it clearly.
+    ranking_prior_strength: float = 30.0
 
     # --- paths (overridable for tests) ---
     ha_config_dir: str = "/homeassistant"
@@ -284,7 +289,7 @@ class Options:
         self.llm_triage_penalty = min(max(float(self.llm_triage_penalty), 0.0), 1.0)
         self.llm_classification_batch = max(int(self.llm_classification_batch), 5)
         self.override_window_seconds = max(int(self.override_window_seconds), 1)
-        self.ranking_prior_k = max(int(self.ranking_prior_k), 1)
+        self.ranking_prior_strength = max(float(self.ranking_prior_strength), 0.01)
 
     # ------------------------------------------------------------------
     def is_excluded(self, entity_id: str) -> bool:
