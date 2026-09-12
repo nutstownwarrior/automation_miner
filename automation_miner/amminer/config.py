@@ -168,6 +168,35 @@ class Options:
     #: by default: these are security decisions, not conveniences.
     allow_security_actions: bool = False
 
+    # --- post-deployment automation health (amminer.health) -------------
+    #: Below this many days of history since an automation was applied, its
+    #: health verdict would rest on almost nothing - "not enough data yet"
+    #: is shown instead of a confident-looking number.
+    health_min_days: int = 7
+    #: Floor on predicted fires before "the pattern is still happening but
+    #: the automation never actually ran" is trusted as dormancy rather than
+    #: read as an ordinary quiet spell.
+    health_min_predicted_for_dormant: int = 3
+    #: Share of an automation's real fires a human reversed within the
+    #: override window (override_window_seconds) before it is flagged noisy
+    #: rather than treated as an occasional, ordinary correction.
+    health_noisy_override_rate: float = 0.3
+    #: Share above which it is not "sometimes wrong" but "wrong most of the
+    #: time it runs" - the recommendation escalates from retune to retire.
+    health_overridden_override_rate: float = 0.6
+    #: Below this many *real* fires, an override rate is a ratio over almost
+    #: nothing - one fire and one revert is a 100% override rate and a single
+    #: observation with a percentage's name on it.  Below this floor a verdict
+    #: that depends on override_rate (healthy, noisy or overridden) is not
+    #: shown at all; only dormancy, which needs no fires to have happened,
+    #: can still be reported.
+    health_min_fires_for_verdict: int = 5
+    #: Below this fraction of its predicted fires, an automation that is
+    #: technically still running has still largely stopped doing its job -
+    #: distinct from dormant (zero real fires): this one fires occasionally,
+    #: just far less than the pattern it was built from says it should.
+    health_shortfall_ratio: float = 0.3
+
     # --- being told ---
     #: Post a notification in Home Assistant when a run finds something new.
     #: On by default: suggestions live in this add-on's own database, so
@@ -290,6 +319,23 @@ class Options:
         self.llm_classification_batch = max(int(self.llm_classification_batch), 5)
         self.override_window_seconds = max(int(self.override_window_seconds), 1)
         self.ranking_prior_strength = max(float(self.ranking_prior_strength), 0.01)
+        self.health_min_days = max(int(self.health_min_days), 1)
+        self.health_min_predicted_for_dormant = max(int(self.health_min_predicted_for_dormant), 1)
+        self.health_noisy_override_rate = min(
+            max(float(self.health_noisy_override_rate), 0.0), 1.0
+        )
+        self.health_overridden_override_rate = min(
+            max(float(self.health_overridden_override_rate), 0.0), 1.0
+        )
+        self.health_min_fires_for_verdict = max(int(self.health_min_fires_for_verdict), 1)
+        self.health_shortfall_ratio = min(max(float(self.health_shortfall_ratio), 0.0), 1.0)
+        # A rule the user is only sometimes wrong about (noisy) has to be a
+        # lower bar than one they are wrong about most of the time
+        # (overridden), or every noisy automation would also read as
+        # overridden - the escalation this module recommends would never
+        # actually escalate.
+        if self.health_overridden_override_rate < self.health_noisy_override_rate:
+            self.health_overridden_override_rate = self.health_noisy_override_rate
 
     # ------------------------------------------------------------------
     def is_excluded(self, entity_id: str) -> bool:
