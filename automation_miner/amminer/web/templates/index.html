@@ -41,7 +41,8 @@
   <article class="card" id="s-{{ s.id }}">
     <header>
       <span class="tag miner">{{ s.miner.replace('_', ' ') }}</span>
-      <span class="score" title="Confidence score">{{ '%.2f' % s.score }}</span>
+      {{ m.ranking_badge(p.extra) }}
+      <span class="score" title="This miner's own score - not comparable to other miners' scores">{{ '%.2f' % s.score }}</span>
     </header>
     <h3><a href="{{ base }}/suggestion/{{ s.id }}">{{ s.title }}</a></h3>
     <p class="sentence">{{ p.sentence or s.summary }}</p>
