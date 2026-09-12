@@ -32,9 +32,10 @@ averaging it away, long enough that a full year of history is at most a few
 tens of thousands of bins - see ``MAX_TRAIN_BINS`` below for how that is
 bounded regardless.
 
-**Observation representation - per-bin counts of human activity, bucketed by a
-small, fixed domain vocabulary, with diagonal-covariance Gaussian emissions on
-their log1p.**  A multinomial/count emission model is a reasonable
+**Observation representation - per-bin counts of currently-active entities,
+bucketed by a small, fixed domain vocabulary, with diagonal-covariance
+Gaussian emissions on their log1p.**  A multinomial/count emission model is a
+reasonable
 alternative, but it needs more free parameters per state (a full distribution
 over event *types*, not just how many) for the same amount of data, and this
 project already leans on log1p + Gaussian for exactly this kind of heavy-tailed
@@ -159,9 +160,9 @@ backtested evidence about the household's behaviour - and today it cannot be
 one-click-applied as a live automation until a follow-up feature actually
 publishes the current mode into Home Assistant as a helper entity that is kept
 up to date between nightly runs.  This is a genuine, known gap, not an
-oversight papered over: see the module's tests for the honest refusal, and the
-project notes for why building a continuously-updating publisher was left out
-of this change.
+oversight papered over: ``amminer.llm.validate``'s own test suite already
+covers that refusal for any unknown entity id, this module's id included; no
+special case was added, and none was needed.
 """
 
 from __future__ import annotations
