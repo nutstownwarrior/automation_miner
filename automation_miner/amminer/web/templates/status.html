@@ -179,6 +179,9 @@
     rather than as real, distinguishable household patterns yet.
   </p>
   {% endif %}
+  {% if report.home_mode.selection_note %}
+  <p class="muted small">{{ report.home_mode.selection_note }}</p>
+  {% endif %}
   <ul class="plain small">
     {% for state in report.home_mode.state_summaries %}
     <li>

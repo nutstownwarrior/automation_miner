@@ -456,8 +456,22 @@ def run_analysis(
         # before mining starts is what lets amminer.miners.conditional pick
         # it up through condition_entities() with no other change needed.
         if options.home_mode_enabled:
+            # Read back before fitting, purely so tonight's states can be
+            # relabelled to match last night's own numbering where the two
+            # line up (amminer.learn.home_mode.fit's own "Mode identity
+            # across runs") - never to influence the fit itself, and never a
+            # substitute for it: HomeModeModel.from_row already refuses a
+            # stale schema version, so a model from a build that changed the
+            # feature vector or persisted shape is treated the same as no
+            # previous model at all.
+            previous_home_mode = home_mode_module.HomeModeModel.from_row(
+                store.get_home_mode_model()
+            )
+
             def _fit_home_mode():
-                return home_mode_module.fit(train_changes, signals, options, train_window, resolver)
+                return home_mode_module.fit(
+                    train_changes, signals, options, train_window, resolver, previous_home_mode
+                )
 
             home_mode_model = run_stage("household mode", _fit_home_mode)
             if home_mode_model is None:
@@ -466,6 +480,13 @@ def run_analysis(
                     "to the conditional miner."
                 )
             elif not home_mode_model.fitted:
+                # Persisted even when there was nothing to fit - the honest
+                # reason why is itself worth remembering between runs, the
+                # same "retrained/replaced wholesale every run, nothing
+                # incremental to migrate" treatment amminer.learn.ranking's
+                # own model already gets (see store.save_ranking_model
+                # below).
+                store.save_home_mode_model(home_mode_model.as_dict())
                 report.home_mode = home_mode_model.as_dict()
                 report.degradations.append(
                     "No household mode signal is available yet "
@@ -502,6 +523,12 @@ def run_analysis(
                         "A household mode was inferred but could not be replayed as a "
                         "signal this run; it was not offered to the conditional miner."
                     )
+                # Persisted after labelling/decoding above, not right after
+                # the fit itself, so the payload a later run reads back (and
+                # what this run reports) agree on the one model, LLM labels
+                # included - see the not-fitted branch above for why this is
+                # saved every run, fitted or not.
+                store.save_home_mode_model(home_mode_model.as_dict())
                 report.home_mode = {
                     k: v
                     for k, v in home_mode_model.as_dict().items()

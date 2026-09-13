@@ -292,6 +292,104 @@ def test_fit_is_deterministic_across_processes(tmp_path: Path):
     assert np.allclose(results[0]["transition"], results[1]["transition"])
 
 
+# --- mode identity across runs ----------------------------------------------
+def _relabelled(model: hm.HomeModeModel, order: list[int]) -> hm.HomeModeModel:
+    """A model carrying exactly ``model``'s own states, renumbered by ``order``
+    (state ``i``'s data becomes state ``order[i]``) - a stand-in for "the
+    model a previous, otherwise-identical run happened to persist", used to
+    prove alignment is actually driven by ``previous`` and not merely today's
+    own (deterministic, so otherwise indistinguishable) fit order.
+    """
+    idx = np.argsort(order)
+    return hm.HomeModeModel(
+        fitted=True,
+        n_states=model.n_states,
+        feature_names=model.feature_names,
+        means=model.means[idx],
+        variances=model.variances[idx],
+        initial=model.initial[idx],
+        transition=model.transition[np.ix_(idx, idx)],
+    )
+
+
+def test_state_identity_is_aligned_to_the_previous_run(options):
+    """EM's states are unlabelled - two fits of the same underlying behaviour
+    have no reason to number their states the same way. Passing the previous
+    run's model must relabel this run's states to match it wherever the two
+    line up, without changing anything about the fit itself (the same
+    activity groups the same way; only which integer names each group can
+    move).
+    """
+    fixture = build_two_regime_activity(days=45, seed=1)
+    baseline = hm.fit(fixture.changes, SignalSet(), options, fixture.window)
+    assert baseline.fitted and baseline.n_states >= 2
+
+    # A "previous run" that is baseline's own fit with states 0 and 1 swapped -
+    # exactly what an independent restart draw on identical behaviour could
+    # have produced.
+    order = list(range(baseline.n_states))
+    order[0], order[1] = order[1], order[0]
+    previous = _relabelled(baseline, order)
+
+    aligned = hm.fit(fixture.changes, SignalSet(), options, fixture.window, previous=previous)
+    assert aligned.fitted
+    assert np.allclose(aligned.means[0], baseline.means[1])
+    assert np.allclose(aligned.means[1], baseline.means[0])
+    assert np.allclose(aligned.variances[0], baseline.variances[1])
+    assert np.allclose(aligned.variances[1], baseline.variances[0])
+    # A pure relabelling changes no fitted number, including the likelihood.
+    assert aligned.log_likelihood == baseline.log_likelihood
+    assert aligned.n_states == baseline.n_states
+
+    # Decoded labels must move with the relabelling too, not just the
+    # parameters describing each state - otherwise "mode_0" in the decoded
+    # signal and "mode_0" in state_summaries could disagree about which
+    # physical state it names.
+    counts, first_idx = hm.build_feature_matrix(fixture.changes, SignalSet(), options,
+                                                 *fixture.window)
+    x = hm._to_features(counts)
+    baseline_labels = hm.decode_labels(x, baseline.initial, baseline.transition, baseline.means,
+                                        baseline.variances, baseline.var_floor)
+    aligned_labels = hm.decode_labels(x, aligned.initial, aligned.transition, aligned.means,
+                                       aligned.variances, aligned.var_floor)
+    swapped_expected = np.where(
+        baseline_labels == 0, 1, np.where(baseline_labels == 1, 0, baseline_labels)
+    )
+    assert np.array_equal(aligned_labels, swapped_expected)
+
+
+def test_no_alignment_without_a_matching_previous_model(options):
+    """No previous model, a differently-shaped one, or one with a different
+    state count must all leave this run's own (arbitrary but deterministic)
+    order alone rather than guessing at a partial relabelling."""
+    fixture = build_two_regime_activity(days=45, seed=1)
+    baseline = hm.fit(fixture.changes, SignalSet(), options, fixture.window)
+    assert baseline.fitted
+
+    no_previous = hm.fit(fixture.changes, SignalSet(), options, fixture.window, previous=None)
+    assert np.array_equal(no_previous.means, baseline.means)
+
+    unfitted_previous = hm.HomeModeModel(fitted=False, fallback_reason="cold start")
+    still_default = hm.fit(
+        fixture.changes, SignalSet(), options, fixture.window, previous=unfitted_previous
+    )
+    assert np.array_equal(still_default.means, baseline.means)
+
+    fewer_states_previous = hm.HomeModeModel(
+        fitted=True,
+        n_states=1,
+        feature_names=baseline.feature_names,
+        means=baseline.means[:1],
+        variances=baseline.variances[:1],
+        initial=np.array([1.0]),
+        transition=np.array([[1.0]]),
+    )
+    mismatched_k = hm.fit(
+        fixture.changes, SignalSet(), options, fixture.window, previous=fewer_states_previous
+    )
+    assert np.array_equal(mismatched_k.means, baseline.means)
+
+
 # --- the holdout discipline -------------------------------------------------
 def test_fit_ignores_activity_outside_the_given_window(options):
     """Rows in the input that fall outside [start, end) must never move the fit -
@@ -334,9 +432,9 @@ def test_pipeline_fits_the_mode_model_on_the_training_window_only(
     calls: list[tuple[float, float]] = []
     real_fit = pipeline_module.home_mode_module.fit
 
-    def spy(changes, signals, options, train_window, resolver=None):
+    def spy(changes, signals, options, train_window, resolver=None, previous=None):
         calls.append(train_window)
-        return real_fit(changes, signals, options, train_window, resolver)
+        return real_fit(changes, signals, options, train_window, resolver, previous)
 
     monkeypatch.setattr(pipeline_module.home_mode_module, "fit", spy)
 

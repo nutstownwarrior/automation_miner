@@ -127,6 +127,30 @@ reason ``amminer/enrich/signals.py``'s long-term-statistics fallback stamps an
 hourly mean where its interval closes: the label is not knowable until the
 activity inside the bin has actually happened.
 
+**Mode identity across runs.**  The model is refit from scratch every night
+(see "The holdout discipline" above and ``amminer.pipeline``, which persists
+the result via ``Store.save_home_mode_model``) - there is nothing incremental
+about a from-scratch EM fit to carry forward.  But EM's states are
+unlabelled: nothing about a fit itself prefers calling one cluster "state 0"
+over "state 1", so two fits of even *identical* underlying behaviour, one
+restart-draw apart, are free to number their states differently.  Left alone,
+that makes "mode_2" mean something different from one night to the next -
+unstable for a person trying to build an understanding of their own home's
+modes, and for a mined candidate that conditions on a specific mode, whose
+meaning would silently shift under it between the run that found it and the
+run that reports it.  :func:`fit` therefore accepts the *previous* persisted
+model (``amminer.pipeline`` reads it back before calling :func:`fit`) purely
+to relabel tonight's states to best match last time's, by the same
+scale-aware emission distance :attr:`HomeModeModel.weakly_separated` already
+uses (see :func:`_align_state_order`) - never to seed or otherwise influence
+the fit itself, so this has no effect whatsoever on what was found, only on
+which integer names it. When the state count itself changes night to night,
+no relabelling is attempted: there is no bijection between two differently-
+sized sets of states that could preserve every identity, and a state count
+that changed is real information, reported honestly as
+:attr:`HomeModeModel.n_states` changing rather than papered over by a
+best-effort partial relabelling.
+
 Honesty about what the modes are
 ---------------------------------
 
@@ -173,6 +197,7 @@ import math
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from itertools import permutations
 from typing import Any
 
 import numpy as np
@@ -1351,6 +1376,93 @@ def _drop_unoccupied_states(em: _EMResult, x: np.ndarray, var_floor: float) -> _
 
 
 # ----------------------------------------------------------------------
+# Mode identity across runs
+# ----------------------------------------------------------------------
+def _pooled_distance(
+    mean_a: np.ndarray, var_a: np.ndarray, mean_b: np.ndarray, var_b: np.ndarray
+) -> float:
+    """The same scale-aware distance :func:`_describe_states` uses for
+    :attr:`HomeModeModel.weakly_separated` - here comparing one state against
+    a state from a *different* fit rather than two states from the same one.
+    """
+    pooled_std = np.sqrt((var_a + var_b) / 2.0)
+    pooled_std = np.maximum(pooled_std, np.sqrt(VAR_FLOOR))
+    return float(np.linalg.norm((mean_a - mean_b) / pooled_std))
+
+
+def _align_state_order(
+    previous: HomeModeModel | None, means: np.ndarray, variances: np.ndarray
+) -> tuple[int, ...] | None:
+    """The permutation of this fit's own state indices that best matches
+    ``previous``'s, by scale-aware emission distance - or ``None`` when there
+    is nothing to align to.
+
+    EM's states are unlabelled: nothing about the fit itself prefers calling
+    the sofa-and-TV cluster "state 0" over "state 1"; :func:`_fit_best_of_restarts`
+    and :func:`_drop_unoccupied_states` never had any reason to settle that
+    consistently across nights, because until now nothing downstream cared.
+    It matters once a user (or a mined candidate that conditions on
+    ``mode_2``) starts attaching meaning to a specific label across runs -
+    refit nightly from scratch, tonight's "state 0" is otherwise as likely to
+    be last night's "state 1" as its "state 0", purely from which restart's
+    arbitrary internal ordering happened to win. Picking whichever of the
+    ``k!`` equally-valid relabellings lines up best with the previous run's
+    own states costs nothing (:func:`fit`'s statistical result - which
+    activity got grouped with which - is completely unchanged, only which
+    integer names each group) and removes that churn.
+
+    Returns ``None`` - leaving this fit's own (arbitrary) order alone -
+    whenever there is no previous *fitted* model to align to, its feature
+    vocabulary does not match this build's (a stale schema :meth:`HomeModeModel.from_row`
+    would already have refused), or its state count differs from this fit's:
+    with a different number of states there is no bijection between the two
+    sets that could preserve every identity, and guessing a partial one (drop
+    an old mode here, invent a new label there) is exactly the kind of
+    unforced, hard-to-explain choice this module's own "Honesty" section
+    argues against - a state count change is real information (the household
+    changed, or the fit found a level of structure it could not detect
+    before) and is reported as such by :attr:`HomeModeModel.n_states` itself
+    changing, not smoothed over by relabelling.
+    """
+    if (
+        previous is None
+        or not previous.fitted
+        or previous.feature_names != FEATURE_NAMES
+        or len(previous.means) != len(means)
+    ):
+        return None
+    k = len(means)
+    best_perm = tuple(range(k))
+    best_cost = math.inf
+    for perm in permutations(range(k)):
+        cost = sum(
+            _pooled_distance(previous.means[i], previous.variances[i], means[perm[i]], variances[perm[i]])
+            for i in range(k)
+        )
+        if cost < best_cost:
+            best_cost = cost
+            best_perm = perm
+    return best_perm
+
+
+def _reorder_em_result(em: _EMResult, perm: Sequence[int]) -> _EMResult:
+    """Relabel ``em``'s states according to ``perm`` (state ``i`` becomes
+    whatever was at ``perm[i]``) - a pure relabelling, so ``log_likelihood``
+    (a property of the model, not of which integer names which state) is
+    carried over unchanged rather than recomputed.
+    """
+    idx = np.array(perm)
+    return _EMResult(
+        em.log_likelihood,
+        em.initial[idx],
+        em.transition[np.ix_(idx, idx)],
+        em.means[idx],
+        em.variances[idx],
+        em.n_iter,
+    )
+
+
+# ----------------------------------------------------------------------
 # Public API
 # ----------------------------------------------------------------------
 def fit(
@@ -1359,6 +1471,7 @@ def fit(
     options: Options,
     train_window: tuple[float, float],
     resolver: Any = None,
+    previous: HomeModeModel | None = None,
 ) -> HomeModeModel:
     """Fit a home-mode model on **training-window data only**.
 
@@ -1372,6 +1485,15 @@ def fit(
     still only have training-window activity counted here - the guarantee is
     "this function never learns from anything outside the window it names",
     not merely "callers are expected to be careful".
+
+    ``previous``, when given, is the *previously persisted* model
+    (``amminer.pipeline`` reads it back via ``Store.get_home_mode_model``) -
+    used only to relabel this run's own states to match its state numbering
+    where the two line up (see :func:`_align_state_order`), never to seed or
+    otherwise influence the fit itself. It has no bearing on the holdout
+    discipline above: a fixed relabelling chosen after the fact cannot leak
+    holdout information into training, because it is not a function of the
+    holdout at all, only of two already-fitted models' parameters.
     """
     start_ts, end_ts = train_window
     train_days = (end_ts - start_ts) / 86400.0
@@ -1429,6 +1551,9 @@ def fit(
             f"them; reporting the {chosen_k} the fit actually uses rather than a state "
             "count it does not."
         )
+    perm = _align_state_order(previous, best.means, best.variances)
+    if perm is not None:
+        best = _reorder_em_result(best, perm)
     summaries, weakly_separated = _describe_states(
         chosen_k, best, x, first_idx, BIN_SECONDS, train_changes, options, resolver, var_floor
     )
