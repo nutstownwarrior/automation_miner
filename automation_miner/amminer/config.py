@@ -263,7 +263,28 @@ class Options:
     #: not say.  Only entities with no area are considered, only areas that
     #: already exist may be used, and every guess is marked as one.
     llm_areas: bool = False
+    #: Let the model propose a short, human-readable label for one inferred
+    #: household mode (amminer.learn.home_mode) from its typical hours and
+    #: active domains/areas - advisory only, exactly like llm_triage/
+    #: llm_audit: it can suggest a name, never invent a mode, change which
+    #: candidates are surfaced, or replace the honest, structural description
+    #: (typical hours, top domains/areas) that is shown regardless of whether
+    #: this is on.
+    llm_home_mode_labels: bool = False
     llm_triage_penalty: float = 0.5
+
+    # --- home mode (amminer.learn.home_mode) ----------------------------
+    #: Infer a small number of unobserved household "modes" (asleep, away,
+    #: winding down...) from binned activity, via a hidden Markov model fit
+    #: on training-window data only, and expose the result as a signal
+    #: amminer.miners.conditional can condition on. On by default: unlike the
+    #: LLM features above, this needs no external provider and degrades to
+    #: "no mode signal available" (with an honest reason) when there is not
+    #: yet enough history - see amminer/learn/home_mode.py. Never affects the
+    #: backtest gate or conflict checking; disabling it only removes one
+    #: candidate signal, the same as a signal amminer.enrich.detect never
+    #: found.
+    home_mode_enabled: bool = True
 
     # --- learned ranking (amminer.learn.ranking) -----------------------
     #: Order suggestions by a calibrated estimate of how likely *this user* is
@@ -373,6 +394,7 @@ class Options:
             "explanations": bool(self.llm_explain),
             "scenes": bool(self.llm_scenes),
             "area_inference": bool(self.llm_areas),
+            "home_mode_labels": bool(self.llm_home_mode_labels),
         }
 
     @property

@@ -19,7 +19,7 @@ from typing import Any
 
 _LOGGER = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 STATUS_NEW = "new"
 STATUS_DISMISSED = "dismissed"
@@ -202,6 +202,28 @@ CREATE TABLE IF NOT EXISTS automation_health (
     status        TEXT NOT NULL,
     verdict       TEXT NOT NULL,
     payload       TEXT NOT NULL
+);
+
+-- A single row (id fixed at 1) holding whatever household-mode model
+-- (see amminer.learn.home_mode) is currently fitted. Retrained wholesale on
+-- the training window each nightly run, never patched in place - the same
+-- "nothing incremental, nothing to migrate row by row" reasoning as
+-- ranking_models above. ``fitted``/``n_states``/``selection_method``/
+-- ``trained_ts``/``fallback_reason`` are flattened out for cheap reads (the
+-- Status page and health checks do not need the whole model just to say
+-- whether one is fitted); ``payload`` is the complete
+-- amminer.learn.home_mode.HomeModeModel.as_dict(), which is what
+-- amminer.learn.home_mode.HomeModeModel.from_row rebuilds from - the same
+-- "flat columns for the common read, one JSON payload for the rest" shape
+-- the backtests table above already uses.
+CREATE TABLE IF NOT EXISTS home_mode_models (
+    id                INTEGER PRIMARY KEY CHECK (id = 1),
+    fitted            INTEGER NOT NULL DEFAULT 0,
+    n_states          INTEGER NOT NULL DEFAULT 0,
+    selection_method  TEXT,
+    trained_ts        REAL NOT NULL,
+    fallback_reason   TEXT,
+    payload           TEXT NOT NULL
 );
 """
 
@@ -977,6 +999,48 @@ class Store:
         data["fallback_to_prior"] = bool(data["fallback_to_prior"])
         return data
 
+    # --- home-mode model (amminer.learn.home_mode) ---------------------
+    def save_home_mode_model(self, model: dict[str, Any]) -> None:
+        """Persist the singleton home-mode model row (id=1).
+
+        Overwritten wholesale every run, like ``save_ranking_model`` -
+        ``amminer.learn.home_mode.fit`` is refit from scratch each night from
+        that run's own training window, so there is nothing here to migrate
+        incrementally, only the latest fit (or the latest honest reason there
+        was not one) to remember between runs.
+        """
+        self._execute(
+            "INSERT INTO home_mode_models(id, fitted, n_states, selection_method, trained_ts,"
+            " fallback_reason, payload) VALUES(1,?,?,?,?,?,?)"
+            " ON CONFLICT(id) DO UPDATE SET fitted=excluded.fitted, n_states=excluded.n_states,"
+            " selection_method=excluded.selection_method, trained_ts=excluded.trained_ts,"
+            " fallback_reason=excluded.fallback_reason, payload=excluded.payload",
+            (
+                1 if model.get("fitted") else 0,
+                int(model.get("n_states") or 0),
+                model.get("selection_method"),
+                float(model.get("trained_ts") or 0.0),
+                model.get("fallback_reason"),
+                _json(model),
+            ),
+        )
+
+    def get_home_mode_model(self) -> dict[str, Any] | None:
+        """The complete persisted model dict, ready for
+        ``amminer.learn.home_mode.HomeModeModel.from_row``.
+
+        Read from ``payload`` alone (not the flattened columns) - those exist
+        for cheap listing/status reads, not as a second source of truth that
+        could drift from what was actually fitted.
+        """
+        rows = self._query("SELECT payload FROM home_mode_models WHERE id = 1")
+        if not rows:
+            return None
+        try:
+            return json.loads(rows[0]["payload"])
+        except (json.JSONDecodeError, TypeError):
+            return None
+
     # --- overrides ----------------------------------------------------
     def record_overrides(self, overrides: Iterable[Any]) -> int:
         inserted = 0
@@ -1215,6 +1279,7 @@ class Store:
             "preferences",
             "gap_suggestions",
             "ranking_models",
+            "home_mode_models",
             "applied_automations",
             "automation_health",
         ):

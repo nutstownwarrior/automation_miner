@@ -19,7 +19,7 @@ def add(store, suggestion_id="s1", miner="time_of_day", score=0.8, run_id=1):
 
 
 def test_schema_is_created_and_counts_start_empty(store):
-    assert store.get_meta("schema_version") == "4"
+    assert store.get_meta("schema_version") == "5"
     assert all(count == 0 for count in store.counts().values())
 
 
@@ -137,7 +137,7 @@ def test_an_old_database_migrates_the_backtest_validation_columns(tmp_path):
     conn.close()
 
     with Store(path) as store:
-        assert store.get_meta("schema_version") == "4"
+        assert store.get_meta("schema_version") == "5"
         old = store.get_backtest("old-one")
         assert old["precision_score"] == 0.6
         assert old["validation"] == "in_sample"  # the new column's default
@@ -340,7 +340,7 @@ def test_an_old_database_gains_the_applied_automations_tables(tmp_path):
     conn.close()
 
     with Store(path) as store:
-        assert store.get_meta("schema_version") == "4"
+        assert store.get_meta("schema_version") == "5"
         # Pre-existing data survived the migration untouched.
         assert store.get_suggestion("old-sugg")["title"] == "Old suggestion"
         # And the new tables are not just present but fully usable end to end,
