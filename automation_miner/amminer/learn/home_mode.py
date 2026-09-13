@@ -565,16 +565,34 @@ class _EMResult:
 def _fit_em(
     x: np.ndarray,
     k: int,
-    rng: np.random.Generator,
+    rng: np.random.Generator | None = None,
     var_floor: float = VAR_FLOOR,
     max_iter: int = MAX_EM_ITERS,
+    init: _EMResult | None = None,
 ) -> _EMResult:
-    """One deterministic (given ``rng``) EM run to convergence or ``max_iter``."""
+    """One deterministic EM run to convergence or ``max_iter``.
+
+    Initialised either from ``rng`` (an independent random restart - the
+    normal case) or, when ``init`` is given instead, from an *existing*
+    fit's parameters - used to warm-start the full-quality refit from
+    whatever :func:`select_model`'s cheaper inner comparison already found
+    (see :func:`_fit_best_of_restarts`), so structure that comparison
+    already located cannot be lost purely because an independent random
+    redraw on the full data happens not to rediscover it. Exactly one of
+    ``rng``/``init`` must be given.
+    """
     t_len = x.shape[0]
-    pi = rng.dirichlet(np.ones(k))
-    a = rng.dirichlet(np.ones(k), size=k)
-    means = x[rng.choice(t_len, size=k, replace=False)].copy()
-    variances = np.tile(np.maximum(x.var(axis=0), var_floor), (k, 1))
+    if init is not None:
+        pi = init.initial.copy()
+        a = init.transition.copy()
+        means = init.means.copy()
+        variances = init.variances.copy()
+    else:
+        assert rng is not None, "_fit_em needs either rng or init"
+        pi = rng.dirichlet(np.ones(k))
+        a = rng.dirichlet(np.ones(k), size=k)
+        means = x[rng.choice(t_len, size=k, replace=False)].copy()
+        variances = np.tile(np.maximum(x.var(axis=0), var_floor), (k, 1))
 
     prev_ll = -np.inf
     n_iter = 0
@@ -786,36 +804,82 @@ def _causal_occupied_count(em: _EMResult, x: np.ndarray, var_floor: float) -> in
     return len({int(label) for label in labels})
 
 
-def _fit_best_of_restarts(
-    x: np.ndarray, k: int, var_floor: float, restarts: int, max_iter: int
+def _select_best_restart(
+    candidates: list[_EMResult], x: np.ndarray, var_floor: float
 ) -> _EMResult:
-    """The best of ``restarts`` independent, seeded fits - preferring one that
-    actually uses all ``k`` states under *causal* decoding.
+    """Prefer the restart that causally occupies the *most* states; break ties
+    by (smoothed) log-likelihood.
+
+    Not "exactly ``k`` states or fall back to raw likelihood": that
+    exact-or-bust rule throws away everything a restart found the moment
+    none of them happens to hit ``k`` on the nose, including a restart that
+    causally distinguished ``k - 1`` (or ``k - 2``) states - which is
+    obviously less collapsed, and therefore obviously preferable, to one
+    that only ever occupies a single state, even though the old rule treated
+    both as equally disqualified and picked between them on likelihood
+    alone. Reproduced concretely: ``build_two_regime_activity(days=365,
+    seed=7)`` selects ``k=4`` on held-out evidence, but the full-quality
+    refit's three restarts causally occupy ``{1, 2, 2}`` states - none hits
+    4 - and the old rule's likelihood-only fallback picked the ``1``-state
+    restart over both ``2``-state ones, discarding structure the selection
+    stage had already found (see
+    ``tests/test_home_mode.py::test_selection_survives_an_unlucky_restart_draw``).
+    Maximum-occupied-first fixes that without needing every restart to hit
+    the same exact count that inner, cheaper selection happened to prefer.
+    """
+    occupied = [(_causal_occupied_count(c, x, var_floor), c) for c in candidates]
+    max_occupied = max(n for n, _ in occupied)
+    pool = [c for n, c in occupied if n == max_occupied]
+    return max(pool, key=lambda c: c.log_likelihood)
+
+
+def _fit_best_of_restarts(
+    x: np.ndarray,
+    k: int,
+    var_floor: float,
+    restarts: int,
+    max_iter: int,
+    warm_start: _EMResult | None = None,
+) -> _EMResult:
+    """The best of ``restarts`` independent, seeded fits, plus (optionally) one
+    warm-started from an existing fit - preferring whichever causally
+    occupies the most of ``k`` states under *causal* decoding, ties broken by
+    likelihood (see :func:`_select_best_restart`).
 
     EM's own fitting objective is the smoothed (forward-backward) likelihood,
     which can legitimately prefer a restart that, decoded the way this
     module is actually ever deployed (:func:`decode_labels`, forward-only,
     see the module docstring's "The holdout discipline"), collapses onto a
     single dominant state even though its *smoothed* training likelihood is
-    higher than a restart that does distinguish all ``k`` states causally - a
+    higher than a restart that does distinguish more states causally - a
     sufficiently "sticky" fitted transition matrix can make one state win
-    every causal decision even when the fit meaningfully uses a second one
-    with the benefit of hindsight. Since production never has that
-    hindsight, a restart this model will actually be able to tell apart in
-    practice is preferred over one that merely scores higher on an objective
-    nothing here ever gets to use directly - falling back to plain
-    best-likelihood only when *every* restart collapses, since that is then
-    the honest answer about what this data supports once actually deployed
-    (see :func:`_drop_unoccupied_states`, which prunes whatever is left).
+    every causal decision even when the fit meaningfully uses others with
+    the benefit of hindsight. Since production never has that hindsight, a
+    restart this model will actually be able to tell apart in practice is
+    preferred over one that merely scores higher on an objective nothing
+    here ever gets to use directly.
+
+    ``warm_start``, when given, is an already-fit :class:`_EMResult` (from a
+    *different*, typically smaller, slice of data - see
+    :func:`select_model`'s full-quality refit) whose parameters seed one
+    extra EM run on ``x`` instead of a random draw. This is what lets
+    structure the cheaper selection stage already found survive into the
+    full-quality refit even when every independently-seeded restart on the
+    full data happens to redraw into something more collapsed - the
+    independent restarts are still run and still compete on equal footing
+    (a warm start that is actually worse than a random restart on the full
+    data does not win just for being a warm start), it is only ever an
+    additional candidate in the same pool, never a replacement for genuine
+    restarts.
     """
     candidates = [
-        _fit_em(x, k, np.random.default_rng([_SEED_BASE, k, restart]), var_floor, max_iter)
+        _fit_em(x, k, rng=np.random.default_rng([_SEED_BASE, k, restart]),
+                var_floor=var_floor, max_iter=max_iter)
         for restart in range(restarts)
     ]
-    fully_occupied = [c for c in candidates if _causal_occupied_count(c, x, var_floor) == k]
-    pool = fully_occupied or candidates
-    best = max(pool, key=lambda c: c.log_likelihood)
-    return best
+    if warm_start is not None:
+        candidates.append(_fit_em(x, k, var_floor=var_floor, max_iter=max_iter, init=warm_start))
+    return _select_best_restart(candidates, x, var_floor)
 
 
 def _fit_candidates(
@@ -901,8 +965,15 @@ def select_model(
         method = "held_out_likelihood"
         # Only the winner is refit at full quality on every training bin -
         # the ranking above already decided k; there is nothing left for the
-        # other candidates' full-quality fits to be used for.
-        winner = _fit_best_of_restarts(x, chosen_k, var_floor, RESTARTS, MAX_EM_ITERS)
+        # other candidates' full-quality fits to be used for. Warm-started
+        # from the selection-stage winner's own parameters (fit on x_fit) so
+        # that the structure which just won the held-out comparison cannot
+        # be lost purely because this refit's independent random restarts on
+        # the full data happen to redraw into something more collapsed - see
+        # _fit_best_of_restarts's own docstring.
+        winner = _fit_best_of_restarts(
+            x, chosen_k, var_floor, RESTARTS, MAX_EM_ITERS, warm_start=inner_fits[chosen_k]
+        )
         per_k = {
             k: {
                 "score": scores[k],
@@ -1020,6 +1091,17 @@ class HomeModeModel:
     #: Never left implicit - every caller that skips conditioning on the mode
     #: signal because ``fitted`` is False can read exactly why.
     fallback_reason: str | None = None
+    #: Set when :attr:`n_states` is *smaller* than the state count
+    #: :func:`select_model` actually chose on held-out (or BIC) evidence -
+    #: i.e. the full-quality refit's restarts, even warm-started from the
+    #: selection winner, never causally distinguished that many states, so
+    #: :func:`_drop_unoccupied_states` pruned it down. Never left implicit,
+    #: for the same reason :attr:`fallback_reason` is not: a reader seeing
+    #: ``n_states=1`` after selection found real evidence for more should be
+    #: able to tell "this is what the data supports once actually deployed"
+    #: apart from "the household plainly has only one regime" without
+    #: reading this module's source.
+    selection_note: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -1044,6 +1126,7 @@ class HomeModeModel:
             "weakly_separated": self.weakly_separated,
             "trained_ts": self.trained_ts,
             "fallback_reason": self.fallback_reason,
+            "selection_note": self.selection_note,
         }
 
     @classmethod
@@ -1087,6 +1170,7 @@ class HomeModeModel:
                 weakly_separated=bool(row.get("weakly_separated", False)),
                 trained_ts=float(row.get("trained_ts", 0.0)),
                 fallback_reason=row.get("fallback_reason"),
+                selection_note=row.get("selection_note"),
             )
         except (KeyError, TypeError, ValueError):
             return None
@@ -1325,8 +1409,26 @@ def fit(
     except ValueError as err:
         return HomeModeModel(fitted=False, fallback_reason=str(err))
 
+    selected_k = chosen_k
     best = _drop_unoccupied_states(per_k[chosen_k]["fit"], x, var_floor)
     chosen_k = len(best.initial)
+    selection_note = None
+    if chosen_k < selected_k:
+        # select_model's own evidence (held-out likelihood, or BIC when there
+        # was not enough history for a held-out slice) preferred selected_k
+        # states, but the full-quality refit's restarts - including one
+        # warm-started from that selection winner's own parameters, see
+        # _fit_best_of_restarts - never causally distinguished more than
+        # chosen_k of them once decoded the way this model is ever actually
+        # deployed. That is itself evidence selected_k was not achievable
+        # from this data, not a fit gone wrong; see this module's docstring,
+        # "State count".
+        selection_note = (
+            f"{method.replace('_', ' ')} selection preferred {selected_k} states, but "
+            f"the full-quality fit never causally distinguished more than {chosen_k} of "
+            f"them; reporting the {chosen_k} the fit actually uses rather than a state "
+            "count it does not."
+        )
     summaries, weakly_separated = _describe_states(
         chosen_k, best, x, first_idx, BIN_SECONDS, train_changes, options, resolver, var_floor
     )
@@ -1348,6 +1450,7 @@ def fit(
         selection_method=method,
         state_summaries=summaries,
         weakly_separated=weakly_separated,
+        selection_note=selection_note,
     )
 
 
