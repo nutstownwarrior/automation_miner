@@ -128,8 +128,37 @@ def test_recovered_states_are_honestly_described(options):
         assert summary["label"] == f"mode_{summary['state']}"
 
 
+# --- shared fixture fits for the state-count sweeps below -----------------
+#
+# The four tests below all exercise `build_two_regime_activity` across a
+# spread of seeds, and several of them exercise the *same* (days, seed)
+# pairs to check different properties of the same fit (never collapses to
+# one state; never inflates past a few states; is not weakly-separated when
+# it does report more than two). Fitting is deterministic given the same
+# input (see test_fit_is_deterministic_within_a_process) - so re-fitting the
+# same synthetic history from scratch in each test bought nothing but CPU:
+# a full production-shaped fit costs several seconds each, and the naive
+# version of these four tests performed 32 of them where only 18 distinct
+# (days, seed) pairs are ever actually needed. This cache makes that sharing
+# explicit rather than accidental duplication, without weakening any single
+# test's assertions or reducing which seeds are checked - every seed and
+# every property below is still exercised exactly as before, just against a
+# fit computed once instead of up to three times.
+_TWO_REGIME_FIT_CACHE: dict[tuple[int, int], hm.HomeModeModel] = {}
+
+
+def _fit_two_regime(days: int, seed: int) -> hm.HomeModeModel:
+    key = (days, seed)
+    if key not in _TWO_REGIME_FIT_CACHE:
+        fixture = build_two_regime_activity(days=days, seed=seed)
+        _TWO_REGIME_FIT_CACHE[key] = hm.fit(
+            fixture.changes, SignalSet(), Options(), fixture.window
+        )
+    return _TWO_REGIME_FIT_CACHE[key]
+
+
 # --- state-count selection ------------------------------------------------
-def test_state_count_stays_small_for_a_quiet_home(options):
+def test_state_count_stays_small_for_a_quiet_home():
     """A simple two-regime home must never be *confidently* reported as
     having five separate modes - it may honestly find more than the two true
     regimes, but only when it also says, plainly, that they are not well
@@ -151,8 +180,7 @@ def test_state_count_stays_small_for_a_quiet_home(options):
     "Honesty about what the modes are".
     """
     for seed in range(1, 6):
-        fixture = build_two_regime_activity(days=45, seed=seed)
-        model = hm.fit(fixture.changes, SignalSet(), options, fixture.window)
+        model = _fit_two_regime(days=45, seed=seed)
         assert model.fitted
         assert model.n_states <= max(hm.STATE_CANDIDATES)
         if model.n_states > 2:
@@ -198,7 +226,7 @@ def test_em_does_not_silently_collapse_to_one_effective_state():
     )
 
 
-def test_selection_survives_an_unlucky_restart_draw(options):
+def test_selection_survives_an_unlucky_restart_draw():
     """The exact case a review of this module reproduced: selection found
     (what looked like) clear held-out evidence for several states, but the
     full-quality refit's own restarts could, by bad luck, causally
@@ -234,8 +262,7 @@ def test_selection_survives_an_unlucky_restart_draw(options):
     undifferentiated mode when the data underneath it is genuinely built
     from (at least) two regimes.
     """
-    fixture = build_two_regime_activity(days=365, seed=7)
-    model = hm.fit(fixture.changes, SignalSet(), options, fixture.window)
+    model = _fit_two_regime(days=365, seed=7)
     assert model.fitted
     assert model.n_states >= 2, (
         "held-out selection found strong evidence for multiple states, but the "
@@ -252,8 +279,7 @@ def test_two_regime_structure_is_never_collapsed_to_one_state():
     """
     collapsed = []
     for seed in range(8):
-        fixture = build_two_regime_activity(days=365, seed=seed)
-        model = hm.fit(fixture.changes, SignalSet(), Options(), fixture.window)
+        model = _fit_two_regime(days=365, seed=seed)
         if model.fitted and model.n_states < 2:
             collapsed.append((seed, model.n_states, model.score_by_states))
     assert not collapsed, (
@@ -286,8 +312,7 @@ def test_state_count_stays_small_across_seeds():
     ceiling = max(hm.STATE_CANDIDATES) - 1  # "well below max k", not merely "not max k"
     counts: list[int] = []
     for seed in range(1, 11):
-        fixture = build_two_regime_activity(days=45, seed=seed)
-        model = hm.fit(fixture.changes, SignalSet(), Options(), fixture.window)
+        model = _fit_two_regime(days=45, seed=seed)
         assert model.fitted
         counts.append(model.n_states)
         assert model.n_states <= ceiling, (
@@ -301,8 +326,7 @@ def test_state_count_stays_small_across_seeds():
     )
 
     for seed in range(8):
-        fixture = build_two_regime_activity(days=365, seed=seed)
-        model = hm.fit(fixture.changes, SignalSet(), Options(), fixture.window)
+        model = _fit_two_regime(days=365, seed=seed)
         assert model.fitted
         assert model.n_states <= ceiling, (
             f"365-day seed {seed}: expected at most {ceiling} states for a simple "
