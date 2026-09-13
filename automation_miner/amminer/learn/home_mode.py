@@ -60,24 +60,50 @@ smaller candidate (see :func:`select_model` and :data:`SELECTION_Z_SCORE`),
 falling back to in-sample BIC only when there is not enough history for that
 slice to mean anything. Either way a spurious extra "mode" that just fits
 noise, or a shape a Gaussian is a poor match for, is not worth its added
-complexity, and a quiet home legitimately comes back with 2. It is not,
-however, a hard floor: the state count actually reported is the number of
-states the *final* fit still uses after refitting on every training bin (a
-component with no support left in that refit can end up empty rather than
-merging into a neighbour - see :func:`_drop_unoccupied_states`), so a home
-whose activity does not distinguish into separate regimes at all can
-honestly come back as 1, described plainly rather than split into two
-groups neither of which means anything (see "Honesty" below).
+complexity, and a quiet home legitimately comes back with 2.
+
+Clearing that noise bar is necessary but not sufficient: a larger candidate
+must *also* introduce a state whose emission is not a near-duplicate of one
+a smaller candidate already has (see :func:`_larger_fit_adds_a_novel_state`).
+A first-order Markov chain's dwell time in a state is memoryless; real
+activity durations often are not (a burst that lasts "about an hour" is
+much closer to constant than exponential), and splitting one true regime
+into two states with identical emissions but different transition dynamics
+is a real, reproducible way to fit that non-geometric dwell time better -
+clearing *any* held-out significance bar, however strict, because it is
+not sampling noise. Nothing about *how significant* that gain is can tell
+it apart from a genuine extra regime; what the new state's emission
+actually looks like can, which is why both conditions are required
+together, not either alone.
+
+It is not, however, a hard floor: the state count actually reported is the
+number of states the *final* fit still uses after refitting on every
+training bin (a component with no support left in that refit can end up
+empty rather than merging into a neighbour - see
+:func:`_drop_unoccupied_states`), so a home whose activity does not
+distinguish into separate regimes at all can honestly come back as 1,
+described plainly rather than split into two groups neither of which means
+anything (see "Honesty" below).
 
 **Restarts and determinism - fixed, seeded, best-of-N.**  EM only finds a local
 optimum, so each candidate ``k`` is fit :data:`RESTARTS` (or, for ranking
 candidates against each other, the cheaper :data:`SELECTION_RESTARTS`) times
-from independent initialisations and the best kept (see
-:func:`_fit_best_of_restarts`) - "best" by log-likelihood among whichever
-restarts actually distinguish all ``k`` states once decoded the same
-causal way this module is ever deployed, since EM's own smoothed training
-objective can otherwise prefer a restart that looks better on paper and
-collapses in practice. Every restart's random state comes from
+from independent initialisations - and "best" means two *different* things
+for two different jobs, deliberately not the same criterion for both (see
+:func:`_select_best_restart`'s own docstring for the full reasoning and the
+regression each half guards against). Choosing which restart's *model* to
+keep, once ``k`` is already settled, prefers whichever restart causally
+distinguishes the most states once decoded the same causal way this module
+is ever deployed - EM's own smoothed training objective can otherwise
+prefer a restart that looks better on paper and collapses in practice.
+Ranking *different* candidate ``k`` values against each other uses plain
+best log-likelihood instead, with no such preference: applying the first
+rule there does not fix anything (a single-state restart was never the
+best-scoring one for its own k anyway) and instead systematically rewards
+a restart that fragments one true regime into several near-duplicate
+states, at every k, pulling the whole ranking toward the top of
+:data:`STATE_CANDIDATES` regardless of what the data actually supports.
+Every restart's random state comes from
 ``numpy.random.default_rng`` seeded with a fixed base constant plus ``(k,
 restart_index)`` - never from wall-clock time, never from Python's global
 ``random`` module, never from iteration over a ``dict``/``set`` whose order
@@ -264,7 +290,38 @@ EM_TOL = 1e-4
 #: changing which candidate wins in practice - the ranking only needs to be
 #: good enough to compare four numbers against each other, not to produce a
 #: publication-quality fit for all four.
-SELECTION_RESTARTS = 2
+#:
+#: ``SELECTION_RESTARTS`` was raised from 2 to 4 after measuring that 2 was
+#: not enough restarts for the ranking fits themselves to be reliable: a
+#: candidate as small as ``k=2`` can, at only 2 cheap restarts, land on a
+#: genuinely degenerate fit (its states not causally distinguishable at
+#: all - see :func:`_causal_occupied_count`) purely by bad luck, which then
+#: makes *every* larger candidate look like a dramatic, highly "significant"
+#: improvement for the wrong reason: not because it found more real
+#: structure, but because the baseline it is being compared against never
+#: represented the data it already had. That, not fragmentation being
+#: rewarded, was the actual mechanism behind
+#: ``build_two_regime_activity``'s seeds returning 4-5 states for a
+#: genuinely two-regime household even with occupied-count preference
+#: correctly confined to :func:`_fit_best_of_restarts`'s *other* job (see
+#: that function's own docstring) - a degenerate ``k=2`` baseline makes
+#: :func:`_larger_fit_adds_a_novel_state` too, since a fit that never
+#: distinguished its own states looks "novel" relative to almost anything.
+#: 4 restarts was measured sufficient for every synthetic fixture this
+#: module's own test suite exercises to reliably find a properly-converged
+#: fit at every candidate k; raising it further had no further effect
+#: (the degeneracy is a discrete "did a restart happen to land near the
+#: right optimum" event, not something more EM iterations at the *same*
+#: restarts fixes - see :data:`SELECTION_MAX_ITERS`, left unchanged and
+#: confirmed by the same measurement to already be enough once a restart
+#: does land well). Doubling it also did not make the module slower
+#: end-to-end in practice: a ranking stage that reliably tells small
+#: candidates apart from large ones now more often *keeps* the count small,
+#: and the (far more expensive) full-quality refit on the winning k is
+#: correspondingly cheaper - measured net effect on this module's own
+#: dense-synthetic-year benchmark was a wash to a modest improvement, not a
+#: regression.
+SELECTION_RESTARTS = 4
 SELECTION_MAX_ITERS = 10
 
 #: Absolute floor under any state's emission variance, regardless of scale.
@@ -787,13 +844,100 @@ def _held_out_bin_loglik(result: _EMResult, x_val: np.ndarray, var_floor: float)
 #: step (roughly a one-sided 2-3% false-accept rate) keeps the compounded
 #: risk low while still accepting a real, clearly separated extra regime
 #: (see ``tests/test_home_mode.py``'s wind-down fixture, which has one).
+#:
+#: This bar alone is **not enough**, and cannot be made enough by raising it
+#: further - see :func:`_larger_fit_adds_a_novel_state` for why a second,
+#: independent condition is required alongside it.
 SELECTION_Z_SCORE = 2.0
+
+#: Below this scale-aware distance (see :func:`_pooled_distance`), two
+#: states' emissions are not something an observer - or this selection
+#: criterion - can tell apart. Shared by :attr:`HomeModeModel.weakly_separated`
+#: (describing an already-chosen model *after* the fact) and
+#: :func:`_larger_fit_adds_a_novel_state` (deciding *during* selection
+#: whether a larger model earned its extra state) - the same question either
+#: way: is this state actually distinguishable from that one.
+SEPARATION_MIN_DISTANCE = 1.0
+
+
+def _pooled_distance(
+    mean_a: np.ndarray, var_a: np.ndarray, mean_b: np.ndarray, var_b: np.ndarray,
+    var_floor: float = VAR_FLOOR,
+) -> float:
+    """Scale-aware distance between two states' emissions, in pooled-standard-
+    deviation units - the same quantity :attr:`HomeModeModel.weakly_separated`
+    compares against :data:`SEPARATION_MIN_DISTANCE`, generalised here to
+    compare a state from one fit against a state from a *different* fit
+    (:func:`_larger_fit_adds_a_novel_state`, and separately
+    :func:`_align_state_order` for matching a fit against a previous run's,
+    where the default floor is fine - only a *relative* ranking of
+    permutations, never an absolute threshold, is ever read from it there).
+    ``var_floor`` should be the effective floor the fit(s) being compared
+    were actually fit under (see :data:`VAR_FLOOR_FRACTION`) wherever an
+    absolute threshold *is* being read from the result, so this always
+    means the same thing :attr:`HomeModeModel.weakly_separated` does.
+    """
+    pooled_std = np.sqrt((var_a + var_b) / 2.0)
+    pooled_std = np.maximum(pooled_std, np.sqrt(var_floor))
+    return float(np.linalg.norm((mean_a - mean_b) / pooled_std))
+
+
+def _larger_fit_adds_a_novel_state(
+    current_fit: _EMResult, candidate_fit: _EMResult, var_floor: float
+) -> bool:
+    """Does ``candidate_fit`` (more states than ``current_fit``) contain at
+    least one state that is not a near-duplicate, by :data:`SEPARATION_MIN_DISTANCE`,
+    of every state ``current_fit`` already has?
+
+    This exists because a significance test on held-out likelihood alone
+    (:func:`_prefer_more_states`) is not sufficient to decide whether a
+    larger ``k`` found a genuine extra behavioural regime, and cannot be
+    made sufficient by raising :data:`SELECTION_Z_SCORE` - no matter how
+    high. A first-order Markov chain's dwell time in a state is
+    memoryless (geometric); real activity durations routinely are not (a
+    "the TV is on for about an hour" burst is much closer to constant than
+    exponential). Splitting one true regime into two states with the
+    *same* emission distribution but different transition dynamics lets the
+    chain approximate that non-geometric dwell time - a real, substantial,
+    reproducible improvement in held-out likelihood, not sampling noise, so
+    it clears *any* significance bar: measured z-scores for this exact
+    spurious split ranged up to 286 across ``build_two_regime_activity``'s
+    seeds, comfortably exceeding the 23-53 measured for a genuine third
+    regime in ``build_winddown_habit_activity`` - there is no threshold
+    that keeps the second and rejects the first, because the first is not
+    noise either. What reliably tells them apart is not how *significant*
+    the gain is but *what the extra state actually looks like*: a
+    dwell-time phase split's new state has, by construction, (numerically
+    measured) **zero** distance to a state the smaller model already had,
+    while a genuine extra regime's new state measures several units away
+    (see ``tests/test_home_mode.py::test_state_count_stays_small_across_seeds``
+    for the reproduction, and ``test_a_third_real_regime_is_still_found``
+    for the case this must still accept). Requiring both this *and* the
+    significance bar means a state only ever gets added when it is both a
+    genuine surprise on held-out data *and* something an observer could
+    point to as different - exactly what :attr:`HomeModeModel.state_summaries`
+    then goes on to describe.
+    """
+    for j in range(len(candidate_fit.means)):
+        nearest = min(
+            _pooled_distance(
+                candidate_fit.means[j], candidate_fit.variances[j],
+                current_fit.means[i], current_fit.variances[i],
+                var_floor,
+            )
+            for i in range(len(current_fit.means))
+        )
+        if nearest >= SEPARATION_MIN_DISTANCE:
+            return True
+    return False
 
 
 def _prefer_more_states(
-    current_per_bin: np.ndarray, candidate_per_bin: np.ndarray
+    current_per_bin: np.ndarray, candidate_per_bin: np.ndarray,
+    current_fit: _EMResult, candidate_fit: _EMResult, var_floor: float,
 ) -> bool:
-    """Would the larger model's per-bin gain survive being sampling noise?
+    """Would the larger model's per-bin gain survive being sampling noise -
+    and does it actually add a state worth having?
 
     The *mean* paired per-bin improvement must exceed
     :data:`SELECTION_Z_SCORE` standard errors of the paired differences, not
@@ -812,6 +956,12 @@ def _prefer_more_states(
     current best - so a bigger model has to clear the bar against the best
     complexity found *so far*, not against a fixed baseline it might have
     beaten by luck alone.
+
+    Clearing that bar is necessary but - see
+    :func:`_larger_fit_adds_a_novel_state` - never sufficient on its own:
+    a significant held-out gain is also exactly what a spurious dwell-time
+    phase split produces, so the larger fit must also introduce a state that
+    is not just a near-duplicate of one the smaller fit already had.
     """
     diffs = candidate_per_bin - current_per_bin
     n = len(diffs)
@@ -819,9 +969,10 @@ def _prefer_more_states(
         return False
     mean_diff = float(np.mean(diffs))
     se_diff = float(np.std(diffs, ddof=1) / np.sqrt(n)) if n > 1 else 0.0
-    if se_diff > 0:
-        return mean_diff > SELECTION_Z_SCORE * se_diff
-    return mean_diff > 0
+    significant = mean_diff > SELECTION_Z_SCORE * se_diff if se_diff > 0 else mean_diff > 0
+    if not significant:
+        return False
+    return _larger_fit_adds_a_novel_state(current_fit, candidate_fit, var_floor)
 
 
 def _causal_occupied_count(em: _EMResult, x: np.ndarray, var_floor: float) -> int:
@@ -830,28 +981,68 @@ def _causal_occupied_count(em: _EMResult, x: np.ndarray, var_floor: float) -> in
 
 
 def _select_best_restart(
-    candidates: list[_EMResult], x: np.ndarray, var_floor: float
+    candidates: list[_EMResult], x: np.ndarray, var_floor: float,
+    prefer_max_occupied: bool = True,
 ) -> _EMResult:
-    """Prefer the restart that causally occupies the *most* states; break ties
-    by (smoothed) log-likelihood.
+    """Pick the best of ``candidates`` - by one of two different criteria for
+    two different jobs, never the same one for both (see ``prefer_max_occupied``).
 
-    Not "exactly ``k`` states or fall back to raw likelihood": that
-    exact-or-bust rule throws away everything a restart found the moment
-    none of them happens to hit ``k`` on the nose, including a restart that
-    causally distinguished ``k - 1`` (or ``k - 2``) states - which is
-    obviously less collapsed, and therefore obviously preferable, to one
-    that only ever occupies a single state, even though the old rule treated
-    both as equally disqualified and picked between them on likelihood
-    alone. Reproduced concretely: ``build_two_regime_activity(days=365,
-    seed=7)`` selects ``k=4`` on held-out evidence, but the full-quality
-    refit's three restarts causally occupy ``{1, 2, 2}`` states - none hits
-    4 - and the old rule's likelihood-only fallback picked the ``1``-state
-    restart over both ``2``-state ones, discarding structure the selection
-    stage had already found (see
+    ``prefer_max_occupied=True`` (the default): prefer the restart that
+    causally occupies the *most* states; break ties by (smoothed)
+    log-likelihood. Not "exactly ``k`` states or fall back to raw
+    likelihood": that exact-or-bust rule throws away everything a restart
+    found the moment none of them happens to hit ``k`` on the nose,
+    including a restart that causally distinguished ``k - 1`` (or ``k - 2``)
+    states - which is obviously less collapsed, and therefore obviously
+    preferable, to one that only ever occupies a single state, even though
+    the old rule treated both as equally disqualified and picked between
+    them on likelihood alone. Reproduced concretely:
+    ``build_two_regime_activity(days=365, seed=7)`` - at the
+    :data:`SELECTION_RESTARTS` value in effect when this was found - had
+    selection score ``k=4`` well above ``k=2``/``k=3``, but the
+    full-quality refit's three restarts causally occupied only
+    ``{1, 2, 2}`` states - none hit 4 - and the old rule's likelihood-only
+    fallback picked the ``1``-state restart over both ``2``-state ones,
+    discarding structure the selection stage had already found (see
     ``tests/test_home_mode.py::test_selection_survives_an_unlucky_restart_draw``).
-    Maximum-occupied-first fixes that without needing every restart to hit
-    the same exact count that inner, cheaper selection happened to prefer.
+    Whether ``k=4`` itself was the *right* count for that data is a separate
+    question from this one - see :func:`_larger_fit_adds_a_novel_state` and
+    :data:`SELECTION_RESTARTS`'s own comment, where it turned out not to be -
+    but this rule's job is narrower and still exactly right regardless:
+    whatever count selection settles on, the model actually kept must not
+    silently be a more-collapsed one. This is the right rule for choosing
+    *among restarts of one already-chosen
+    k* - the actual model that gets kept - because a restart this deployment
+    will actually be able to tell apart in practice is preferred over one
+    that merely scores higher on an objective (smoothed likelihood) nothing
+    here ever gets to use directly (see the module docstring's "The holdout
+    discipline").
+
+    ``prefer_max_occupied=False``: plain best (smoothed) log-likelihood,
+    full stop - no occupied-count preference at all. This is the right (and
+    only correct) rule when the candidates being compared are for
+    *different* k, i.e. when the caller is ranking candidate state counts
+    against each other (:func:`select_model`'s inner comparison, and its BIC
+    fallback): occupied-count-first there does not fix anything, because a
+    restart that only occupies one state was never in the running as the
+    *best-scoring* candidate for a given k anyway. What it *does* do,
+    proven wrong empirically, is systematically reward fragmentation - a
+    restart that splits one true regime into several near-duplicate states
+    (see the module docstring's "State count" on why a Gaussian-HMM can
+    always buy this) now looks preferable to one that does not, at *every*
+    k, which pulls the whole ranking toward the top of
+    :data:`STATE_CANDIDATES` regardless of what the data actually supports.
+    Measured: with occupied-count preference applied here too,
+    ``build_two_regime_activity(days=45, seed=1..5)`` - a genuinely
+    two-regime home - returned 4 or 5 states on every seed, never 2 (see
+    ``tests/test_home_mode.py::test_state_count_stays_small_across_seeds``).
+    Ranking must stay on the criterion that exists for exactly this job -
+    held-out likelihood, or in-sample BIC on the fallback path - which
+    penalises a fragmented fit's extra parameters/lost held-out
+    generalisation instead of rewarding its occupied-count.
     """
+    if not prefer_max_occupied:
+        return max(candidates, key=lambda c: c.log_likelihood)
     occupied = [(_causal_occupied_count(c, x, var_floor), c) for c in candidates]
     max_occupied = max(n for n, _ in occupied)
     pool = [c for n, c in occupied if n == max_occupied]
@@ -865,24 +1056,17 @@ def _fit_best_of_restarts(
     restarts: int,
     max_iter: int,
     warm_start: _EMResult | None = None,
+    prefer_max_occupied: bool = True,
 ) -> _EMResult:
     """The best of ``restarts`` independent, seeded fits, plus (optionally) one
-    warm-started from an existing fit - preferring whichever causally
-    occupies the most of ``k`` states under *causal* decoding, ties broken by
-    likelihood (see :func:`_select_best_restart`).
-
-    EM's own fitting objective is the smoothed (forward-backward) likelihood,
-    which can legitimately prefer a restart that, decoded the way this
-    module is actually ever deployed (:func:`decode_labels`, forward-only,
-    see the module docstring's "The holdout discipline"), collapses onto a
-    single dominant state even though its *smoothed* training likelihood is
-    higher than a restart that does distinguish more states causally - a
-    sufficiently "sticky" fitted transition matrix can make one state win
-    every causal decision even when the fit meaningfully uses others with
-    the benefit of hindsight. Since production never has that hindsight, a
-    restart this model will actually be able to tell apart in practice is
-    preferred over one that merely scores higher on an objective nothing
-    here ever gets to use directly.
+    warm-started from an existing fit - "best" per :func:`_select_best_restart`,
+    whose ``prefer_max_occupied`` this simply forwards (default ``True``:
+    occupied-count first, likelihood as tiebreak - the right choice when the
+    caller has already settled on ``k`` and is only choosing which restart's
+    *model* to keep; pass ``False`` when instead comparing this ``k`` against
+    a *different* k, where occupied-count-first would reward fragmentation -
+    see that function's own docstring for why the two jobs need different
+    rules).
 
     ``warm_start``, when given, is an already-fit :class:`_EMResult` (from a
     *different*, typically smaller, slice of data - see
@@ -904,7 +1088,7 @@ def _fit_best_of_restarts(
     ]
     if warm_start is not None:
         candidates.append(_fit_em(x, k, var_floor=var_floor, max_iter=max_iter, init=warm_start))
-    return _select_best_restart(candidates, x, var_floor)
+    return _select_best_restart(candidates, x, var_floor, prefer_max_occupied)
 
 
 def _fit_candidates(
@@ -913,15 +1097,26 @@ def _fit_candidates(
     max_k_exclusive: int,
     restarts: int = RESTARTS,
     max_iter: int = MAX_EM_ITERS,
+    prefer_max_occupied: bool = True,
 ) -> dict[int, _EMResult]:
-    """Best-of-``restarts`` fit for every candidate ``k`` that fits in ``x``."""
+    """Best-of-``restarts`` fit for every candidate ``k`` that fits in ``x``.
+
+    ``prefer_max_occupied`` is forwarded to :func:`_fit_best_of_restarts` for
+    every candidate - pass ``False`` when the result is going to be used to
+    *rank* these candidate ``k`` values against each other (see
+    :func:`_select_best_restart`'s own docstring); the default ``True`` is
+    right only when each candidate's fit here is the one that will actually
+    be kept, with no separate anti-collapse refit downstream.
+    """
     fits: dict[int, _EMResult] = {}
     for k in STATE_CANDIDATES:
         if k >= max_k_exclusive:
             # Cannot have more states than data points to assign them to;
             # skip rather than fit something degenerate.
             continue
-        fits[k] = _fit_best_of_restarts(x, k, var_floor, restarts, max_iter)
+        fits[k] = _fit_best_of_restarts(
+            x, k, var_floor, restarts, max_iter, prefer_max_occupied=prefer_max_occupied
+        )
     return fits
 
 
@@ -970,8 +1165,20 @@ def select_model(
     x_fit, x_val = x[:split], x[split:]
 
     if len(x_fit) >= max(STATE_CANDIDATES) + 1 and t_len >= MIN_BINS_FOR_HELD_OUT_SELECTION:
+        # prefer_max_occupied=False: these fits are only ever used to rank
+        # candidate k values against each other on held-out likelihood below
+        # - occupied-count-first here would systematically reward a restart
+        # that fragments one true regime into several near-duplicate states
+        # at *every* k, pulling the whole ranking toward the top of
+        # STATE_CANDIDATES regardless of what the data supports (see
+        # _select_best_restart's own docstring, and
+        # tests/test_home_mode.py::test_state_count_stays_small_across_seeds,
+        # which is exactly the regression this guards). The model actually
+        # kept for chosen_k is a *separate* refit below, where
+        # occupied-count-first is the right rule.
         inner_fits = _fit_candidates(
-            x_fit, var_floor, len(x_fit), SELECTION_RESTARTS, SELECTION_MAX_ITERS
+            x_fit, var_floor, len(x_fit), SELECTION_RESTARTS, SELECTION_MAX_ITERS,
+            prefer_max_occupied=False,
         )
         if not inner_fits:
             raise ValueError("not enough bins to fit even the smallest candidate state count")
@@ -984,7 +1191,9 @@ def select_model(
         ordered = sorted(inner_fits)
         chosen_k = ordered[0]
         for k in ordered[1:]:
-            if _prefer_more_states(per_bin[chosen_k], per_bin[k]):
+            if _prefer_more_states(
+                per_bin[chosen_k], per_bin[k], inner_fits[chosen_k], inner_fits[k], var_floor
+            ):
                 chosen_k = k
         scores = {k: float(np.mean(v)) if len(v) else -np.inf for k, v in per_bin.items()}
         method = "held_out_likelihood"
@@ -1008,7 +1217,14 @@ def select_model(
             for k, f in inner_fits.items()
         }
     else:
-        final_fits = _fit_candidates(x, var_floor, t_len)
+        # Same separation as the held-out branch above, and for the same
+        # reason: these fits rank candidate k values against each other (via
+        # BIC, which is scored from each one's log_likelihood) and must not
+        # be biased by occupied-count preference, or a fragmented restart
+        # would look like a better (lower-BIC) fit than a genuine one at
+        # every k, for the same reason described in
+        # _select_best_restart's own docstring.
+        final_fits = _fit_candidates(x, var_floor, t_len, prefer_max_occupied=False)
         if not final_fits:
             raise ValueError("not enough bins to fit even the smallest candidate state count")
         per_k = {
@@ -1019,8 +1235,35 @@ def select_model(
             }
             for k, f in final_fits.items()
         }
-        chosen_k = max(per_k, key=lambda k: (per_k[k]["score"], -k))
+        # Walked the same way as the held-out branch above, for the same
+        # reason (see _larger_fit_adds_a_novel_state's own docstring): a
+        # bare argmax over BIC scores is just as fooled by a dwell-time
+        # phase split as a bare argmax over held-out likelihood would be -
+        # BIC's in-sample likelihood term rewards the same split the
+        # held-out branch does, and its parameter-count penalty has no way
+        # to know the "extra" state is a near-duplicate of one already
+        # there. Only ever move to a larger k when it both scores better
+        # and adds a state that is not just a near-duplicate of one the
+        # current best already has.
+        ordered = sorted(final_fits)
+        chosen_k = ordered[0]
+        for k in ordered[1:]:
+            if per_k[k]["score"] > per_k[chosen_k]["score"] and _larger_fit_adds_a_novel_state(
+                final_fits[chosen_k], final_fits[k], var_floor
+            ):
+                chosen_k = k
         method = "bic"
+        # As with the held-out branch: the fit actually *kept* for chosen_k
+        # gets its own refit with occupied-count-first restart selection
+        # (the default), warm-started from the ranking-only fit above - the
+        # anti-collapse guarantee this module exists to provide applies to
+        # the model that gets used, not to the fits that only ever existed
+        # to compare BIC scores against each other.
+        winner = _fit_best_of_restarts(
+            x, chosen_k, var_floor, RESTARTS, MAX_EM_ITERS, warm_start=final_fits[chosen_k]
+        )
+        per_k[chosen_k]["fit"] = winner
+        per_k[chosen_k]["log_likelihood"] = winner.log_likelihood
     return chosen_k, per_k, method
 
 
@@ -1315,11 +1558,11 @@ def _describe_states(
         min_separation = np.inf
         for i in range(model_k):
             for j in range(i + 1, model_k):
-                pooled_std = np.sqrt((em.variances[i] + em.variances[j]) / 2.0)
-                pooled_std = np.maximum(pooled_std, np.sqrt(var_floor))
-                distance = np.linalg.norm((em.means[i] - em.means[j]) / pooled_std)
+                distance = _pooled_distance(
+                    em.means[i], em.variances[i], em.means[j], em.variances[j], var_floor
+                )
                 min_separation = min(min_separation, distance)
-        weakly_separated = bool(min_separation < 1.0)
+        weakly_separated = bool(min_separation < SEPARATION_MIN_DISTANCE)
     return summaries, weakly_separated
 
 
@@ -1378,18 +1621,6 @@ def _drop_unoccupied_states(em: _EMResult, x: np.ndarray, var_floor: float) -> _
 # ----------------------------------------------------------------------
 # Mode identity across runs
 # ----------------------------------------------------------------------
-def _pooled_distance(
-    mean_a: np.ndarray, var_a: np.ndarray, mean_b: np.ndarray, var_b: np.ndarray
-) -> float:
-    """The same scale-aware distance :func:`_describe_states` uses for
-    :attr:`HomeModeModel.weakly_separated` - here comparing one state against
-    a state from a *different* fit rather than two states from the same one.
-    """
-    pooled_std = np.sqrt((var_a + var_b) / 2.0)
-    pooled_std = np.maximum(pooled_std, np.sqrt(VAR_FLOOR))
-    return float(np.linalg.norm((mean_a - mean_b) / pooled_std))
-
-
 def _align_state_order(
     previous: HomeModeModel | None, means: np.ndarray, variances: np.ndarray
 ) -> tuple[int, ...] | None:

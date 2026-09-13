@@ -199,22 +199,40 @@ def test_em_does_not_silently_collapse_to_one_effective_state():
 
 
 def test_selection_survives_an_unlucky_restart_draw(options):
-    """The exact case a review of this module reproduced: selection finds
-    clear held-out evidence for several states, but the full-quality refit's
-    own restarts can, by bad luck, causally distinguish fewer of them - and
-    the old rule for picking among restarts ("exactly k or fall back to raw
-    smoothed likelihood") could then report a single undifferentiated mode
-    even though selection's own evidence said otherwise.
+    """The exact case a review of this module reproduced: selection found
+    (what looked like) clear held-out evidence for several states, but the
+    full-quality refit's own restarts could, by bad luck, causally
+    distinguish fewer of them - and the old rule for picking among restarts
+    ("exactly k or fall back to raw smoothed likelihood") could then report
+    a single undifferentiated mode even though selection's own evidence said
+    otherwise.
 
-    ``build_two_regime_activity(days=365, seed=7)``: ``select_model`` scores
-    k=4 far above k=2/3 (12.7 vs 8.0 - not a hairline), but the old
-    exact-k-or-bust rule's three restarts on the full-quality refit causally
-    occupied only ``{1, 2, 2}`` states - none hit 4 - so it fell back to
-    whichever of those three had the best *smoothed* training likelihood,
-    which happened to be the one occupying only 1. That is not a fit that
-    happens to disagree with selection by one or two states; it is the
-    complete opposite conclusion (one mode, not several) from evidence that
-    was never in question. See ``_select_best_restart``'s own docstring.
+    ``build_two_regime_activity(days=365, seed=7)`` was the original
+    reproduction: with only :data:`hm.SELECTION_RESTARTS` ``== 2`` (since
+    raised - see that constant's own comment), ``select_model`` scored k=4
+    far above k=2/3, but the old exact-k-or-bust rule's three restarts on
+    the full-quality refit causally occupied only ``{1, 2, 2}`` states -
+    none hit 4 - so it fell back to whichever of those three had the best
+    *smoothed* training likelihood, which happened to be the one occupying
+    only 1. That was not a fit that happened to disagree with selection by
+    one or two states; it was the complete opposite conclusion (one mode,
+    not several) from evidence that was never in question - see
+    ``_select_best_restart``'s own docstring, which is the fix this
+    specific case motivated and still tests.
+
+    What this case's *own* evidence actually supports has since changed:
+    that "k=4 far above k=2/3" reading was itself an artifact of the same
+    family of bug, one level up - ``k=2``'s ranking-stage fit was, at only 2
+    cheap restarts, *itself* landing on a degenerate (1-effective-state) fit,
+    making every larger k look dramatically better by comparison to a
+    baseline that never represented the data it already had (see
+    :func:`hm._larger_fit_adds_a_novel_state`'s own docstring, and
+    :data:`hm.SELECTION_RESTARTS`'s comment on why it was raised). Refit
+    fairly, this fixture's true, defensible count is 2 - so this test
+    asserts what actually matters and is still true either way: whatever
+    the fair count turns out to be, it is never reported as a single
+    undifferentiated mode when the data underneath it is genuinely built
+    from (at least) two regimes.
     """
     fixture = build_two_regime_activity(days=365, seed=7)
     model = hm.fit(fixture.changes, SignalSet(), options, fixture.window)
@@ -241,6 +259,55 @@ def test_two_regime_structure_is_never_collapsed_to_one_state():
     assert not collapsed, (
         f"a two-regime household collapsed to a single mode for: {collapsed}"
     )
+
+
+def test_state_count_stays_small_across_seeds():
+    """The flip side of the two tests above, and the one the honesty-contract
+    assertion in test_state_count_stays_small_for_a_quiet_home cannot catch
+    on its own: ``weakly_separated=True whenever count > 2`` is satisfied by
+    *every* over-segmented fit, so it would keep passing even if selection
+    regressed to "always pick the top of STATE_CANDIDATES" - which is
+    exactly what happened when occupied-count-first restart selection (the
+    fix for the collapse bug above) was also applied inside the per-candidate
+    *ranking* stage: a restart that fragments one true regime into several
+    near-duplicate states always looked preferable there too, systematically
+    pulling every seed to 4 or 5 states, never 2 (see
+    ``_select_best_restart``'s own docstring for the mechanism, and
+    ``_larger_fit_adds_a_novel_state`` for the fix - a larger k must add a
+    state that is not just a near-duplicate of one the smaller model
+    already had, not merely score significantly better).
+
+    This bounds the *outcome* directly rather than trusting any single
+    internal mechanism: a genuinely two-regime household's reported count
+    must stay well clear of :data:`hm.STATE_CANDIDATES`'s top end, across a
+    spread of seeds and both the 45- and 365-day windows this module's other
+    fixtures already use.
+    """
+    ceiling = max(hm.STATE_CANDIDATES) - 1  # "well below max k", not merely "not max k"
+    counts: list[int] = []
+    for seed in range(1, 11):
+        fixture = build_two_regime_activity(days=45, seed=seed)
+        model = hm.fit(fixture.changes, SignalSet(), Options(), fixture.window)
+        assert model.fitted
+        counts.append(model.n_states)
+        assert model.n_states <= ceiling, (
+            f"45-day seed {seed}: expected at most {ceiling} states for a simple "
+            f"two-regime home, got {model.n_states} (scores: {model.score_by_states})"
+        )
+    mean_count = sum(counts) / len(counts)
+    assert mean_count <= 3.5, (
+        f"mean state count across seeds drifted toward the top of the candidate "
+        f"range: {counts} (mean {mean_count:.2f})"
+    )
+
+    for seed in range(8):
+        fixture = build_two_regime_activity(days=365, seed=seed)
+        model = hm.fit(fixture.changes, SignalSet(), Options(), fixture.window)
+        assert model.fitted
+        assert model.n_states <= ceiling, (
+            f"365-day seed {seed}: expected at most {ceiling} states for a simple "
+            f"two-regime home, got {model.n_states} (scores: {model.score_by_states})"
+        )
 
 
 # --- determinism -----------------------------------------------------------
