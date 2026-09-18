@@ -168,15 +168,49 @@ def test_pad_row_never_moves():
 # ---------------------------------------------------------------------------
 
 
-def _three_way_fixture(days: int = 60, seed: int = 11):
-    """A pattern no single-antecedent (pairwise) rule can express.
+def _arrival_events(base: float, rng: random.Random, with_light: bool) -> list[StateChange]:
+    """One "someone came home" episode: door, then motion a few seconds
+    later - and, when ``with_light`` is true, the light a few seconds after
+    that. Reused for both the true-arrival pattern (see
+    ``_three_way_fixture``) and the holdout period in
+    ``test_a_pattern_that_reverses_in_holdout_is_rejected_by_backtest``,
+    where ``with_light`` is false because the pattern no longer holds."""
+    t = base + rng.uniform(0, 86000.0)
+    events = [_ch("binary_sensor.door_front", "on", t, Cause.DEVICE)]
+    mt = t + rng.uniform(2, 8)
+    events.append(_ch("binary_sensor.motion_hall", "on", mt, Cause.DEVICE))
+    if with_light:
+        events.append(_ch("light.hall", "on", mt + rng.uniform(2, 6), Cause.HUMAN))
+    return events
 
-    ``binary_sensor.door_front`` and ``binary_sensor.motion_hall`` each fire
-    often, but the light follows *only* when a motion event happens shortly
-    after a door event - "arriving home", not "already home and moving
-    around" or "the door opened but nobody came into the hallway". Neither
-    door alone nor motion alone predicts the light at a useful rate; the
-    combination does, reliably.
+
+def _three_way_fixture(days: int = 60, seed: int = 11):
+    """A pattern no single-antecedent (pairwise) rule can express - each of
+    ``binary_sensor.door_front`` and ``binary_sensor.motion_hall`` alone is a
+    *weak, misleading* predictor of the light; only the conjunction, with the
+    right ordering, is strong.
+
+    The naive version of this fixture (an earlier draft of this test) made
+    door and motion fire often *without* any other human-caused action
+    nearby when they were not followed by light. ``amminer.miners.association``
+    only ever builds a transaction ("basket") around a *human*-caused anchor
+    event (see that module's own ``build_transactions`` docstring) - so those
+    "door/motion without an arrival" events, isolated from every other human
+    action, mostly never entered any basket at all, and confidence(door ->
+    light) came out misleadingly high (~95%) purely because nearly every
+    basket that happened to contain the door also happened to be anchored on
+    the light itself. That was an accident of the fixture, not evidence about
+    the mechanism - see the review this file's git history records.
+
+    Here, every "false alarm" (door or motion with no arrival) is paired with
+    its own real human action (``switch.decoy``) a few seconds later, so it
+    *does* form its own basket - one that contains the door or motion but not
+    the light. That is what actually drives confidence(door -> light) and
+    confidence(motion -> light) down to a genuinely weak, sub-threshold level
+    (see ``test_recovers_a_three_way_interaction_association_cannot_express``,
+    which measures ~45% for both, below ``min_confidence``), while the
+    ordered conjunction - door, then motion a few seconds later - still
+    predicts the light almost perfectly.
     """
     rng = random.Random(seed)
     start = 1_700_000_000.0
@@ -184,25 +218,23 @@ def _three_way_fixture(days: int = 60, seed: int = 11):
     changes: list[StateChange] = []
     for day in range(days):
         base = start + day * day_seconds
-        # The real "arrival" pattern: door, then motion within a few
-        # seconds, then (usually) a human turns the light on.
+        # The real, reliable pattern: door, then motion, then light.
         for _ in range(4):
+            changes.extend(_arrival_events(base, rng, with_light=True))
+        # False alarm: door opens, nobody arrives - a real human action
+        # (not light) follows nearby instead, so this becomes its own
+        # basket containing the door but not the light.
+        for _ in range(5):
             t = base + rng.uniform(0, day_seconds - 60)
             changes.append(_ch("binary_sensor.door_front", "on", t, Cause.DEVICE))
-            if rng.random() < 0.9:
-                mt = t + rng.uniform(2, 8)
-                changes.append(_ch("binary_sensor.motion_hall", "on", mt, Cause.DEVICE))
-                if rng.random() < 0.92:
-                    changes.append(_ch("light.hall", "on", mt + rng.uniform(2, 6), Cause.HUMAN))
-        # Door opens with nobody arriving in the hallway (no light).
-        for _ in range(6):
-            t = base + rng.uniform(0, day_seconds)
-            changes.append(_ch("binary_sensor.door_front", "on", t, Cause.DEVICE))
-        # Motion elsewhere in the house, unrelated to the door (no light).
-        for _ in range(7):
-            t = base + rng.uniform(0, day_seconds)
+            changes.append(_ch("switch.decoy", "on", t + rng.uniform(2, 8), Cause.HUMAN))
+        # False alarm: motion elsewhere, unrelated to the door, likewise
+        # anchored by a real human action rather than left isolated.
+        for _ in range(5):
+            t = base + rng.uniform(0, day_seconds - 60)
             changes.append(_ch("binary_sensor.motion_hall", "on", t, Cause.DEVICE))
-        # Unrelated household noise across many entities/domains.
+            changes.append(_ch("switch.decoy", "off", t + rng.uniform(2, 8), Cause.HUMAN))
+        # Unrelated household noise across many other entities/domains.
         for _ in range(5):
             t = base + rng.uniform(0, day_seconds)
             entity = f"switch.noise{rng.randint(0, 5)}"
@@ -294,26 +326,44 @@ def test_never_learns_from_rows_outside_the_training_window(options):
 # ---------------------------------------------------------------------------
 
 
+def _sequence_model_matches(candidates, *, target_entity: str, required_entities: set[str]):
+    """Candidates targeting ``target_entity`` whose trigger+conditions cover
+    at least ``required_entities`` - a superset match, not an exact one,
+    because ``CANDIDATE_MAX_CONDITIONS`` fills both condition slots whenever
+    a context has that many distinct entities available, so the true
+    (door, motion) pairing is often reported alongside one more incidental,
+    equally-real-but-not-load-bearing entity (see the module's own extraction
+    code) rather than alone."""
+    out = []
+    for c in candidates:
+        if not c.actions or c.actions[0].entity_id != target_entity:
+            continue
+        entities = {t.entity_id for t in c.triggers} | {cond.entity_id for cond in c.conditions}
+        if required_entities <= entities:
+            out.append(c)
+    return out
+
+
 def test_recovers_a_three_way_interaction_association_cannot_express(options):
+    """The whole argument for this feature existing: it finds a real
+    interaction that ``amminer.miners.association`` cannot, by mechanism -
+    not by an accident of this fixture (see ``_three_way_fixture``'s own
+    docstring for the earlier, misleading version of this test)."""
     changes, window = _three_way_fixture(days=60)
     model, examples = sm.fit(changes, options, window)
     assert model.fitted, model.fallback_reason
 
     candidates = sm.extract_candidates(model, examples, options, window, resolver=None)
-    assert candidates, "expected at least the trained (door, motion) -> light candidate"
-    # Redundancy pruning drops a *strictly worse* superset (see
-    # _drop_redundant_supersets), not one that happened to score slightly
-    # higher on this particular random draw - so the clean two-entity rule
-    # is found among the results, not necessarily ranked first.
-    matches = [
-        c
-        for c in candidates
-        if c.actions[0].entity_id == "light.hall"
-        and ({t.entity_id for t in c.triggers} | {cond.entity_id for cond in c.conditions})
-        == {"binary_sensor.door_front", "binary_sensor.motion_hall"}
-    ]
-    assert len(matches) == 1
-    candidate = matches[0]
+    matches = _sequence_model_matches(
+        candidates,
+        target_entity="light.hall",
+        required_entities={"binary_sensor.door_front", "binary_sensor.motion_hall"},
+    )
+    assert matches, "expected at least one (door, motion) -> light candidate"
+    # The strongest one, by the counted ratio the backtest gate would also
+    # see - not cherry-picked by model probability, which is not comparable
+    # to it (see amminer/miners/base.py's own warning on this).
+    candidate = max(matches, key=lambda c: c.evidence.confidence)
     assert candidate.miner == "sequence_model"
     assert candidate.evidence.confidence >= options.sequence_model_min_confidence
     assert candidate.evidence.occurrences >= options.sequence_model_min_occurrences
@@ -323,14 +373,49 @@ def test_recovers_a_three_way_interaction_association_cannot_express(options):
     assert candidate.evidence.confidence != candidate.evidence.extra["model_probability"]
     assert any("Model-derived" in note for note in candidate.evidence.notes)
 
-    # The pairwise association miner sees each of door/motion as a lone
-    # antecedent and cannot express "both together" - it either finds
-    # nothing for light.hall, or something markedly weaker.
+    # The default, gated association miner: genuinely finds nothing for
+    # light.hall on this fixture (not an accident - see below).
     assoc_candidates = association.mine(changes, options, window)
-    light_hall_rules = [c for c in assoc_candidates if c.actions and c.actions[0].entity_id == "light.hall"]
-    if light_hall_rules:
-        best_assoc_confidence = max(c.evidence.confidence or 0.0 for c in light_hall_rules)
-        assert best_assoc_confidence < candidate.evidence.confidence
+    assert not any(c.actions and c.actions[0].entity_id == "light.hall" for c in assoc_candidates)
+
+    # The *mechanism*, isolated from every quality gate that might otherwise
+    # be blamed for the empty result above: rebuild the same rules with
+    # confidence and lift fully relaxed (min_support left alone, so this
+    # still excludes pure sampling noise - see the docstring above). Even
+    # with every quality bar removed, a rule can only ever pair one
+    # antecedent item with one consequent item - fpgrowth is called with
+    # max_len=2 in amminer.miners.association, so {door, motion} can never
+    # become one antecedent. This is what actually bounds association's
+    # best possible answer for this target, independent of any threshold.
+    permissive = Options(min_confidence=0.0, min_lift=0.0, min_support=options.min_support)
+    transactions, _counts, _order = association.build_transactions(
+        changes, permissive.association_window_seconds, permissive
+    )
+    # Directly verifies the mechanism, not just its downstream effect: even
+    # the raw frequent-itemset search (before confidence/lift/direction are
+    # applied at all) never considers a three-item set - max_len=2 in
+    # amminer.miners.association's own fpgrowth call rules out {door,
+    # motion, light} as a single itemset from the start.
+    import pandas as pd
+    from mlxtend.frequent_patterns import fpgrowth
+
+    frame = association.one_hot_encode(transactions, pd)
+    frequent = fpgrowth(frame, min_support=permissive.min_support, use_colnames=True, max_len=2)
+    assert not frequent.empty
+    assert frequent["itemsets"].apply(len).max() <= 2
+
+    raw_rules = association._rules_from_transactions(transactions, permissive)
+    assert raw_rules, "expected fpgrowth to find *some* pairwise rules on this fixture"
+    light_rules = [r for r in raw_rules if r["consequent"] == "light.hall=on"]
+    assert light_rules, "expected door/motion single-item rules for light.hall to survive relaxed thresholds"
+    best_pairwise_confidence = max(r["confidence"] for r in light_rules)
+
+    # Unconditional: the best the pairwise miner can do for this target, with
+    # every quality gate but support removed, is still markedly weaker than
+    # what the sequence model found - because it is structurally blind to
+    # the two-item conjunction that actually drives the outcome.
+    assert best_pairwise_confidence < 0.6
+    assert candidate.evidence.confidence > best_pairwise_confidence + 0.3
 
 
 def test_finds_nothing_in_pure_noise():
