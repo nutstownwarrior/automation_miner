@@ -37,6 +37,21 @@ from amminer.testing.synthetic import build_two_regime_activity, build_winddown_
 
 os.environ.setdefault("TZ", "UTC")
 
+#: The multi-seed EM sweeps below are genuine evidence (see each test's own
+#: docstring) but each one fits several full, production-shaped models - the
+#: same "needs its own CI job, not the default matrix" tradeoff
+#: test_recorder_queries.py's MariaDB dialect test already makes for a
+#: different kind of expensive-but-worth-running test. Gated the same way:
+#: a marker for `-m` selection (see the `test-model-sweeps` CI job) plus a
+#: skip unless the env var is set, so a plain `pytest` locally or in the
+#: default three-version matrix does not pay for it either.
+RUN_SLOW_MODEL_TESTS = os.environ.get("AMMINER_RUN_SLOW_MODEL_TESTS")
+_slow_model = pytest.mark.skipif(
+    not RUN_SLOW_MODEL_TESTS,
+    reason="set AMMINER_RUN_SLOW_MODEL_TESTS=1 to run the multi-seed home-mode EM sweeps "
+    "(see the dedicated test-model-sweeps CI job)",
+)
+
 
 @pytest.fixture
 def options() -> Options:
@@ -130,20 +145,24 @@ def test_recovered_states_are_honestly_described(options):
 
 # --- shared fixture fits for the state-count sweeps below -----------------
 #
-# The four tests below all exercise `build_two_regime_activity` across a
-# spread of seeds, and several of them exercise the *same* (days, seed)
-# pairs to check different properties of the same fit (never collapses to
-# one state; never inflates past a few states; is not weakly-separated when
-# it does report more than two). Fitting is deterministic given the same
-# input (see test_fit_is_deterministic_within_a_process) - so re-fitting the
-# same synthetic history from scratch in each test bought nothing but CPU:
-# a full production-shaped fit costs several seconds each, and the naive
-# version of these four tests performed 32 of them where only 18 distinct
-# (days, seed) pairs are ever actually needed. This cache makes that sharing
-# explicit rather than accidental duplication, without weakening any single
-# test's assertions or reducing which seeds are checked - every seed and
-# every property below is still exercised exactly as before, just against a
-# fit computed once instead of up to three times.
+# The tests below all exercise `build_two_regime_activity` across a spread
+# of seeds (or, for the cheap always-on "_smoke" tests, a single seed drawn
+# from that same spread), and several of them exercise the *same* (days,
+# seed) pairs to check different properties of the same fit (never
+# collapses to one state; never inflates past a few states; is not
+# weakly-separated when it does report more than two). Fitting is
+# deterministic given the same input (see
+# test_fit_is_deterministic_within_a_process) - so re-fitting the same
+# synthetic history from scratch in each test bought nothing but CPU: a full
+# production-shaped fit costs several seconds each, and the naive version of
+# the full sweeps performed 32 of them where only 18 distinct (days, seed)
+# pairs are ever actually needed - and a smoke test sharing a seed with the
+# sweep it stands in for (see each one's own docstring) costs nothing extra
+# at all whenever both happen to run in the same process. This cache makes
+# that sharing explicit rather than accidental duplication, without
+# weakening any assertion or reducing which seeds the sweeps check - every
+# seed and every property is still exercised exactly as before, just
+# against a fit computed once instead of several times.
 _TWO_REGIME_FIT_CACHE: dict[tuple[int, int], hm.HomeModeModel] = {}
 
 
@@ -158,6 +177,8 @@ def _fit_two_regime(days: int, seed: int) -> hm.HomeModeModel:
 
 
 # --- state-count selection ------------------------------------------------
+@pytest.mark.slow_model
+@_slow_model
 def test_state_count_stays_small_for_a_quiet_home():
     """A simple two-regime home must never be *confidently* reported as
     having five separate modes - it may honestly find more than the two true
@@ -189,6 +210,27 @@ def test_state_count_stays_small_for_a_quiet_home():
                 "two-regime home without flagging them as weakly separated "
                 f"(scores: {model.score_by_states})"
             )
+
+
+def test_state_count_stays_small_for_a_quiet_home_smoke():
+    """Cheap, always-on stand-in for test_state_count_stays_small_for_a_quiet_home
+    (``@pytest.mark.slow_model`` - see the dedicated ``test-model-sweeps`` CI job for
+    the full 5-seed sweep this proves across). One seed cannot prove the property
+    holds in general, but it does catch a gross regression - e.g. selection
+    regressing to "always pick the top of STATE_CANDIDATES" - in every default
+    matrix run, not just whenever the sweep job happens to run. Seed 1 is chosen
+    deliberately: at this seed the home *does* report more than two states (see
+    the sweep above), so this is also the smoke coverage for the
+    :attr:`HomeModeModel.weakly_separated` honesty flag, not just the ceiling.
+    """
+    model = _fit_two_regime(days=45, seed=1)
+    assert model.fitted
+    assert model.n_states <= max(hm.STATE_CANDIDATES)
+    if model.n_states > 2:
+        assert model.weakly_separated, (
+            f"reported {model.n_states} states for a genuinely two-regime home "
+            f"without flagging them as weakly separated (scores: {model.score_by_states})"
+        )
 
 
 def test_a_third_real_regime_is_still_found(options):
@@ -270,6 +312,8 @@ def test_selection_survives_an_unlucky_restart_draw():
     )
 
 
+@pytest.mark.slow_model
+@_slow_model
 def test_two_regime_structure_is_never_collapsed_to_one_state():
     """Across a spread of seeds, a household built from two genuinely
     different regimes must never be reported as a single undifferentiated
@@ -287,6 +331,29 @@ def test_two_regime_structure_is_never_collapsed_to_one_state():
     )
 
 
+def test_two_regime_structure_is_never_collapsed_smoke():
+    """Cheap, always-on stand-in for both test_two_regime_structure_is_never_collapsed_to_one_state
+    and the 365-day half of test_state_count_stays_small_across_seeds (both
+    ``@pytest.mark.slow_model`` - see the dedicated ``test-model-sweeps`` CI job for the
+    full sweeps this proves across). One seed cannot prove either property holds in
+    general, but it does catch a gross regression - collapse *or* inflation - in every
+    default matrix run.
+    """
+    ceiling = max(hm.STATE_CANDIDATES) - 1
+    model = _fit_two_regime(days=365, seed=0)
+    assert model.fitted
+    assert model.n_states >= 2, (
+        "a two-regime household collapsed to a single mode "
+        f"(scores: {model.score_by_states})"
+    )
+    assert model.n_states <= ceiling, (
+        f"expected at most {ceiling} states for a simple two-regime home, got "
+        f"{model.n_states} (scores: {model.score_by_states})"
+    )
+
+
+@pytest.mark.slow_model
+@_slow_model
 def test_state_count_stays_small_across_seeds():
     """The flip side of the two tests above, and the one the honesty-contract
     assertion in test_state_count_stays_small_for_a_quiet_home cannot catch
