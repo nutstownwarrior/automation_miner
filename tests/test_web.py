@@ -31,6 +31,20 @@ def test_every_page_renders(wired):
         assert "Automation Miner" in response.text
 
 
+def test_status_page_explains_the_off_default_after_a_real_run(wired):
+    """report.sequence_model is populated (fitted: False, a fallback_reason
+    of "disabled...") even when the feature is off, exactly like every other
+    optional feature's report entry - the template must still show the
+    friendlier, actionable explanation for the off state, not the terse
+    per-run fallback reason that entry carries (see the fix for the dead
+    branch this pins down)."""
+    client, _store, _runner, _ha = wired
+    body = client.get("/status").text
+    section = body[body.index("Learned sequence model"):]
+    assert "Off by default" in section
+    assert "Did not run this time" not in section
+
+
 def test_automations_page_is_empty_before_anything_is_applied(wired):
     client, _store, _runner, _ha = wired
     response = client.get("/automations")

@@ -219,22 +219,22 @@
     history - every candidate it produces goes through the same backtest and
     conflict checks as any other miner's.
   </p>
-  {% if report and report.sequence_model and report.sequence_model.fitted %}
-  <dl class="metrics wide">
-    <div><dt>Trained on</dt><dd>{{ report.sequence_model.n_examples }} examples, {{ report.sequence_model.n_vocab }} distinct items</dd></div>
-    <div><dt>Training took</dt><dd>{{ report.sequence_model.training_seconds }}s ({{ report.sequence_model.steps_run }} steps)</dd></div>
-    <div><dt>Training accuracy</dt><dd>{{ (report.sequence_model.train_accuracy * 100) | round(1) }}%</dd></div>
-  </dl>
-  {% elif report and report.sequence_model and not report.sequence_model.fitted %}
-  <p class="muted">Did not run this time: {{ report.sequence_model.fallback_reason }}</p>
-  {% elif options.sequence_model_enabled %}
-  <p class="muted">Not yet trained - it runs during the next analysis.</p>
-  {% else %}
+  {% if not options.sequence_model_enabled %}
   <p class="muted">
     Off by default. Turn on <code>sequence_model_enabled</code> to try it -
     it declines on its own, with a specific reason, on a host that cannot
     afford it.
   </p>
+  {% elif report and report.sequence_model and report.sequence_model.fitted %}
+  <dl class="metrics wide">
+    <div><dt>Trained on</dt><dd>{{ report.sequence_model.n_examples }} examples, {{ report.sequence_model.n_vocab }} distinct items</dd></div>
+    <div><dt>Training took</dt><dd>{{ report.sequence_model.training_seconds }}s ({{ report.sequence_model.steps_run }} steps)</dd></div>
+    <div><dt>Training accuracy</dt><dd>{{ (report.sequence_model.train_accuracy * 100) | round(1) }}%</dd></div>
+  </dl>
+  {% elif report and report.sequence_model %}
+  <p class="muted">Did not run this time: {{ report.sequence_model.fallback_reason }}</p>
+  {% else %}
+  <p class="muted">Not yet trained - it runs during the next analysis.</p>
   {% endif %}
 </section>
 

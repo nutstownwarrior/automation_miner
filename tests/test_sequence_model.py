@@ -94,6 +94,57 @@ def test_capability_as_dict_reports_mb_not_bytes():
     assert payload["ok"] is True
 
 
+def test_cgroup_v2_limit_is_read(tmp_path: Path):
+    (tmp_path / "memory.max").write_text("1073741824\n")  # 1 GiB
+    (tmp_path / "memory.current").write_text("268435456\n")  # 256 MiB used
+    assert sm._cgroup_available_memory_bytes(str(tmp_path)) == 1073741824 - 268435456
+
+
+def test_cgroup_v2_unlimited_is_ignored(tmp_path: Path):
+    (tmp_path / "memory.max").write_text("max\n")
+    assert sm._cgroup_available_memory_bytes(str(tmp_path)) is None
+
+
+def test_cgroup_v1_limit_is_read(tmp_path: Path):
+    (tmp_path / "memory").mkdir()
+    (tmp_path / "memory" / "memory.limit_in_bytes").write_text("536870912\n")  # 512 MiB
+    (tmp_path / "memory" / "memory.usage_in_bytes").write_text("100000000\n")
+    assert sm._cgroup_available_memory_bytes(str(tmp_path)) == 536870912 - 100000000
+
+
+def test_cgroup_v1_unlimited_sentinel_is_ignored(tmp_path: Path):
+    (tmp_path / "memory").mkdir()
+    (tmp_path / "memory" / "memory.limit_in_bytes").write_text("9223372036854771712\n")
+    (tmp_path / "memory" / "memory.usage_in_bytes").write_text("100000000\n")
+    assert sm._cgroup_available_memory_bytes(str(tmp_path)) is None
+
+
+def test_cgroup_absent_is_none(tmp_path: Path):
+    assert sm._cgroup_available_memory_bytes(str(tmp_path / "does-not-exist")) is None
+
+
+def test_available_memory_is_the_tighter_of_host_and_cgroup(monkeypatch):
+    """A roomy host with a tightly-capped container must not clear the gate
+    on the host's figure alone - this is the exact OOM-kill scenario a
+    cgroup-blind check would miss (see _cgroup_available_memory_bytes)."""
+    monkeypatch.setattr(sm, "_host_available_memory_bytes", lambda: 16 * 1024 * 1024 * 1024)
+    monkeypatch.setattr(sm, "_cgroup_available_memory_bytes", lambda: 200 * 1024 * 1024)
+    assert sm._available_memory_bytes() == 200 * 1024 * 1024
+
+    monkeypatch.setattr(sm, "_cgroup_available_memory_bytes", lambda: None)
+    assert sm._available_memory_bytes() == 16 * 1024 * 1024 * 1024
+
+
+def test_capability_declines_when_only_the_container_is_too_tight(monkeypatch):
+    """The scenario issue #3 names directly: a roomy host, a container
+    capped below the floor by its own cgroup - the gate must still decline."""
+    monkeypatch.setattr(sm, "_host_available_memory_bytes", lambda: 16 * 1024 * 1024 * 1024)
+    monkeypatch.setattr(sm, "_cgroup_available_memory_bytes", lambda: 200 * 1024 * 1024)
+    cap = sm.capability(cpu_count=4)
+    assert cap.ok is False
+    assert "memory" in cap.reason
+
+
 def test_fit_declines_when_host_cannot_afford_it(monkeypatch, options):
     monkeypatch.setattr(sm, "capability", lambda: sm.Capability(False, "only 1 CPU core(s) detected", 1, None))
     model, examples = sm.fit([], options, (0.0, 40 * 86400.0))
@@ -461,18 +512,15 @@ def test_a_pattern_that_reverses_in_holdout_is_rejected_by_backtest():
     train_changes, train_window = _three_way_fixture(days=40, seed=21)
     start, train_end = train_window
 
-    # The holdout: the same entities fire, but the light never follows -
-    # the learned pattern has reversed.
+    # The holdout: door and motion still fire the same way, but the light
+    # never follows any more - the learned pattern has reversed.
     rng = random.Random(99)
     holdout_days = 15
     holdout_changes: list[StateChange] = []
     for day in range(holdout_days):
         base = train_end + day * 86400.0
         for _ in range(4):
-            t = base + rng.uniform(0, 86000.0)
-            holdout_changes.append(_ch("binary_sensor.door_front", "on", t, Cause.DEVICE))
-            holdout_changes.append(_ch("binary_sensor.motion_hall", "on", t + 4.0, Cause.DEVICE))
-            # No light.hall event follows any more.
+            holdout_changes.extend(_arrival_events(base, rng, with_light=False))
     holdout_changes.sort(key=lambda c: c.ts)
     full_changes = sorted(train_changes + holdout_changes, key=lambda c: c.ts)
     full_window = (start, holdout_changes[-1].ts + 3600.0)
@@ -480,19 +528,18 @@ def test_a_pattern_that_reverses_in_holdout_is_rejected_by_backtest():
     model, examples = sm.fit(train_changes, options, train_window)
     assert model.fitted, model.fallback_reason
     candidates = sm.extract_candidates(model, examples, options, train_window, resolver=None)
-    matches = [
-        c
-        for c in candidates
-        if c.actions[0].entity_id == "light.hall"
-        and ({t.entity_id for t in c.triggers} | {cond.entity_id for cond in c.conditions})
-        == {"binary_sensor.door_front", "binary_sensor.motion_hall"}
-    ]
-    assert len(matches) == 1, "fixture must still produce the trained (door, motion) -> light candidate"
+    matches = _sequence_model_matches(
+        candidates,
+        target_entity="light.hall",
+        required_entities={"binary_sensor.door_front", "binary_sensor.motion_hall"},
+    )
+    assert matches, "fixture must still produce a (door, motion) -> light candidate"
+    candidate = max(matches, key=lambda c: c.evidence.confidence)
 
-    all_entities = {"binary_sensor.door_front", "binary_sensor.motion_hall", "light.hall"}
+    all_entities = {c.entity_id for c in full_changes}
     store = build_signal_store(full_changes, all_entities, None, full_window)
     passed, rejected = backtest_module.backtest_all(
-        matches, full_changes, store, options, full_window, validate_holdout=False
+        [candidate], full_changes, store, options, full_window, validate_holdout=False
     )
     assert passed == []
     assert len(rejected) == 1

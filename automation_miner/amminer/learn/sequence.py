@@ -111,14 +111,17 @@ Hardware gating
 -----------------
 
 This is the one non-LLM miner in the project that is off by default
-(``sequence_model_enabled``) and gated behind an explicit capability check
-(:func:`capability`) that runs on every attempt, whether or not the feature
-is enabled, and declines with a specific, honest reason rather than
-attempting a fit it cannot afford - see that function's own docstring for
-what it measures and why. Training and extraction never run when the gate
-fails; nothing here silently reduces its own cost when memory is tight, it
-simply does not run, the same "attempt it properly or say plainly why not"
-posture ``amminer.miners.motif`` already takes with ``stumpy``.
+(``sequence_model_enabled``). ``amminer.pipeline`` gates the call to
+:func:`fit` on that flag - spending nothing at all when the feature is off,
+which is the right behaviour, not a shortcut - and every attempt it does
+make is behind an explicit capability check (:func:`capability`), run first
+and unconditionally inside :func:`fit`, which declines with a specific,
+honest reason rather than attempting a fit it cannot afford - see that
+function's own docstring for what it measures and why. Training and
+extraction never run when the gate fails; nothing here silently reduces its
+own cost when memory is tight, it simply does not run, the same "attempt it
+properly or say plainly why not" posture ``amminer.miners.motif`` already
+takes with ``stumpy``.
 
 No persistence
 ----------------
@@ -145,6 +148,7 @@ import os
 import time as time_module
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -175,17 +179,64 @@ MIN_CPU_COUNT = 2
 MIN_AVAILABLE_MEMORY_BYTES = 512 * 1024 * 1024
 
 
-def _available_memory_bytes() -> int | None:
-    """Best-effort available memory, or ``None`` when it cannot be read.
+#: A parsed cgroup memory limit at or above this is treated as "no real
+#: limit" (cgroup v1 reports an unlimited memory.limit_in_bytes as a huge
+#: sentinel, typically ~9.2 EiB - close to LONG_MAX rounded to a page
+#: boundary; cgroup v2 spells it "max" instead, handled separately). No real
+#: container limit looks anything like this - 1 PiB is a generous margin
+#: above it.
+_CGROUP_UNLIMITED_SANITY_BOUND = 1 << 50
+
+
+def _cgroup_available_memory_bytes(root: str = "/sys/fs/cgroup") -> int | None:
+    """Available memory *inside this container's cgroup*, when one applies.
+
+    This add-on always runs as a Home Assistant OS/Supervisor container, so
+    a host-level figure alone describes the machine, not what this process
+    may actually use - a host with 16 GB free says nothing about a container
+    capped at 512 MB by its own cgroup. Reading only ``/proc/meminfo`` would
+    let exactly that container clear the gate and then get OOM-killed, the
+    scenario this gate exists to prevent. Handles cgroup v2
+    (``memory.max``/``memory.current``), cgroup v1
+    (``memory.limit_in_bytes``/``memory.usage_in_bytes``), and no cgroup
+    limit at all - ``None``, meaning nothing to report here, not a failure;
+    :func:`_available_memory_bytes` falls back to the host figure.
+    """
+    v2_max = Path(root) / "memory.max"
+    v2_current = Path(root) / "memory.current"
+    try:
+        raw = v2_max.read_text(encoding="ascii").strip()
+        if raw != "max":
+            limit = int(raw)
+            if 0 < limit < _CGROUP_UNLIMITED_SANITY_BOUND:
+                usage = int(v2_current.read_text(encoding="ascii").strip())
+                return max(limit - usage, 0)
+    except (OSError, ValueError):
+        pass
+
+    v1_limit = Path(root) / "memory" / "memory.limit_in_bytes"
+    v1_usage = Path(root) / "memory" / "memory.usage_in_bytes"
+    try:
+        limit = int(v1_limit.read_text(encoding="ascii").strip())
+        if 0 < limit < _CGROUP_UNLIMITED_SANITY_BOUND:
+            usage = int(v1_usage.read_text(encoding="ascii").strip())
+            return max(limit - usage, 0)
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _host_available_memory_bytes() -> int | None:
+    """Best-effort available memory *on the host*, or ``None`` when it
+    cannot be read.
 
     ``/proc/meminfo``'s ``MemAvailable`` (Linux - what every add-on actually
     runs on, in a container) is preferred because it already accounts for
     reclaimable cache, which is what "can I actually allocate this much"
     means; ``os.sysconf`` is a portable fallback for local development off
-    Linux. ``None`` - not zero, not a guess - is returned when neither
-    works, and :func:`capability` treats that as "cannot check", not "not
-    enough": a host this cannot be measured on is not silently blocked, only
-    honestly noted as unmeasured (the CPU-count check still applies).
+    Linux. This is the machine's own headroom, not this process's - see
+    :func:`_cgroup_available_memory_bytes` for the container's own limit,
+    which :func:`_available_memory_bytes` combines with this.
     """
     try:
         with open("/proc/meminfo", encoding="ascii") as handle:
@@ -203,6 +254,24 @@ def _available_memory_bytes() -> int | None:
     except (ValueError, OSError, AttributeError):
         pass
     return None
+
+
+def _available_memory_bytes() -> int | None:
+    """Available memory, the tighter of the host's own figure and this
+    container's cgroup limit (when either is readable).
+
+    ``None`` - not zero, not a guess - only when *neither* can be read, and
+    :func:`capability` treats that as "cannot check", not "not enough": a
+    host this cannot be measured on is not silently blocked, only honestly
+    noted as unmeasured (the CPU-count check still applies).
+    """
+    host = _host_available_memory_bytes()
+    cgroup = _cgroup_available_memory_bytes()
+    if host is None:
+        return cgroup
+    if cgroup is None:
+        return host
+    return min(host, cgroup)
 
 
 @dataclass(frozen=True)
@@ -232,12 +301,15 @@ def capability(
 ) -> Capability:
     """Detect whether the host can afford this feature, honestly.
 
-    Called every time :func:`fit` runs, whether or not
-    ``sequence_model_enabled`` is set - the point is to *never* attempt a fit
-    and fail, and never to quietly train a smaller/cheaper model instead:
-    either the host clears both floors or nothing is attempted at all, with
-    the specific reason it was declined surfaced to the run report and the
-    UI. ``cpu_count``/``available_memory_bytes`` are accepted as overrides
+    Called first, unconditionally, every time :func:`fit` runs - and
+    ``fit`` only ever runs when ``sequence_model_enabled`` is set, since
+    ``amminer.pipeline`` gates the call itself; a disabled feature costs
+    nothing here, not even this check. The point of running it first, before
+    anything else in ``fit``, is to *never* attempt a fit and fail, and never
+    to quietly train a smaller/cheaper model instead: either the host clears
+    both floors or nothing is attempted at all, with the specific reason it
+    was declined surfaced to the run report and the UI.
+    ``cpu_count``/``available_memory_bytes`` are accepted as overrides
     purely so tests can exercise both branches without patching
     ``os.cpu_count``/``/proc/meminfo`` globally.
     """

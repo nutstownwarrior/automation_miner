@@ -329,12 +329,14 @@ class Options:
     #: real historical support as candidates - see amminer/learn/sequence.py
     #: for the full reasoning. OFF by default, unlike home_mode_enabled/
     #: ranking_enabled above: training it costs real CPU and memory that a
-    #: Raspberry Pi may not have to spare, so it needs an explicit opt-in on
-    #: top of the capability gate (amminer.learn.sequence.capability) that
-    #: still runs every time and declines honestly, never attempting a fit
-    #: it cannot afford. Never affects the backtest gate or conflict
-    #: checking; every candidate it proposes passes through both unchanged,
-    #: exactly like every other miner's.
+    #: Raspberry Pi may not have to spare, so this flag gates whether a fit
+    #: is even attempted - disabled costs nothing, not even the capability
+    #: check. Turning it on does not skip that check: every attempt still
+    #: goes through the capability gate (amminer.learn.sequence.capability)
+    #: first and declines honestly rather than attempting a fit it cannot
+    #: afford. Never affects the backtest gate or conflict checking; every
+    #: candidate it proposes passes through both unchanged, exactly like
+    #: every other miner's.
     sequence_model_enabled: bool = False
     #: Below this many days of *training* history, fitting is skipped
     #: outright - a higher bar than home_mode_min_train_days/
