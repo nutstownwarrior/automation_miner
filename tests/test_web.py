@@ -25,10 +25,17 @@ def wired(ha_config_dir, store, fake_client):
 
 def test_every_page_renders(wired):
     client, _store, _runner, _ha = wired
-    for path in ("/", "/gaps", "/audit", "/dismissed", "/status"):
+    for path in ("/", "/gaps", "/audit", "/dismissed", "/status", "/automations"):
         response = client.get(path)
         assert response.status_code == 200, path
         assert "Automation Miner" in response.text
+
+
+def test_automations_page_is_empty_before_anything_is_applied(wired):
+    client, _store, _runner, _ha = wired
+    response = client.get("/automations")
+    assert response.status_code == 200
+    assert "Nothing applied yet" in response.text
 
 
 def test_suggestion_detail_shows_evidence_and_backtest(wired):
@@ -214,6 +221,33 @@ def test_apply_writes_and_reloads(wired):
     assert "id" not in written  # the id travels in the URL, per HA's config API
 
 
+def test_a_successful_apply_is_remembered_for_health_checks(wired):
+    """apply.py writing the automation is only half the job: runner.apply must
+    also record the stable marker and a snapshot, or amminer.health has
+    nothing to ever check."""
+    client, store, _runner, ha = wired
+    actionable = [s for s in store.list_suggestions(status="new") if s["payload"].get("actions")]
+    suggestion_id = actionable[0]["id"]
+    result = client.post(f"/api/suggestions/{suggestion_id}/apply").json()
+    assert result["ok"] is True
+
+    applied = store.list_applied_automations()
+    assert len(applied) == 1
+    row = applied[0]
+    assert row["automation_id"] == result["automation_id"]
+    assert row["automation_id"] in ha.written
+    assert row["suggestion_id"] == suggestion_id
+    assert row["candidate_payload"]["actions"]
+    # The exact config written to Home Assistant, id included - apply.py
+    # strips it only from the HTTP body, not from what this add-on keeps.
+    assert row["shipped_config"]["id"] == row["automation_id"]
+    assert row["health"] is None  # no run has judged it yet
+
+    page = client.get("/automations")
+    assert page.status_code == 200
+    assert str(escape(row["title"])) in page.text
+
+
 def test_apply_is_refused_when_validation_fails(wired):
     client, store, runner, ha = wired
     ha.check_config_result = "invalid"
@@ -222,6 +256,7 @@ def test_apply_is_refused_when_validation_fails(wired):
     assert result["ok"] is False
     assert result["errors"]
     assert not ha.written
+    assert store.list_applied_automations() == []
 
 
 def test_apply_refuses_audit_findings(wired):

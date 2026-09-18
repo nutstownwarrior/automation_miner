@@ -257,6 +257,22 @@ class Runner:
             )
 
         result = apply_generation(generation, self.client)
+        if result.ok and result.automation_id:
+            # The stable marker is result.automation_id - the "id" this add-on
+            # just wrote into the automation itself (see apply.py), which Home
+            # Assistant keeps fixed across a rename or an edit.  Snapshotting
+            # both the neutral candidate (replayable by amminer.health via
+            # candidate_from_payload, exactly as it was backtested) and the
+            # exact config written (so a later edit can be detected) is what
+            # lets a health check recognise and judge this automation without
+            # ever re-asking whether it was applied.
+            self.store.record_applied_automation(
+                automation_id=result.automation_id,
+                suggestion_id=suggestion_id,
+                title=candidate.title,
+                candidate_payload=candidate.as_dict(self._ensure_resolver()),
+                shipped_config=dict(generation.config or {}),
+            )
         data = result.as_dict()
         data["generation"] = generation.as_dict()
         return data

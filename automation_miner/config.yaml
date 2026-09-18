@@ -43,6 +43,12 @@ options:
   backtest_holdout_fraction: 0.25
   backtest_min_holdout_days: 7
   backtest_min_train_days: 14
+  health_min_days: 7
+  health_min_predicted_for_dormant: 3
+  health_noisy_override_rate: 0.3
+  health_overridden_override_rate: 0.6
+  health_min_fires_for_verdict: 5
+  health_shortfall_ratio: 0.3
   allow_security_actions: false
   notify_on_new_suggestions: true
   notify_service: ""
@@ -85,6 +91,12 @@ schema:
   backtest_holdout_fraction: float(0.0,0.9)?
   backtest_min_holdout_days: int(1,3650)?
   backtest_min_train_days: int(1,3650)?
+  health_min_days: int(1,3650)?
+  health_min_predicted_for_dormant: int(1,1000)?
+  health_noisy_override_rate: float(0.0,1.0)?
+  health_overridden_override_rate: float(0.0,1.0)?
+  health_min_fires_for_verdict: int(1,1000)?
+  health_shortfall_ratio: float(0.0,1.0)?
   allow_security_actions: bool?
   notify_on_new_suggestions: bool?
   notify_service: str?

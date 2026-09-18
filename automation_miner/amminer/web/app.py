@@ -192,6 +192,14 @@ def create_app(
             ),
         )
 
+    @app.get("/automations", response_class=HTMLResponse)
+    def automations_view(request: Request):
+        return templates.TemplateResponse(
+            request=request,
+            name="automations.html",
+            context=context(request, applied=store.list_applied_automations()),
+        )
+
     @app.get("/status", response_class=HTMLResponse)
     def status_view(request: Request):
         llm = build_provider(options).status().as_dict()

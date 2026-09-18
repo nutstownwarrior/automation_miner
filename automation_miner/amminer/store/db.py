@@ -19,7 +19,7 @@ from typing import Any
 
 _LOGGER = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 STATUS_NEW = "new"
 STATUS_DISMISSED = "dismissed"
@@ -170,6 +170,38 @@ CREATE TABLE IF NOT EXISTS ranking_models (
     -- feature vector would standardise the wrong number against the wrong
     -- column.
     scaler                 TEXT NOT NULL
+);
+
+-- One row per automation this add-on has ever written to Home Assistant.
+-- ``automation_id`` is the stable marker: the "id" this add-on put INTO the
+-- automation's own config at apply time (see amminer.apply), not its
+-- entity_id - Home Assistant keeps that id fixed across a rename or an edit,
+-- which is exactly what lets a health check still recognise the automation
+-- after the user has changed it. ``candidate_payload`` is the neutral
+-- Candidate this add-on backtested (amminer.runner.candidate_from_payload
+-- reads it back), replayed by amminer.health to see what the rule would
+-- still do; ``shipped_config`` is the actual HA automation config written,
+-- kept so amminer.health can tell whether the live automation still says
+-- the same thing.
+CREATE TABLE IF NOT EXISTS applied_automations (
+    automation_id     TEXT PRIMARY KEY,
+    suggestion_id     TEXT NOT NULL,
+    title             TEXT NOT NULL,
+    applied_ts        REAL NOT NULL,
+    candidate_payload TEXT NOT NULL,
+    shipped_config    TEXT NOT NULL
+);
+
+-- The latest health verdict for one applied automation (amminer.health),
+-- recomputed and overwritten wholesale on every run - there is nothing
+-- incremental about replaying history, so nothing here is worth migrating
+-- row by row rather than just retrieving it fresh.
+CREATE TABLE IF NOT EXISTS automation_health (
+    automation_id TEXT PRIMARY KEY,
+    ts            REAL NOT NULL,
+    status        TEXT NOT NULL,
+    verdict       TEXT NOT NULL,
+    payload       TEXT NOT NULL
 );
 """
 
@@ -1054,6 +1086,88 @@ class Store:
             return None
         return data
 
+    # --- applied automations & post-deployment health -----------------
+    def record_applied_automation(
+        self,
+        automation_id: str,
+        suggestion_id: str,
+        title: str,
+        candidate_payload: dict[str, Any],
+        shipped_config: dict[str, Any],
+    ) -> None:
+        """Remember one automation this add-on just wrote to Home Assistant.
+
+        Keyed on ``automation_id`` - the stable marker written into the
+        automation itself (see the table's own comment) - so re-applying the
+        same suggestion (perhaps after the user asked for changes and it was
+        regenerated) refreshes the snapshot and its ``applied_ts`` rather than
+        leaving two rows or an unreachable resurrected old one.
+        """
+        self._execute(
+            "INSERT INTO applied_automations(automation_id, suggestion_id, title,"
+            " applied_ts, candidate_payload, shipped_config) VALUES(?,?,?,?,?,?)"
+            " ON CONFLICT(automation_id) DO UPDATE SET suggestion_id=excluded.suggestion_id,"
+            " title=excluded.title, applied_ts=excluded.applied_ts,"
+            " candidate_payload=excluded.candidate_payload,"
+            " shipped_config=excluded.shipped_config",
+            (
+                automation_id,
+                suggestion_id,
+                title,
+                time.time(),
+                _json(candidate_payload),
+                _json(shipped_config),
+            ),
+        )
+
+    def _row_to_applied(self, row: sqlite3.Row) -> dict[str, Any]:
+        data = dict(row)
+        try:
+            data["candidate_payload"] = json.loads(data["candidate_payload"])
+        except (json.JSONDecodeError, TypeError):
+            data["candidate_payload"] = {}
+        try:
+            data["shipped_config"] = json.loads(data["shipped_config"])
+        except (json.JSONDecodeError, TypeError):
+            data["shipped_config"] = {}
+        health = self._query(
+            "SELECT * FROM automation_health WHERE automation_id = ?", (data["automation_id"],)
+        )
+        if health:
+            entry = dict(health[0])
+            try:
+                entry["payload"] = json.loads(entry["payload"]) if entry.get("payload") else {}
+            except (json.JSONDecodeError, TypeError):
+                entry["payload"] = {}
+            data["health"] = entry
+        else:
+            # No run has judged this one yet (it was applied since, or the
+            # health stage has not run) - never a stand-in for a real verdict.
+            data["health"] = None
+        return data
+
+    def list_applied_automations(self) -> list[dict[str, Any]]:
+        rows = self._query("SELECT * FROM applied_automations ORDER BY applied_ts DESC")
+        return [self._row_to_applied(row) for row in rows]
+
+    def get_applied_automation(self, automation_id: str) -> dict[str, Any] | None:
+        rows = self._query(
+            "SELECT * FROM applied_automations WHERE automation_id = ?", (automation_id,)
+        )
+        return self._row_to_applied(rows[0]) if rows else None
+
+    def save_automation_health(
+        self, automation_id: str, status: str, verdict: str, payload: dict[str, Any]
+    ) -> None:
+        """Overwrite this automation's health verdict with this run's finding."""
+        self._execute(
+            "INSERT INTO automation_health(automation_id, ts, status, verdict, payload)"
+            " VALUES(?,?,?,?,?)"
+            " ON CONFLICT(automation_id) DO UPDATE SET ts=excluded.ts,"
+            " status=excluded.status, verdict=excluded.verdict, payload=excluded.payload",
+            (automation_id, time.time(), status, verdict, _json(payload)),
+        )
+
     # --- gap suggestions ---------------------------------------------
     def upsert_gap(self, gap_id: str, kind: str, title: str, payload: dict[str, Any]) -> None:
         now = time.time()
@@ -1101,6 +1215,8 @@ class Store:
             "preferences",
             "gap_suggestions",
             "ranking_models",
+            "applied_automations",
+            "automation_health",
         ):
             rows = self._query(f"SELECT COUNT(*) AS c FROM {table}")
             out[table] = int(rows[0]["c"]) if rows else 0

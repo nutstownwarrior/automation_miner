@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+{% set active = 'automations' %}
+{% block content %}
+
+<h2>Automations we applied <span class="count">{{ applied | length }}</span></h2>
+<p class="muted">
+  Everything below started as a suggestion this add-on backtested, that you
+  applied. This page checks whether it is still doing the right thing -
+  it never changes or removes anything itself.
+</p>
+
+{% if not applied %}
+<div class="empty">
+  <p>Nothing applied yet.</p>
+  <p class="muted">Once you apply a suggestion, its health will show up here after a run or two.</p>
+</div>
+{% endif %}
+
+<div class="cards">
+{% for a in applied %}
+  {% set h = (a.health.payload if a.health else None) %}
+  <article class="card">
+    <header>
+      {% if h %}
+        {% if h.verdict == 'healthy' %}
+        <span class="tag ok">healthy</span>
+        {% elif h.verdict in ('noisy', 'overridden') %}
+        {# Noisy and overridden are one finding - a human undoing this
+           automation - at two severities of the same override rate, not two
+           different diagnoses. Same tag colour; the wording carries the
+           severity, and the exact rate is always in the sentence below. #}
+        <span class="tag warning">overridden - {{ 'severe' if h.verdict == 'overridden' else 'moderate' }}</span>
+        {% elif h.verdict in ('dormant', 'underperforming') %}
+        <span class="tag warning">{{ h.verdict }}</span>
+        {% elif h.verdict == 'insufficient_data' %}
+        <span class="tag">not enough data yet</span>
+        {% elif h.status == 'error' %}
+        <span class="tag error">could not check</span>
+        {% else %}
+        <span class="tag">{{ h.status }}</span>
+        {% endif %}
+      {% else %}
+      <span class="tag">not checked yet</span>
+      {% endif %}
+      <span class="muted small">applied at {{ a.applied_ts | int }}</span>
+    </header>
+    <h3>{{ a.title }}</h3>
+    {% if h %}
+    <p class="small {{ 'ok' if h.verdict == 'healthy' else ('warn' if h.verdict in ('noisy', 'dormant', 'overridden', 'underperforming') else '') }}">
+      {{ h.evidence }}
+    </p>
+    {% if h.status == 'active' and h.verdict not in ('insufficient_data',) %}
+    <dl class="metrics">
+      <div><dt>Predicted fires</dt><dd>{{ h.predicted_fires }}</dd></div>
+      <div><dt>Actual fires</dt><dd>{{ h.actual_fires }}</dd></div>
+      <div><dt>Fires / week</dt><dd>{{ h.actual_fires_per_week }}</dd></div>
+      {% if h.overrides is not none %}<div><dt>Overrides</dt><dd>{{ h.overrides }}</dd></div>{% endif %}
+      {% if h.override_rate is not none %}<div><dt>Override rate</dt><dd>{{ '%.0f%%' % (h.override_rate * 100) }}</dd></div>{% endif %}
+      <div><dt>Days evaluated</dt><dd>{{ h.days_evaluated }}</dd></div>
+    </dl>
+    {% endif %}
+    {% if h.verdict in ('dormant', 'overridden', 'noisy', 'underperforming') %}
+    <p class="small warn"><strong>Suggested action:</strong> {{ h.recommendation }} This add-on will not do it for you.</p>
+    {% endif %}
+    {% for note in h.notes or [] %}<p class="small muted">{{ note }}</p>{% endfor %}
+    {% else %}
+    <p class="small muted">No health check has run since this was applied yet.</p>
+    {% endif %}
+    <p class="small muted">id: <code>{{ a.automation_id }}</code>{% if h and h.entity_id %} &middot; <code>{{ h.entity_id }}</code>{% endif %}</p>
+  </article>
+{% endfor %}
+</div>
+{% endblock %}
