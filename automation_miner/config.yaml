@@ -70,6 +70,7 @@ options:
   llm_areas: false
   llm_home_mode_labels: false
   home_mode_enabled: true
+  home_mode_min_train_days: 14
   ranking_enabled: true
   ranking_prior_strength: 30.0
 schema:
@@ -127,5 +128,6 @@ schema:
   llm_hypotheses_per_candidate: int(0,10)?
   llm_triage_penalty: float(0.0,1.0)?
   home_mode_enabled: bool?
+  home_mode_min_train_days: int(1,3650)?
   ranking_enabled: bool?
   ranking_prior_strength: float(0.01,1000.0)?

@@ -285,6 +285,23 @@ class Options:
     #: candidate signal, the same as a signal amminer.enrich.detect never
     #: found.
     home_mode_enabled: bool = True
+    #: Below this many days of *training* history, fitting a latent-mode model
+    #: is skipped outright rather than attempted, and reported honestly as
+    #: "not enough history yet" (the same ``report.degradations``/status-page
+    #: pattern ``backtest_min_train_days`` above already uses) - fitting one
+    #: anyway would be both slow and dishonest: a home whose mode has not
+    #: been observed enough to support a latent-mode model does not get a
+    #: confident-looking split instead. The value mirrors
+    #: ``backtest_min_train_days`` (this project's existing bar for "enough
+    #: training history to mine anything from") and comfortably clears
+    #: ``amminer.learn.home_mode.MIN_BINS_FOR_HELD_OUT_SELECTION`` (~10.4
+    #: days) - the point below which even this module's own *preferred*
+    #: state-count criterion (held-out likelihood) cannot run at all, leaving
+    #: only the in-sample BIC fallback, which that module's own test suite
+    #: shows can be fooled by non-Gaussian count noise into manufacturing an
+    #: extra "mode". Below this floor, a fit is not just slow, it rests on
+    #: the less trustworthy of this project's two sanctioned criteria.
+    home_mode_min_train_days: int = 14
 
     # --- learned ranking (amminer.learn.ranking) -----------------------
     #: Order suggestions by a calibrated estimate of how likely *this user* is
@@ -330,6 +347,7 @@ class Options:
         self.backtest_holdout_fraction = min(max(float(self.backtest_holdout_fraction), 0.0), 0.9)
         self.backtest_min_holdout_days = max(int(self.backtest_min_holdout_days), 1)
         self.backtest_min_train_days = max(int(self.backtest_min_train_days), 1)
+        self.home_mode_min_train_days = max(int(self.home_mode_min_train_days), 1)
         self.sequence_min_occurrences = max(int(self.sequence_min_occurrences), 2)
         self.association_window_seconds = max(int(self.association_window_seconds), 1)
         self.stale_automation_days = max(int(self.stale_automation_days), 1)

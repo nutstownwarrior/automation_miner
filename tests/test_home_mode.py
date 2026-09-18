@@ -143,6 +143,45 @@ def test_recovered_states_are_honestly_described(options):
         assert summary["label"] == f"mode_{summary['state']}"
 
 
+# --- minimum training history -----------------------------------------
+def test_too_little_history_skips_the_fit_and_says_so(options):
+    """Below ``home_mode_min_train_days``, no model is fit at all - fast, and
+    honest about why, the same "not enough history yet" pattern this project
+    already gives ``backtest_min_train_days``/``health_min_days`` (see that
+    field's own docstring in ``amminer.config``)."""
+    fixture = build_two_regime_activity(days=5, seed=1)
+    train_days = (fixture.window[1] - fixture.window[0]) / 86400.0
+    assert train_days < options.home_mode_min_train_days
+    model = hm.fit(fixture.changes, SignalSet(), options, fixture.window)
+    assert not model.fitted
+    assert "days of training history" in model.fallback_reason
+    assert f"< {options.home_mode_min_train_days}" in model.fallback_reason
+
+
+def test_home_mode_min_train_days_is_configurable():
+    """Lowering the option lets a fit that would otherwise be skipped run -
+    the same knob every other "enough history to trust this" bar in this
+    project already exposes."""
+    fixture = build_two_regime_activity(days=5, seed=1)
+    lowered = Options(home_mode_min_train_days=4)
+    model = hm.fit(fixture.changes, SignalSet(), lowered, fixture.window)
+    assert model.fitted
+
+
+def test_a_short_window_still_falls_back_to_bic_when_configured_for_it():
+    """A window too thin for a held-out slice to mean anything (see
+    ``hm.MIN_BINS_FOR_HELD_OUT_SELECTION``) still gets a fit - via this
+    module's other sanctioned criterion, in-sample BIC - when the caller has
+    actively asked to fit on that little (a lowered
+    ``home_mode_min_train_days``), honestly labelled as the less trustworthy
+    of the two (see :func:`hm.select_model`'s own docstring)."""
+    small = Options(home_mode_min_train_days=5)
+    fixture = build_two_regime_activity(days=8, seed=1)
+    model = hm.fit(fixture.changes, SignalSet(), small, fixture.window)
+    assert model.fitted
+    assert model.selection_method == "bic"
+
+
 # --- shared fixture fits for the state-count sweeps below -----------------
 #
 # The tests below all exercise `build_two_regime_activity` across a spread

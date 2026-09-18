@@ -135,6 +135,27 @@ policy, not an accident of whatever the window happened to be. Recent
 behaviour is also the more relevant behaviour for "what mode is the household
 in tonight", which is the only thing this model needs to be good at.
 
+Below ``options.home_mode_min_train_days`` (see that field's own docstring in
+``amminer.config`` for the evidence behind its default) :func:`fit` does not
+run at all - a home with too little history to trust a latent-mode model does
+not pay for one either, and the same "not enough history yet" honesty this
+project already gives ``backtest_min_train_days``/``health_min_days`` applies
+here too (see :func:`fit`'s own early return and ``report.degradations`` in
+``amminer.pipeline``). :func:`select_model` also never fits a candidate ``k``
+the data plainly cannot support - see :data:`MIN_BINS_PER_CANDIDATE_STATE` -
+so a home with, say, nine days of history is not asked to distinguish five
+states from a few hundred bins just because it cleared the floor above.
+
+Restarts of the *same* candidate ``k`` are fit together, one shared,
+still-sequential-in-``t`` sweep instead of one sweep per restart - see
+:func:`_forward_backward_batch`'s own docstring for the mechanism (the same
+"numpy's per-call overhead dwarfs the work at k<=5" fact behind
+:func:`_logsumexp_row`, paid once per batch instead of once per restart) and
+:func:`_fit_em_batch`'s for why this changes nothing about what any one
+restart converges to - each restart's own trajectory, and its own
+independent convergence check, depend only on its own history, never on
+another restart sharing the same sweep.
+
 **The holdout discipline.**  :func:`fit` takes only the rows and window the
 caller decides to hand it - it has no way to reach into a wider window itself,
 and it is the caller's job (``amminer.pipeline``) to call it with
@@ -256,12 +277,12 @@ BIN_SECONDS = 900.0
 #: the work"). 60 days at 15-minute bins.
 MAX_TRAIN_BINS = 5760
 
-#: Below this many days of training history there have not been enough
-#: distinct days for a regime split to mean anything - mirrors
-#: ``amminer.pipeline.MIN_DAYS_FOR_SEQUENCE_MINING``'s own judgement call for
-#: a different kind of pattern that also needs several full days to trust.
-MIN_TRAIN_DAYS = 7
-MIN_TRAIN_BINS = int(MIN_TRAIN_DAYS * 86400.0 / BIN_SECONDS)
+#: The actual minimum-training-history floor :func:`fit` checks against is
+#: ``options.home_mode_min_train_days`` - a config option, not a constant
+#: here, precisely so it can be tuned like every other "enough history to
+#: trust this" bar in this project (``backtest_min_train_days``,
+#: ``health_min_days``...). See that field's own docstring (``amminer.config``)
+#: for the evidence behind its default.
 
 #: Candidate numbers of hidden states to try; BIC picks among these, never a
 #: fixed one. Bounded at 5 so a "quiet home" question never becomes an
@@ -527,30 +548,54 @@ def build_feature_matrix(
     ]
     relevant.sort(key=lambda c: c.ts)
 
+    # Only *edges* - a change whose active/inactive state actually differs
+    # from that entity's last tracked state - move a bucket's count; a
+    # `light.turn_on` while it is already tracked "on" contributes nothing,
+    # the same dedup `apply()` always did. This loop is therefore already
+    # over transitions, not bins, and is unavoidably sequential per entity
+    # (each decision depends on that entity's own previous state) - what
+    # used to also be a Python-level loop here was the *snapshotting* below,
+    # writing every one of up to MAX_TRAIN_BINS bins one row at a time even
+    # when nothing in it changed. A bin's level is exactly the running total
+    # of every edge at or before it, which a single cumulative sum computes
+    # for every bin and every bucket at once - integer running counts, so
+    # this is an exact reformulation, not an approximation: `np.add.at` followed
+    # by `cumsum` gives bit-for-bit (here, exactly, since counts are whole
+    # numbers) the same per-bin totals the old snapshot-every-bin loop wrote.
     current: dict[str, bool] = {}
-    bucket_counts = dict.fromkeys(FEATURE_NAMES, 0)
+    edit_bins: list[int] = []
+    edit_features: list[int] = []
+    edit_deltas: list[int] = []
 
-    def apply(entity_id: str, active: bool) -> None:
+    def apply(entity_id: str, active: bool, bin_idx: int) -> None:
         if current.get(entity_id, False) == active:
             return
         current[entity_id] = active
         delta = 1 if active else -1
         if entity_id in presence_entities:
-            bucket_counts["presence"] += delta
+            edit_bins.append(bin_idx)
+            edit_features.append(bucket_index["presence"])
+            edit_deltas.append(delta)
         bucket = _DOMAIN_BUCKET.get(entity_id.split(".", 1)[0])
         if bucket:
-            bucket_counts[bucket] += delta
+            edit_bins.append(bin_idx)
+            edit_features.append(bucket_index[bucket])
+            edit_deltas.append(delta)
 
-    pos = 0
-    n = len(relevant)
-    for bin_idx in range(n_bins):
-        bin_close = (first_idx + bin_idx + 1) * bin_seconds
-        while pos < n and relevant[pos].ts < bin_close:
-            change = relevant[pos]
-            apply(change.entity_id, _is_active_state(change.state))
-            pos += 1
-        for name in FEATURE_NAMES:
-            counts[bin_idx, bucket_index[name]] = bucket_counts[name]
+    for change in relevant:
+        # The bin whose close-boundary sweep would first have reached this
+        # change under the old bin-by-bin walk - clamped to bin 0 for
+        # anything at or before the window's own start, which has already
+        # happened by the time the very first bin closes (the old walk's
+        # `pos` pointer always reached those before bin_idx=0 finished too).
+        # `relevant` is filtered to `change.ts < end_ts`, so this never
+        # reaches n_bins.
+        bin_idx = max(int(change.ts // bin_seconds) - first_idx, 0)
+        apply(change.entity_id, _is_active_state(change.state), bin_idx)
+
+    if edit_bins:
+        np.add.at(counts, (np.array(edit_bins), np.array(edit_features)), edit_deltas)
+        np.cumsum(counts, axis=0, out=counts)
     return counts, first_idx
 
 
@@ -644,90 +689,222 @@ class _EMResult:
     n_iter: int
 
 
-def _fit_em(
+# ----------------------------------------------------------------------
+# Batched EM: many independent restarts of the same k, fit together
+#
+# Every candidate ``k`` is ever fit as a *batch* of restarts (see
+# _fit_best_of_restarts below) rather than one at a time - restarts of the
+# same k share nothing statistically (independent initial draws, independent
+# EM trajectories), only the sequential-in-t loop structure is shared, purely
+# to amortise numpy's fixed per-call dispatch overhead across all of them at
+# once instead of paying it once per restart (see
+# _forward_backward_batch's own docstring, and _logsumexp_row's for the
+# underlying "overhead dwarfs the work at k<=5" fact this exploits the other
+# direction). A batch of one restart is a valid, if pointless, special case -
+# there is no separate single-chain EM function to keep in step with this
+# one.
+# ----------------------------------------------------------------------
+def _log_gaussian_pdf_batch(
+    x: np.ndarray, means: np.ndarray, variances: np.ndarray, var_floor: float
+) -> np.ndarray:
+    """:func:`_log_gaussian_pdf`, batched over an extra restart axis.
+
+    ``x``: ``(T, D)`` - shared by every restart in the batch, they are all
+    fitting the same data. ``means``/``variances``: ``(B, K, D)`` -> ``(T, B, K)``.
+    """
+    variances = np.maximum(variances, var_floor)
+    diff2 = (x[:, None, None, :] - means[None, :, :, :]) ** 2
+    log_norm = -0.5 * np.sum(np.log(2.0 * np.pi * variances), axis=2)
+    quad = -0.5 * np.sum(diff2 / variances[None, :, :, :], axis=3)
+    return quad + log_norm[None, :, :]
+
+
+def _forward_backward_batch(
+    log_b: np.ndarray, log_pi: np.ndarray, log_a: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """:func:`_forward_backward`, batched over an extra restart axis ``B``.
+
+    ``log_b``: ``(T, B, K)``, ``log_pi``: ``(B, K)``, ``log_a``: ``(B, K, K)``.
+    Returns ``(log_alpha, log_beta, loglik)`` shaped ``(T, B, K)``, ``(T, B, K)``,
+    ``(B,)``.
+
+    Forward-backward is sequential in ``t`` by construction (see
+    :func:`_forward_backward`'s own docstring) and nothing here changes
+    that - the ``t`` loop below still runs exactly ``T`` times. What is
+    batched is *width*: at ``k <= 5``, :func:`_logsumexp_row`'s own docstring
+    records that replacing a *single* chain's per-``t`` numpy call with pure
+    Python was a real win, because numpy's fixed per-call dispatch overhead
+    dwarfs the arithmetic for an array that tiny. That overhead is paid once
+    per call, not once per element - so fitting ``B`` independent restarts of
+    the same ``k`` in lock-step, one shared numpy call per ``t`` computing
+    all ``B`` of them at once instead of ``B`` separate calls (numpy, once
+    per restart) or ``B`` separate pure-Python sweeps, amortises exactly that
+    fixed cost across ``B`` restarts' worth of real work instead of paying it
+    ``B`` times over. Measured on this module's own production-shaped
+    benchmark (T ~ 3000-5000, k = 5, B = RESTARTS/SELECTION_RESTARTS): a
+    clear win over both alternatives, growing with ``B``.
+
+    Restarts share nothing statistically - independent initial draws,
+    independent trajectories - only the loop structure is shared. Each
+    batch slot's arithmetic only ever touches its own slot (elementwise
+    ops, and every reduction below is over the state axis, never the batch
+    axis), so this computes exactly what ``B`` independent calls to
+    :func:`_forward_backward` would - not an approximation, the same
+    algorithm run wider.
+    """
+    # `.reduce()` on the ufunc directly (`np.maximum.reduce`/`np.add.reduce`)
+    # rather than the free functions `np.max`/`np.sum` - measured ~2x faster
+    # per call here, purely from skipping the free functions' generic
+    # keyword-argument dispatch (`_wrapreduction`); same arithmetic, same
+    # result, called T times per EM iteration so its own per-call overhead is
+    # exactly the kind of fixed cost this function exists to amortise.
+    t_len, b, k = log_b.shape
+    log_alpha = np.empty((t_len, b, k))
+    log_alpha[0] = log_pi + log_b[0]
+    for t in range(1, t_len):
+        prev = log_alpha[t - 1]  # (B, K_from)
+        m = prev[:, :, None] + log_a  # (B, K_from, K_to)
+        mx = np.maximum.reduce(m, axis=1, keepdims=True)
+        mx = np.where(np.isfinite(mx), mx, 0.0)
+        lse = mx[:, 0, :] + np.log(np.add.reduce(np.exp(m - mx), axis=1))
+        log_alpha[t] = lse + log_b[t]
+
+    log_beta = np.zeros((t_len, b, k))
+    for t in range(t_len - 2, -1, -1):
+        tail = log_b[t + 1] + log_beta[t + 1]  # (B, K_to)
+        m = log_a + tail[:, None, :]  # (B, K_from, K_to)
+        mx = np.maximum.reduce(m, axis=2, keepdims=True)
+        mx = np.where(np.isfinite(mx), mx, 0.0)
+        lse = mx[:, :, 0] + np.log(np.add.reduce(np.exp(m - mx), axis=2))
+        log_beta[t] = lse
+
+    mx_last = np.maximum.reduce(log_alpha[-1], axis=1, keepdims=True)
+    mx_last = np.where(np.isfinite(mx_last), mx_last, 0.0)
+    loglik = mx_last[:, 0] + np.log(np.add.reduce(np.exp(log_alpha[-1] - mx_last), axis=1))
+    return log_alpha, log_beta, loglik
+
+
+def _fit_em_batch(
     x: np.ndarray,
     k: int,
-    rng: np.random.Generator | None = None,
-    var_floor: float = VAR_FLOOR,
-    max_iter: int = MAX_EM_ITERS,
-    init: _EMResult | None = None,
-) -> _EMResult:
-    """One deterministic EM run to convergence or ``max_iter``.
+    inits: Sequence[tuple[np.random.Generator | None, _EMResult | None]],
+    var_floor: float,
+    max_iter: int,
+) -> list[_EMResult]:
+    """``len(inits)`` independent, deterministic EM runs to convergence (or
+    ``max_iter``), each to exactly what running it alone would have produced
+    - one per ``(rng, init)`` entry of ``inits``, initialised either from
+    ``rng`` (an independent random restart - the normal case) or, when
+    ``init`` is given instead, from an *existing* fit's parameters (used to
+    warm-start the full-quality refit from whatever :func:`select_model`'s
+    cheaper inner comparison already found - see :func:`_fit_best_of_restarts`,
+    so structure that comparison already located cannot be lost purely
+    because an independent random redraw on the full data happens not to
+    rediscover it); exactly one of a pair's ``rng``/``init`` must be given.
 
-    Initialised either from ``rng`` (an independent random restart - the
-    normal case) or, when ``init`` is given instead, from an *existing*
-    fit's parameters - used to warm-start the full-quality refit from
-    whatever :func:`select_model`'s cheaper inner comparison already found
-    (see :func:`_fit_best_of_restarts`), so structure that comparison
-    already located cannot be lost purely because an independent random
-    redraw on the full data happens not to rediscover it. Exactly one of
-    ``rng``/``init`` must be given.
+    Every restart runs the same standard Baum-Welch EM step (forward-backward
+    E-step, then closed-form M-step - see :func:`_forward_backward_batch` for
+    what is shared across restarts and why), computed for the whole batch at
+    once, but each keeps its own independent convergence check: the moment a
+    restart's own ``abs(ll - prev_ll) < EM_TOL * max(1, abs(prev_ll))``
+    condition fires, checked against that restart's own ``ll``/``prev_ll``
+    alone, never any other restart's, its ``(initial, transition, means,
+    variances)`` are frozen at exactly the values running it alone would have
+    left them at (the M-step output of the iteration that tripped the check -
+    every iteration always applies one more M-step before testing for
+    convergence) and are never touched again, while any restart still running
+    in the same batch continues. This is what makes batching restarts
+    together equivalent to running them apart: a restart's own results
+    depend only on its own trajectory, never on how long any other restart
+    in the batch happens to keep going.
     """
-    t_len = x.shape[0]
-    if init is not None:
-        pi = init.initial.copy()
-        a = init.transition.copy()
-        means = init.means.copy()
-        variances = init.variances.copy()
-    else:
-        assert rng is not None, "_fit_em needs either rng or init"
-        pi = rng.dirichlet(np.ones(k))
-        a = rng.dirichlet(np.ones(k), size=k)
-        means = x[rng.choice(t_len, size=k, replace=False)].copy()
-        variances = np.tile(np.maximum(x.var(axis=0), var_floor), (k, 1))
+    b = len(inits)
+    t_len, d = x.shape
+    pi = np.empty((b, k))
+    a = np.empty((b, k, k))
+    means = np.empty((b, k, d))
+    variances = np.empty((b, k, d))
+    for i, (rng, init) in enumerate(inits):
+        if init is not None:
+            pi[i] = init.initial
+            a[i] = init.transition
+            means[i] = init.means
+            variances[i] = init.variances
+        else:
+            assert rng is not None, "_fit_em_batch needs either rng or init per entry"
+            pi[i] = rng.dirichlet(np.ones(k))
+            a[i] = rng.dirichlet(np.ones(k), size=k)
+            means[i] = x[rng.choice(t_len, size=k, replace=False)]
+            variances[i] = np.maximum(x.var(axis=0), var_floor)
 
-    prev_ll = -np.inf
-    n_iter = 0
+    converged = np.zeros(b, dtype=bool)
+    prev_ll = np.full(b, -np.inf)
+    n_iter = np.zeros(b, dtype=int)
+
     for iteration in range(1, max_iter + 1):
-        n_iter = iteration
+        active = ~converged
+        if not active.any():
+            break
+        n_iter = np.where(active, iteration, n_iter)
+
         log_pi = np.log(np.clip(pi, 1e-300, None))
         log_a = np.log(np.clip(a, 1e-300, None))
-        log_b = _log_gaussian_pdf(x, means, variances, var_floor)
-        log_alpha, log_beta, ll = _forward_backward(log_b, log_pi, log_a)
+        log_b = _log_gaussian_pdf_batch(x, means, variances, var_floor)
+        log_alpha, log_beta, ll = _forward_backward_batch(log_b, log_pi, log_a)
 
-        # E-step: posterior state occupancy (gamma) and pairwise transition
-        # posteriors (xi), each row-normalised independently in log-space
-        # rather than by subtracting the single sequence-wide log-likelihood -
-        # equivalent in exact arithmetic, but does not compound floating-point
-        # error across a long sequence the way one global subtraction would.
+        # E-step - the same per-slot log-space normalisation as any
+        # Baum-Welch EM step, just with the batch axis carried along
+        # untouched.
         log_gamma = log_alpha + log_beta
-        log_gamma -= _logsumexp(log_gamma, axis=1)[:, None]
-        gamma = np.exp(log_gamma)
+        log_gamma -= _logsumexp(log_gamma, axis=2)[:, :, None]
+        gamma = np.exp(log_gamma)  # (T, B, K)
 
         log_xi = (
-            log_alpha[:-1][:, :, None]
-            + log_a[None, :, :]
-            + (log_b[1:] + log_beta[1:])[:, None, :]
+            log_alpha[:-1][:, :, :, None]
+            + log_a[None, :, :, :]
+            + (log_b[1:] + log_beta[1:])[:, :, None, :]
         )
-        flat = log_xi.reshape(t_len - 1, -1)
-        flat = flat - _logsumexp(flat, axis=1)[:, None]
-        xi = np.exp(flat).reshape(t_len - 1, k, k)
+        flat = log_xi.reshape(t_len - 1, b, -1)
+        flat = flat - _logsumexp(flat, axis=2)[:, :, None]
+        xi = np.exp(flat).reshape(t_len - 1, b, k, k)
 
-        # M-step
-        pi = gamma[0] / gamma[0].sum()
-        denom = np.maximum(gamma[:-1].sum(axis=0), 1e-300)
-        a = xi.sum(axis=0) / denom[:, None]
-        a = a / np.maximum(a.sum(axis=1, keepdims=True), 1e-300)
-        weight = np.maximum(gamma.sum(axis=0), 1e-300)
-        means = (gamma.T @ x) / weight[:, None]
-        diff2 = (x[:, None, :] - means[None, :, :]) ** 2
-        variances = np.einsum("tk,tkd->kd", gamma, diff2) / weight[:, None]
-        variances = np.maximum(variances, var_floor)
+        # M-step - x has no batch axis (every restart fits the same data);
+        # everything else keeps its own per-restart values.
+        new_pi = gamma[0] / gamma[0].sum(axis=1, keepdims=True)
+        denom = np.maximum(gamma[:-1].sum(axis=0), 1e-300)  # (B, K)
+        new_a = xi.sum(axis=0) / denom[:, :, None]
+        new_a = new_a / np.maximum(new_a.sum(axis=2, keepdims=True), 1e-300)
+        weight = np.maximum(gamma.sum(axis=0), 1e-300)  # (B, K)
+        new_means = np.einsum("tbk,td->bkd", gamma, x) / weight[:, :, None]
+        diff2 = (x[:, None, None, :] - new_means[None, :, :, :]) ** 2  # (T,B,K,D)
+        new_variances = np.einsum("tbk,tbkd->bkd", gamma, diff2) / weight[:, :, None]
+        new_variances = np.maximum(new_variances, var_floor)
 
-        if abs(ll - prev_ll) < EM_TOL * max(1.0, abs(prev_ll)):
-            prev_ll = ll
-            break
-        prev_ll = ll
+        # Only restarts still active *this* iteration are updated - one
+        # already converged in an earlier iteration is frozen exactly where
+        # it broke, exactly the break-before-touching-params-again
+        # behaviour running it alone would have had.
+        pi = np.where(active[:, None], new_pi, pi)
+        a = np.where(active[:, None, None], new_a, a)
+        means = np.where(active[:, None, None], new_means, means)
+        variances = np.where(active[:, None, None], new_variances, variances)
 
-    # Recompute the final log-likelihood under the parameters actually kept
-    # (the loop's `ll` was computed *before* the last M-step that produced
-    # them) so `log_likelihood` always matches `(initial, transition, means,
-    # variances)` on this object, which is what BIC below is scored from.
+        just_converged = active & (np.abs(ll - prev_ll) < EM_TOL * np.maximum(1.0, np.abs(prev_ll)))
+        prev_ll = np.where(active, ll, prev_ll)
+        converged = converged | just_converged
+
+    # Recompute the final log-likelihood under the parameters actually kept,
+    # same reason any single EM run does: the loop's last `ll` was computed
+    # *before* the M-step that produced the params each restart was frozen at.
     log_pi = np.log(np.clip(pi, 1e-300, None))
     log_a = np.log(np.clip(a, 1e-300, None))
-    log_b = _log_gaussian_pdf(x, means, variances, var_floor)
-    _, _, final_ll = _forward_backward(log_b, log_pi, log_a)
-    return _EMResult(final_ll, pi, a, means, variances, n_iter)
+    log_b = _log_gaussian_pdf_batch(x, means, variances, var_floor)
+    _, _, final_ll = _forward_backward_batch(log_b, log_pi, log_a)
+
+    return [
+        _EMResult(float(final_ll[i]), pi[i], a[i], means[i], variances[i], int(n_iter[i]))
+        for i in range(b)
+    ]
 
 
 def _bic(result: _EMResult, n_bins: int, n_features: int) -> float:
@@ -754,6 +931,22 @@ INNER_VALIDATION_FRACTION = 0.2
 #: other sanctioned criterion) is used instead, and every fitted model
 #: records honestly which method actually picked its state count.
 MIN_BINS_FOR_HELD_OUT_SELECTION = 1000
+
+#: A candidate ``k`` is only ever fit when there are at least this many bins
+#: available *per state it would need*, i.e. only when ``len(x) >= k *
+#: MIN_BINS_PER_CANDIDATE_STATE`` - below that, even a perfectly even split
+#: across its states would leave the smallest of them less than this many
+#: bins' worth of evidence, and no restart budget rescues an EM fit asked to
+#: explain more regimes than the data could ever demonstrate. 200 bins is 50
+#: hours, a little over two days - not a rigorous minimum-sample bound (the
+#: real answer to "is this k actually supported" is what
+#: :func:`select_model`'s held-out/BIC scoring and
+#: :func:`_larger_fit_adds_a_novel_state`'s separation check already exist to
+#: decide), just a cheap, early "do not even spend a restart budget on this"
+#: cutoff for candidates that are obviously too big for how little data is on
+#: the table - the same spirit as :data:`STATE_CANDIDATES` itself never
+#: trying more than 5 states in the first place.
+MIN_BINS_PER_CANDIDATE_STATE = 200
 
 
 def _stationary_distribution(a: np.ndarray) -> np.ndarray:
@@ -1080,14 +1273,19 @@ def _fit_best_of_restarts(
     data does not win just for being a warm start), it is only ever an
     additional candidate in the same pool, never a replacement for genuine
     restarts.
+
+    Every candidate here is fit in one batched call (see :func:`_fit_em_batch`)
+    rather than one independent EM run per candidate - restarts of the same
+    ``k`` share nothing statistically, only the batching amortises numpy's
+    fixed per-call overhead across all of them at once; see that function's
+    own docstring for the reasoning and the measured effect.
     """
-    candidates = [
-        _fit_em(x, k, rng=np.random.default_rng([_SEED_BASE, k, restart]),
-                var_floor=var_floor, max_iter=max_iter)
-        for restart in range(restarts)
+    inits: list[tuple[np.random.Generator | None, _EMResult | None]] = [
+        (np.random.default_rng([_SEED_BASE, k, restart]), None) for restart in range(restarts)
     ]
     if warm_start is not None:
-        candidates.append(_fit_em(x, k, var_floor=var_floor, max_iter=max_iter, init=warm_start))
+        inits.append((None, warm_start))
+    candidates = _fit_em_batch(x, k, inits, var_floor, max_iter)
     return _select_best_restart(candidates, x, var_floor, prefer_max_occupied)
 
 
@@ -1109,10 +1307,15 @@ def _fit_candidates(
     be kept, with no separate anti-collapse refit downstream.
     """
     fits: dict[int, _EMResult] = {}
+    n_bins = len(x)
     for k in STATE_CANDIDATES:
         if k >= max_k_exclusive:
             # Cannot have more states than data points to assign them to;
             # skip rather than fit something degenerate.
+            continue
+        if n_bins < k * MIN_BINS_PER_CANDIDATE_STATE:
+            # Not enough bins even in principle to support k states - see
+            # MIN_BINS_PER_CANDIDATE_STATE's own comment.
             continue
         fits[k] = _fit_best_of_restarts(
             x, k, var_floor, restarts, max_iter, prefer_max_occupied=prefer_max_occupied
@@ -1727,12 +1930,14 @@ def fit(
     holdout at all, only of two already-fitted models' parameters.
     """
     start_ts, end_ts = train_window
+    min_train_days = options.home_mode_min_train_days
+    min_train_bins = int(min_train_days * 86400.0 / BIN_SECONDS)
     train_days = (end_ts - start_ts) / 86400.0
-    if train_days < MIN_TRAIN_DAYS:
+    if train_days < min_train_days:
         return HomeModeModel(
             fitted=False,
             fallback_reason=(
-                f"only {train_days:.1f} days of training history (< {MIN_TRAIN_DAYS}); "
+                f"only {train_days:.1f} days of training history (< {min_train_days}); "
                 "too little to infer a household mode yet"
             ),
         )
@@ -1746,11 +1951,11 @@ def fit(
         counts = counts[drop:]
         first_idx += drop
         n_bins = MAX_TRAIN_BINS
-    if n_bins < MIN_TRAIN_BINS:
+    if n_bins < min_train_bins:
         return HomeModeModel(
             fitted=False,
             fallback_reason=(
-                f"only {n_bins} activity bins available (< {MIN_TRAIN_BINS} needed); "
+                f"only {n_bins} activity bins available (< {min_train_bins} needed); "
                 "too little to infer a household mode yet"
             ),
         )
