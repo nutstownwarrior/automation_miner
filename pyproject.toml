@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "automation-miner"
-version = "0.7.0"
+version = "0.8.0"
 description = "Home Assistant add-on that mines history for explainable automation suggestions"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -35,6 +35,7 @@ filterwarnings = [
 markers = [
   "mariadb: needs a live MariaDB/MySQL server (set AMMINER_TEST_MYSQL_URL)",
   "slow: takes more than a couple of seconds",
+  "slow_model: a multi-seed home-mode EM sweep (set AMMINER_RUN_SLOW_MODEL_TESTS=1); runs in the dedicated test-model-sweeps CI job, not the default matrix",
 ]
 
 [tool.ruff]
