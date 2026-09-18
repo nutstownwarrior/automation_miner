@@ -31,6 +31,7 @@ from .entities import build_resolver
 from .ha_api import HAClient
 from .learn import home_mode as home_mode_module
 from .learn import ranking as ranking_module
+from .learn import sequence as sequence_model_module
 from .llm import areas as llm_areas
 from .llm import audit as llm_audit
 from .llm import classify as llm_classify
@@ -98,6 +99,12 @@ class RunReport:
     #: Status page has no use for and which would otherwise bloat every run's
     #: stored ``runs.stats`` JSON. See amminer.learn.home_mode.
     home_mode: dict[str, Any] = field(default_factory=dict)
+    #: The learned sequence model's own stats (whether it fitted, why not
+    #: when it did not, how it was trained) - never the weights themselves,
+    #: which are not persisted at all (see amminer.learn.sequence's own
+    #: "No persistence"). Present even when sequence_model_enabled is off,
+    #: so the Status page can say plainly that it was never attempted.
+    sequence_model: dict[str, Any] = field(default_factory=dict)
     #: Post-deployment health of automations this add-on has applied (see
     #: amminer.health) - how many were checked and their verdicts, never the
     #: full detail (that lives in the store, for the automations page).
@@ -132,6 +139,7 @@ class RunReport:
             "suppressed": self.suppressed,
             "ranking": self.ranking,
             "home_mode": self.home_mode,
+            "sequence_model": self.sequence_model,
             "automations": self.automations,
             "degradations": self.degradations,
             "state_rows": self.state_rows,
@@ -586,6 +594,50 @@ def run_analysis(
                 f"{MIN_DAYS_FOR_SEQUENCE_MINING}): association and sequence mining are disabled. "
                 "Switch the recorder to MariaDB and raise purge_keep_days to enable them."
             )
+
+        # --- learned sequence model (amminer.learn.sequence) -------------
+        # A pure-numpy sequence model over recent context, predicting the
+        # next human action directly instead of asking the narrower question
+        # every miner above asks. Off by default: unlike home_mode/ranking
+        # above, this costs real CPU and memory a Raspberry Pi may not have
+        # to spare, so it needs both this explicit opt-in and a capability
+        # gate that runs on every fit attempt and declines honestly instead
+        # of attempting one it cannot afford - see that module's own
+        # docstring. Fit on `train_changes`/`train_window` only, for the
+        # same holdout reason `home_mode` above is; its candidates then go
+        # through the same backtest/conflict machinery as every other
+        # miner's, unchanged.
+        if options.sequence_model_enabled:
+
+            def _fit_sequence_model():
+                return sequence_model_module.fit(train_changes, options, train_window)
+
+            fit_result = run_stage("sequence model", _fit_sequence_model)
+            if fit_result is None:
+                produced["sequence_model"] = []
+                report.degradations.append(
+                    "The sequence model failed and was skipped; other miners still ran."
+                )
+            else:
+                seq_model, seq_examples = fit_result
+                report.sequence_model = seq_model.as_dict()
+                if not seq_model.fitted:
+                    produced["sequence_model"] = []
+                    report.degradations.append(
+                        f"The sequence model did not run this time ({seq_model.fallback_reason})."
+                    )
+                else:
+                    produced["sequence_model"] = run_miner(
+                        "sequence_model",
+                        sequence_model_module.extract_candidates,
+                        seq_model, seq_examples, options, train_window, resolver,
+                    )
+        else:
+            produced["sequence_model"] = []
+            report.sequence_model = {
+                "fitted": False,
+                "fallback_reason": "disabled (sequence_model_enabled=false)",
+            }
 
         # Deliberately the full window, not train_changes/train_window: a stale
         # or unused automation is found by its age and configuration

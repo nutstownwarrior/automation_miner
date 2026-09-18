@@ -1,6 +1,6 @@
 ---
 name: Automation Miner
-version: "0.8.0"
+version: "0.9.0"
 slug: automation_miner
 description: >-
   Mines your Home Assistant history for genuinely useful, explainable automation
@@ -73,6 +73,11 @@ options:
   home_mode_min_train_days: 14
   ranking_enabled: true
   ranking_prior_strength: 30.0
+  sequence_model_enabled: false
+  sequence_model_min_train_days: 30
+  sequence_model_min_confidence: 0.75
+  sequence_model_min_model_probability: 0.6
+  sequence_model_min_occurrences: 5
 schema:
   log_level: list(trace|debug|info|notice|warning|error|fatal)?
   schedule: str?
@@ -131,3 +136,8 @@ schema:
   home_mode_min_train_days: int(1,3650)?
   ranking_enabled: bool?
   ranking_prior_strength: float(0.01,1000.0)?
+  sequence_model_enabled: bool?
+  sequence_model_min_train_days: int(1,3650)?
+  sequence_model_min_confidence: float(0.0,1.0)?
+  sequence_model_min_model_probability: float(0.0,1.0)?
+  sequence_model_min_occurrences: int(2,1000)?

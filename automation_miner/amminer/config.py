@@ -322,6 +322,43 @@ class Options:
     #: real, consistent preference over ~40 decisions still moves it clearly.
     ranking_prior_strength: float = 30.0
 
+    # --- learned sequence model (amminer.learn.sequence) ----------------
+    #: Train a small, pure-numpy sequence model (a compact GRU) over
+    #: tokenised (entity, state, time-gap) events to predict the next human
+    #: action from recent context, and propose the predictions that have
+    #: real historical support as candidates - see amminer/learn/sequence.py
+    #: for the full reasoning. OFF by default, unlike home_mode_enabled/
+    #: ranking_enabled above: training it costs real CPU and memory that a
+    #: Raspberry Pi may not have to spare, so it needs an explicit opt-in on
+    #: top of the capability gate (amminer.learn.sequence.capability) that
+    #: still runs every time and declines honestly, never attempting a fit
+    #: it cannot afford. Never affects the backtest gate or conflict
+    #: checking; every candidate it proposes passes through both unchanged,
+    #: exactly like every other miner's.
+    sequence_model_enabled: bool = False
+    #: Below this many days of *training* history, fitting is skipped
+    #: outright - a higher bar than home_mode_min_train_days/
+    #: backtest_min_train_days because this model has to learn per-entity,
+    #: per-context transition structure, not one household-wide split.
+    sequence_model_min_train_days: int = 30
+    #: How often the model's predicted action must have actually followed
+    #: the same context in training history before it is trusted (an
+    #: empirical, counted ratio - occurrences/opportunities - never the raw
+    #: softmax score, which is reported alongside but never substituted in;
+    #: see that module's own honesty section).
+    sequence_model_min_confidence: float = 0.75
+    #: How confident the model itself must be (its own predicted
+    #: probability, averaged over the times this exact context actually
+    #: produced this outcome) before a candidate is proposed at all - a
+    #: second, independent bar on top of sequence_model_min_confidence, not
+    #: a substitute for it.
+    sequence_model_min_model_probability: float = 0.6
+    #: The minimum number of times a (context, action) pair must actually
+    #: have occurred in training history - mirrors min_occurrences above,
+    #: kept separate because this model's contexts are narrower (they can
+    #: include up to two extra conditions) and so naturally rarer.
+    sequence_model_min_occurrences: int = 5
+
     # --- paths (overridable for tests) ---
     ha_config_dir: str = "/homeassistant"
     state_dir: str = "/config"
@@ -358,6 +395,14 @@ class Options:
         self.llm_classification_batch = max(int(self.llm_classification_batch), 5)
         self.override_window_seconds = max(int(self.override_window_seconds), 1)
         self.ranking_prior_strength = max(float(self.ranking_prior_strength), 0.01)
+        self.sequence_model_min_train_days = max(int(self.sequence_model_min_train_days), 1)
+        self.sequence_model_min_confidence = min(
+            max(float(self.sequence_model_min_confidence), 0.0), 1.0
+        )
+        self.sequence_model_min_model_probability = min(
+            max(float(self.sequence_model_min_model_probability), 0.0), 1.0
+        )
+        self.sequence_model_min_occurrences = max(int(self.sequence_model_min_occurrences), 2)
         self.health_min_days = max(int(self.health_min_days), 1)
         self.health_min_predicted_for_dormant = max(int(self.health_min_predicted_for_dormant), 1)
         self.health_noisy_override_rate = min(
