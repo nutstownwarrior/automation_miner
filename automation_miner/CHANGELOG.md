@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.9.0
+
+**Added: a learned sequence model — `sequence_model_enabled` (OFF by default)**
+
+Every miner this add-on ships is really a hand-specified projection of one
+underlying question: what does this household do next, given what just
+happened? `time_of_day.py` asks it of the clock; `association.py` of
+co-occurring pairs, capped at two items; `sequence.py` of ordered
+subsequences that repeat verbatim; `conditional.py` of one signal at a time,
+tested independently. None of them can see an interaction the others handle,
+and none can see three things interacting at once.
+
+A compact GRU (pure numpy, hand-derived forward/backward, no autodiff
+library), trained on **training-window data only**, now learns that question
+directly from a tokenised `(entity, state, time-gap)` event stream and
+predicts the next human action from recent context. Wherever it predicts one
+with real confidence *and* that exact context/outcome pair has real,
+counted support in history, `amminer/learn/sequence.py` proposes a
+candidate - trigger, up to two extra conditions, and the predicted action -
+which then passes through the same backtest and conflict machinery as
+every other miner's, unchanged.
+
+- **Off by default**, unlike every other non-LLM feature in this add-on: a
+  compact model still costs real CPU and memory a Raspberry Pi may not have
+  to spare. A capability check (`amminer.learn.sequence.capability`) runs on
+  every attempt regardless, and declines with a specific, honest reason -
+  not enough CPU cores, not enough available memory - rather than attempting
+  a fit it cannot afford.
+- Every number a candidate carries is counted directly from history
+  (`occurrences`/`opportunities`/`confidence`), exactly like every other
+  miner's evidence; the model's own predicted probability is reported
+  separately and never substituted in. A candidate needs both bars cleared.
+- Bounded context (6 events), vocabulary (48 items), model size, training
+  examples, gradient steps and wall-clock, all fixed module constants - see
+  that module's own docstring for the measured training time on a realistic
+  synthetic year and the reasoning behind each figure.
+- Trains deterministically: seeded, fixed iteration budget, bit-reproducible
+  across processes given the same input, same as `home_mode`'s own model.
+- Nothing is persisted - refit from scratch each run, like the input it
+  learns from; its candidates are already persisted as ordinary suggestions.
+- Like `home_mode` and `ranking`, this can only ever propose a candidate,
+  never rescue one that fails its backtest or conflict checks.
+
 ## 0.8.0
 
 **Added: inferred household mode — `home_mode_enabled` (on by default)**
