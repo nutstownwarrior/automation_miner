@@ -29,11 +29,15 @@ from .enrich.detect import detect_signals
 from .enrich.signals import SignalStore, build_signal_store
 from .entities import build_resolver
 from .ha_api import HAClient
+from .learn import home_mode as home_mode_module
+from .learn import ranking as ranking_module
+from .learn import sequence as sequence_model_module
 from .llm import areas as llm_areas
 from .llm import audit as llm_audit
 from .llm import classify as llm_classify
 from .llm import explain as llm_explain
 from .llm import gaps as llm_gap_proposals
+from .llm import home_mode_labels as llm_home_mode_labels
 from .llm import hypothesis as llm_hypothesis
 from .llm import preferences as llm_preferences
 from .llm import scenes as llm_scenes
@@ -85,6 +89,26 @@ class RunReport:
     #: Suggestions hidden because they match a preference learned from the
     #: reasons the user gave when dismissing things before.
     suppressed: int = 0
+    #: The acceptance-ranking model's own stats (n_labels, whether it fell
+    #: back to the prior and why), never including the weights themselves -
+    #: for the Status page, not for reconstructing the model.
+    ranking: dict[str, Any] = field(default_factory=dict)
+    #: The inferred household-mode model's own stats (whether it fitted, how
+    #: many modes, how it chose that number, the honest per-mode
+    #: descriptions) - never the raw transition/emission matrices, which the
+    #: Status page has no use for and which would otherwise bloat every run's
+    #: stored ``runs.stats`` JSON. See amminer.learn.home_mode.
+    home_mode: dict[str, Any] = field(default_factory=dict)
+    #: The learned sequence model's own stats (whether it fitted, why not
+    #: when it did not, how it was trained) - never the weights themselves,
+    #: which are not persisted at all (see amminer.learn.sequence's own
+    #: "No persistence"). Present even when sequence_model_enabled is off,
+    #: so the Status page can say plainly that it was never attempted.
+    sequence_model: dict[str, Any] = field(default_factory=dict)
+    #: Post-deployment health of automations this add-on has applied (see
+    #: amminer.health) - how many were checked and their verdicts, never the
+    #: full detail (that lives in the store, for the automations page).
+    automations: dict[str, Any] = field(default_factory=dict)
     degradations: list[str] = field(default_factory=list)
     state_rows: int = 0
 
@@ -113,6 +137,10 @@ class RunReport:
             "notified": self.notified,
             "shadow_fires": self.shadow_fires,
             "suppressed": self.suppressed,
+            "ranking": self.ranking,
+            "home_mode": self.home_mode,
+            "sequence_model": self.sequence_model,
+            "automations": self.automations,
             "degradations": self.degradations,
             "state_rows": self.state_rows,
         }
@@ -422,6 +450,99 @@ def run_analysis(
                 "there is more of it."
             )
 
+        # --- household mode (amminer.learn.home_mode) -------------------
+        # Fit on `train_changes`/`train_window` only - never `changes` or
+        # `window` - because this signal is an input to mining, and mining an
+        # input from data a candidate is later judged against is exactly the
+        # leak amminer.backtest's holdout split exists to prevent (see that
+        # module's own docstring on this). The fitted model is then replayed
+        # - causally, never with foresight of activity past each moment - to
+        # label the training window (added to train_store, for mining) and
+        # separately the whole window through the holdout (added to
+        # full_store, for backtesting), exactly as every other signal in
+        # `signals` already flows into both.  Setting `signals.home_mode`
+        # before mining starts is what lets amminer.miners.conditional pick
+        # it up through condition_entities() with no other change needed.
+        if options.home_mode_enabled:
+            # Read back before fitting, purely so tonight's states can be
+            # relabelled to match last night's own numbering where the two
+            # line up (amminer.learn.home_mode.fit's own "Mode identity
+            # across runs") - never to influence the fit itself, and never a
+            # substitute for it: HomeModeModel.from_row already refuses a
+            # stale schema version, so a model from a build that changed the
+            # feature vector or persisted shape is treated the same as no
+            # previous model at all.
+            previous_home_mode = home_mode_module.HomeModeModel.from_row(
+                store.get_home_mode_model()
+            )
+
+            def _fit_home_mode():
+                return home_mode_module.fit(
+                    train_changes, signals, options, train_window, resolver, previous_home_mode
+                )
+
+            home_mode_model = run_stage("household mode", _fit_home_mode)
+            if home_mode_model is None:
+                report.degradations.append(
+                    "Inferring a household mode failed this run; no mode signal was offered "
+                    "to the conditional miner."
+                )
+            elif not home_mode_model.fitted:
+                # Persisted even when there was nothing to fit - the honest
+                # reason why is itself worth remembering between runs, the
+                # same "retrained/replaced wholesale every run, nothing
+                # incremental to migrate" treatment amminer.learn.ranking's
+                # own model already gets (see store.save_ranking_model
+                # below).
+                store.save_home_mode_model(home_mode_model.as_dict())
+                report.home_mode = home_mode_model.as_dict()
+                report.degradations.append(
+                    "No household mode signal is available yet "
+                    f"({home_mode_model.fallback_reason})."
+                )
+            else:
+                signals.home_mode = [home_mode_module.HOME_MODE_ENTITY_ID]
+                if provider is not None and options.llm_home_mode_labels:
+                    labelled = run_ai(
+                        "home_mode_labels", llm_home_mode_labels.propose, home_mode_model, provider
+                    )
+                    if labelled is not None:
+                        llm_home_mode_labels.apply_labels(home_mode_model, labelled)
+                train_mode_series = run_stage(
+                    "decoding household mode (training window)",
+                    home_mode_module.decode_series,
+                    home_mode_model, train_changes, signals, options, train_window,
+                )
+                full_mode_series = run_stage(
+                    "decoding household mode (full window)",
+                    home_mode_module.decode_series,
+                    home_mode_model, changes, signals, options, window,
+                )
+                if train_mode_series is not None:
+                    train_store.add(train_mode_series)
+                if full_mode_series is not None:
+                    full_store.add(full_mode_series)
+                if train_mode_series is None or full_mode_series is None:
+                    # A model with nothing to replay is not usable as a
+                    # signal even though it fitted - withdraw it rather than
+                    # let a miner test a condition entity with no series.
+                    signals.home_mode = []
+                    report.degradations.append(
+                        "A household mode was inferred but could not be replayed as a "
+                        "signal this run; it was not offered to the conditional miner."
+                    )
+                # Persisted after labelling/decoding above, not right after
+                # the fit itself, so the payload a later run reads back (and
+                # what this run reports) agree on the one model, LLM labels
+                # included - see the not-fitted branch above for why this is
+                # saved every run, fitted or not.
+                store.save_home_mode_model(home_mode_model.as_dict())
+                report.home_mode = {
+                    k: v
+                    for k, v in home_mode_model.as_dict().items()
+                    if k not in ("initial", "transition", "means", "variances")
+                }
+
         # --- mining ---------------------------------------------------
         produced: dict[str, list[Candidate]] = {}
 
@@ -473,6 +594,50 @@ def run_analysis(
                 f"{MIN_DAYS_FOR_SEQUENCE_MINING}): association and sequence mining are disabled. "
                 "Switch the recorder to MariaDB and raise purge_keep_days to enable them."
             )
+
+        # --- learned sequence model (amminer.learn.sequence) -------------
+        # A pure-numpy sequence model over recent context, predicting the
+        # next human action directly instead of asking the narrower question
+        # every miner above asks. Off by default: unlike home_mode/ranking
+        # above, this costs real CPU and memory a Raspberry Pi may not have
+        # to spare, so it needs both this explicit opt-in and a capability
+        # gate that runs on every fit attempt and declines honestly instead
+        # of attempting one it cannot afford - see that module's own
+        # docstring. Fit on `train_changes`/`train_window` only, for the
+        # same holdout reason `home_mode` above is; its candidates then go
+        # through the same backtest/conflict machinery as every other
+        # miner's, unchanged.
+        if options.sequence_model_enabled:
+
+            def _fit_sequence_model():
+                return sequence_model_module.fit(train_changes, options, train_window)
+
+            fit_result = run_stage("sequence model", _fit_sequence_model)
+            if fit_result is None:
+                produced["sequence_model"] = []
+                report.degradations.append(
+                    "The sequence model failed and was skipped; other miners still ran."
+                )
+            else:
+                seq_model, seq_examples = fit_result
+                report.sequence_model = seq_model.as_dict()
+                if not seq_model.fitted:
+                    produced["sequence_model"] = []
+                    report.degradations.append(
+                        f"The sequence model did not run this time ({seq_model.fallback_reason})."
+                    )
+                else:
+                    produced["sequence_model"] = run_miner(
+                        "sequence_model",
+                        sequence_model_module.extract_candidates,
+                        seq_model, seq_examples, options, train_window, resolver,
+                    )
+        else:
+            produced["sequence_model"] = []
+            report.sequence_model = {
+                "fitted": False,
+                "fallback_reason": "disabled (sequence_model_enabled=false)",
+            }
 
         # Deliberately the full window, not train_changes/train_window: a stale
         # or unused automation is found by its age and configuration
@@ -670,11 +835,68 @@ def run_analysis(
             )
         report.conflicted = conflicted or 0
 
+        # --- automation health: does what we already shipped still perform? -
+        # Reuses exactly the events/full_store/overrides this run already
+        # loaded for causality classification and backtesting - see
+        # amminer.health's own docstring for why nothing here re-queries the
+        # recorder.  `existing` is the same list conflict checking just used,
+        # keyed the same way.
+        def _check_health() -> list[dict[str, Any]]:
+            from . import health as health_module
+
+            results = health_module.evaluate_all(
+                store, existing, events, full_store, overrides, options, window
+            )
+            return [r.as_dict() for r in results]
+
+        health_results = run_stage("automation health", _check_health)
+        if health_results is None:
+            report.degradations.append(
+                "Could not check the health of automations already applied; last "
+                "known status is shown instead."
+            )
+        else:
+            by_verdict: dict[str, int] = {}
+            for entry in health_results:
+                by_verdict[entry["verdict"]] = by_verdict.get(entry["verdict"], 0) + 1
+            report.automations = {"checked": len(health_results), "by_verdict": by_verdict}
+
+        # --- ranking: a calibrated ordering, never a gate ---------------
+        # Retrained from scratch every run from the user's own accept/dismiss
+        # history so far - amminer/learn/ranking.py documents why that is
+        # cheap, why it is safe with zero history (a hand-set prior), and why
+        # a noisy handful of decisions cannot make the ordering worse than
+        # that prior (a cross-validated guard falls back to it otherwise).
+        #
+        # This runs after backtesting and conflict checking and is only ever
+        # given `passed` - it has no way to rescue a candidate `backtest_all`
+        # rejected or to hide one that has a blocking conflict, because it
+        # never sees `rejected` and never touches `conflicts` or the
+        # `passed`/`rejected` split itself, only `candidate.extra`.
+        if options.ranking_enabled and passed:
+            def _rank() -> dict[str, Any]:
+                examples = ranking_module.labels_from_rows(store.ranking_labels())
+                model = ranking_module.train_from_labels(examples, l2=options.ranking_prior_strength)
+                store.save_ranking_model(model.as_dict())
+                seen_counts = store.seen_counts([c.id for c in passed])
+                ranking_module.rank_candidates(passed, model, seen_counts)
+                return {k: v for k, v in model.as_dict().items() if k != "weights"}
+
+            ranking_summary = run_stage("ranking", _rank)
+            if ranking_summary is None:
+                report.degradations.append(
+                    "Learning your acceptance patterns failed this run; suggestions are "
+                    "ordered by each miner's own score instead."
+                )
+            else:
+                report.ranking = ranking_summary
+
         # --- persist ---------------------------------------------------
         # Per candidate, not per loop: one candidate whose payload will not
         # serialise must not take the other forty with it.
         for candidate in passed:
             def _save(candidate=candidate) -> bool:
+                ranking_info = candidate.extra.get("ranking") or {}
                 store.upsert_suggestion(
                     candidate.id,
                     candidate.miner,
@@ -683,6 +905,7 @@ def run_analysis(
                     candidate.score,
                     candidate.as_dict(resolver),
                     run_id,
+                    accept_probability=ranking_info.get("probability"),
                 )
                 if candidate.backtest:
                     store.save_backtest(candidate.id, candidate.backtest)

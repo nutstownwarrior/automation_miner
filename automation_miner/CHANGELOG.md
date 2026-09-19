@@ -1,5 +1,140 @@
 # Changelog
 
+## 0.9.0
+
+**Added: a learned sequence model — `sequence_model_enabled` (OFF by default)**
+
+Every miner this add-on ships is really a hand-specified projection of one
+underlying question: what does this household do next, given what just
+happened? `time_of_day.py` asks it of the clock; `association.py` of
+co-occurring pairs, capped at two items; `sequence.py` of ordered
+subsequences that repeat verbatim; `conditional.py` of one signal at a time,
+tested independently. None of them can see an interaction the others handle,
+and none can see three things interacting at once.
+
+A compact GRU (pure numpy, hand-derived forward/backward, no autodiff
+library), trained on **training-window data only**, now learns that question
+directly from a tokenised `(entity, state, time-gap)` event stream and
+predicts the next human action from recent context. Wherever it predicts one
+with real confidence *and* that exact context/outcome pair has real,
+counted support in history, `amminer/learn/sequence.py` proposes a
+candidate - trigger, up to two extra conditions, and the predicted action -
+which then passes through the same backtest and conflict machinery as
+every other miner's, unchanged.
+
+- **Off by default**, unlike every other non-LLM feature in this add-on: a
+  compact model still costs real CPU and memory a Raspberry Pi may not have
+  to spare. A capability check (`amminer.learn.sequence.capability`) runs on
+  every attempt regardless, and declines with a specific, honest reason -
+  not enough CPU cores, not enough available memory - rather than attempting
+  a fit it cannot afford.
+- Every number a candidate carries is counted directly from history
+  (`occurrences`/`opportunities`/`confidence`), exactly like every other
+  miner's evidence; the model's own predicted probability is reported
+  separately and never substituted in. A candidate needs both bars cleared.
+- Bounded context (6 events), vocabulary (48 items), model size, training
+  examples, gradient steps and wall-clock, all fixed module constants - see
+  that module's own docstring for the measured training time on a realistic
+  synthetic year and the reasoning behind each figure.
+- Trains deterministically: seeded, fixed iteration budget, bit-reproducible
+  across processes given the same input, same as `home_mode`'s own model.
+- Nothing is persisted - refit from scratch each run, like the input it
+  learns from; its candidates are already persisted as ordinary suggestions.
+- Like `home_mode` and `ranking`, this can only ever propose a candidate,
+  never rescue one that fails its backtest or conflict checks.
+
+## 0.8.0
+
+**Added: inferred household mode — `home_mode_enabled` (on by default)**
+
+The single most predictive variable in a home has never had an entity: whether
+the household is asleep, out, winding down, cooking, hosting guests. Without
+it, a real habit that is actually driven by that unobserved state looks like
+noisy clock behaviour to every miner - a light that goes on inconsistently
+around 22:00-23:00 on "winding down" evenings clears neither the time-of-day
+miner's consistency bar nor the conditional miner's, when conditioned on the
+right latent state it would clear both easily.
+
+A small hidden Markov model, fit nightly with EM (pure numpy - no
+scikit-learn, no hmmlearn) on binned human activity from **training-window
+data only**, now infers a handful of such household modes and exposes the
+result as an ordinary signal (`amminer/learn/home_mode.py`) in exactly the
+shape `amminer/enrich/signals.py` already produces - `amminer.miners.conditional`
+tests it exactly like it tests outdoor temperature or a workday sensor,
+through the code path that already existed.
+
+- The number of modes is never hardcoded: it is selected per household, from
+  a small range, by held-out likelihood on a slice of training data the fit
+  never saw (falling back to BIC when there is not enough history to spare
+  the slice) - a quiet or simple home legitimately comes back with two.
+- States are unlabelled and unsupervised. Nothing claims a mode is "asleep" or
+  "away" - each is described by what was actually observed while the model
+  was in it (typical hours, most active domains and areas), and a fitted
+  model that turns out weakly separated says so rather than presenting a
+  confident-looking split that is not really there. An optional, clearly
+  marked LLM-proposed label (`llm_home_mode_labels`, off by default) can
+  suggest a friendlier name - advisory only, and the feature works
+  identically with no LLM configured.
+- Fitted on the same training window every other miner mines from, never the
+  holdout carved off to validate suggestions against - the mode signal is an
+  input to mining, so leaking the holdout into it would reopen exactly the
+  leak PR #9 exists to prevent.
+- Bounded for a nightly cron on a Raspberry Pi: at most 60 days of 15-minute
+  activity bins, a handful of candidate state counts, a handful of restarts,
+  a capped iteration count - see the module's own docstring for the exact
+  figures and the reasoning behind each one.
+- Like the ranking model, this only ever adds a conditionable signal. It
+  cannot change whether a candidate passes its backtest or conflict checks.
+
+Known limitation, stated plainly rather than papered over: the inferred mode
+is not (yet) published as a live Home Assistant entity, so a suggestion
+whose only distinguishing condition is the household's mode cannot be
+one-click-applied today - `amminer.llm.validate` correctly refuses to ship a
+trigger or condition naming an entity Home Assistant does not have. The
+signal is already useful for mining, scoring and explaining habits; making it
+literally appliable needs a follow-up that publishes the current mode into
+Home Assistant as a helper entity kept up to date between nightly runs.
+
+## 0.7.0
+
+**Added: learned ordering — `ranking_enabled` (on by default)**
+
+Every miner has always scored its own candidates with its own arithmetic -
+association rules by `confidence * lift`, time-of-day habits by `consistency *
+hits`, staleness by raw age. `Evidence`'s own docstring has said for a while
+that these numbers are not comparable across miners, and the index page sorted
+them against each other anyway.
+
+Suggestions are now ordered by one calibrated number instead: the estimated
+probability that *you* accept this particular suggestion, learned from your own
+accept/dismiss history. Each miner's own score and evidence stay on the card
+exactly as before - this replaces the ordering, not the explanation.
+
+- A brand-new instance has no history to learn from, so a hand-set prior
+  (documented, weight by weight, in `amminer/learn/ranking.py`) provides a
+  sane starting order: a holdout-validated candidate outranks an in-sample
+  one, more conflicts and riskier action domains rank lower, and so on.
+- As you accept and dismiss things, a personal model is fit *towards* that
+  prior rather than towards zero, so with little data the fit barely moves
+  and it takes real, consistent evidence to pull it away
+  (`ranking_prior_strength` controls how hard - lower means your own
+  decisions move things sooner).
+- On top of that, the personal fit is cross-validated against the prior
+  before it is ever used, with a statistical test rather than a bare
+  smaller-number comparison. If a handful of noisy decisions would not
+  *clearly* make the ordering better than the prior alone, the prior is used
+  instead and the card says so.
+- This is ranking and display only. It cannot rescue a suggestion that failed
+  its backtest, and it cannot hide one that passed - those gates are entirely
+  unaffected, the same way the existing AI triage and classification features
+  can only demote or add, never decide.
+- Every card says plainly how much its number rests on general patterns versus
+  your own decisions, rather than showing a precise-looking percentage earned
+  by three data points.
+
+Turn it off with `ranking_enabled: false` to go back to sorting by each
+miner's own score, unchanged.
+
 ## 0.6.0
 
 Four more optional AI features, all `false` by default and all requiring

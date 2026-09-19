@@ -168,6 +168,35 @@ class Options:
     #: by default: these are security decisions, not conveniences.
     allow_security_actions: bool = False
 
+    # --- post-deployment automation health (amminer.health) -------------
+    #: Below this many days of history since an automation was applied, its
+    #: health verdict would rest on almost nothing - "not enough data yet"
+    #: is shown instead of a confident-looking number.
+    health_min_days: int = 7
+    #: Floor on predicted fires before "the pattern is still happening but
+    #: the automation never actually ran" is trusted as dormancy rather than
+    #: read as an ordinary quiet spell.
+    health_min_predicted_for_dormant: int = 3
+    #: Share of an automation's real fires a human reversed within the
+    #: override window (override_window_seconds) before it is flagged noisy
+    #: rather than treated as an occasional, ordinary correction.
+    health_noisy_override_rate: float = 0.3
+    #: Share above which it is not "sometimes wrong" but "wrong most of the
+    #: time it runs" - the recommendation escalates from retune to retire.
+    health_overridden_override_rate: float = 0.6
+    #: Below this many *real* fires, an override rate is a ratio over almost
+    #: nothing - one fire and one revert is a 100% override rate and a single
+    #: observation with a percentage's name on it.  Below this floor a verdict
+    #: that depends on override_rate (healthy, noisy or overridden) is not
+    #: shown at all; only dormancy, which needs no fires to have happened,
+    #: can still be reported.
+    health_min_fires_for_verdict: int = 5
+    #: Below this fraction of its predicted fires, an automation that is
+    #: technically still running has still largely stopped doing its job -
+    #: distinct from dormant (zero real fires): this one fires occasionally,
+    #: just far less than the pattern it was built from says it should.
+    health_shortfall_ratio: float = 0.3
+
     # --- being told ---
     #: Post a notification in Home Assistant when a run finds something new.
     #: On by default: suggestions live in this add-on's own database, so
@@ -234,7 +263,103 @@ class Options:
     #: not say.  Only entities with no area are considered, only areas that
     #: already exist may be used, and every guess is marked as one.
     llm_areas: bool = False
+    #: Let the model propose a short, human-readable label for one inferred
+    #: household mode (amminer.learn.home_mode) from its typical hours and
+    #: active domains/areas - advisory only, exactly like llm_triage/
+    #: llm_audit: it can suggest a name, never invent a mode, change which
+    #: candidates are surfaced, or replace the honest, structural description
+    #: (typical hours, top domains/areas) that is shown regardless of whether
+    #: this is on.
+    llm_home_mode_labels: bool = False
     llm_triage_penalty: float = 0.5
+
+    # --- home mode (amminer.learn.home_mode) ----------------------------
+    #: Infer a small number of unobserved household "modes" (asleep, away,
+    #: winding down...) from binned activity, via a hidden Markov model fit
+    #: on training-window data only, and expose the result as a signal
+    #: amminer.miners.conditional can condition on. On by default: unlike the
+    #: LLM features above, this needs no external provider and degrades to
+    #: "no mode signal available" (with an honest reason) when there is not
+    #: yet enough history - see amminer/learn/home_mode.py. Never affects the
+    #: backtest gate or conflict checking; disabling it only removes one
+    #: candidate signal, the same as a signal amminer.enrich.detect never
+    #: found.
+    home_mode_enabled: bool = True
+    #: Below this many days of *training* history, fitting a latent-mode model
+    #: is skipped outright rather than attempted, and reported honestly as
+    #: "not enough history yet" (the same ``report.degradations``/status-page
+    #: pattern ``backtest_min_train_days`` above already uses) - fitting one
+    #: anyway would be both slow and dishonest: a home whose mode has not
+    #: been observed enough to support a latent-mode model does not get a
+    #: confident-looking split instead. The value mirrors
+    #: ``backtest_min_train_days`` (this project's existing bar for "enough
+    #: training history to mine anything from") and comfortably clears
+    #: ``amminer.learn.home_mode.MIN_BINS_FOR_HELD_OUT_SELECTION`` (~10.4
+    #: days) - the point below which even this module's own *preferred*
+    #: state-count criterion (held-out likelihood) cannot run at all, leaving
+    #: only the in-sample BIC fallback, which that module's own test suite
+    #: shows can be fooled by non-Gaussian count noise into manufacturing an
+    #: extra "mode". Below this floor, a fit is not just slow, it rests on
+    #: the less trustworthy of this project's two sanctioned criteria.
+    home_mode_min_train_days: int = 14
+
+    # --- learned ranking (amminer.learn.ranking) -----------------------
+    #: Order suggestions by a calibrated estimate of how likely *this user* is
+    #: to accept them, learned from their own accept/dismiss history, instead
+    #: of by each miner's own incomparable score. On by default: unlike the
+    #: LLM features above, this needs no external provider and degrades to a
+    #: hand-set prior with zero configuration - see amminer/learn/ranking.py.
+    #: Never affects the backtest gate or conflict checking; disabling it only
+    #: returns to sorting by each miner's own score.
+    ranking_enabled: bool = True
+    #: How strongly the personal fit is pulled towards the hand-set prior
+    #: (an L2 penalty, in standardised feature units, centred on the prior
+    #: rather than on zero - see amminer/learn/ranking.py). Higher means a
+    #: given amount of your own history moves the ordering less; lower means
+    #: it moves faster and trusts fewer decisions more. The default was
+    #: chosen so that decisions genuinely uncorrelated with anything leave
+    #: the ordering close to the prior's even at two dozen of them, while a
+    #: real, consistent preference over ~40 decisions still moves it clearly.
+    ranking_prior_strength: float = 30.0
+
+    # --- learned sequence model (amminer.learn.sequence) ----------------
+    #: Train a small, pure-numpy sequence model (a compact GRU) over
+    #: tokenised (entity, state, time-gap) events to predict the next human
+    #: action from recent context, and propose the predictions that have
+    #: real historical support as candidates - see amminer/learn/sequence.py
+    #: for the full reasoning. OFF by default, unlike home_mode_enabled/
+    #: ranking_enabled above: training it costs real CPU and memory that a
+    #: Raspberry Pi may not have to spare, so this flag gates whether a fit
+    #: is even attempted - disabled costs nothing, not even the capability
+    #: check. Turning it on does not skip that check: every attempt still
+    #: goes through the capability gate (amminer.learn.sequence.capability)
+    #: first and declines honestly rather than attempting a fit it cannot
+    #: afford. Never affects the backtest gate or conflict checking; every
+    #: candidate it proposes passes through both unchanged, exactly like
+    #: every other miner's.
+    sequence_model_enabled: bool = False
+    #: Below this many days of *training* history, fitting is skipped
+    #: outright - a higher bar than home_mode_min_train_days/
+    #: backtest_min_train_days because this model has to learn per-entity,
+    #: per-context transition structure, not one household-wide split.
+    sequence_model_min_train_days: int = 30
+    #: How often the model's predicted action must have actually followed
+    #: the same context in training history before it is trusted (an
+    #: empirical, counted ratio - occurrences/opportunities - never the raw
+    #: softmax score, which is reported alongside but never substituted in;
+    #: see that module's own honesty section).
+    sequence_model_min_confidence: float = 0.75
+    #: How confident the model itself must be (its own predicted
+    #: probability, averaged over the times this exact context actually
+    #: produced this outcome) before a candidate is proposed at all - a
+    #: second, independent bar on top of sequence_model_min_confidence, not
+    #: a substitute for it.
+    sequence_model_min_model_probability: float = 0.6
+    #: The minimum number of times a (context, action) pair must actually
+    #: have occurred in training history - mirrors min_occurrences above,
+    #: kept separate because this model's contexts are narrower (they can
+    #: include up to two extra conditions) and so naturally rarer.
+    sequence_model_min_occurrences: int = 5
 
     # --- paths (overridable for tests) ---
     ha_config_dir: str = "/homeassistant"
@@ -261,6 +386,7 @@ class Options:
         self.backtest_holdout_fraction = min(max(float(self.backtest_holdout_fraction), 0.0), 0.9)
         self.backtest_min_holdout_days = max(int(self.backtest_min_holdout_days), 1)
         self.backtest_min_train_days = max(int(self.backtest_min_train_days), 1)
+        self.home_mode_min_train_days = max(int(self.home_mode_min_train_days), 1)
         self.sequence_min_occurrences = max(int(self.sequence_min_occurrences), 2)
         self.association_window_seconds = max(int(self.association_window_seconds), 1)
         self.stale_automation_days = max(int(self.stale_automation_days), 1)
@@ -270,6 +396,32 @@ class Options:
         self.llm_triage_penalty = min(max(float(self.llm_triage_penalty), 0.0), 1.0)
         self.llm_classification_batch = max(int(self.llm_classification_batch), 5)
         self.override_window_seconds = max(int(self.override_window_seconds), 1)
+        self.ranking_prior_strength = max(float(self.ranking_prior_strength), 0.01)
+        self.sequence_model_min_train_days = max(int(self.sequence_model_min_train_days), 1)
+        self.sequence_model_min_confidence = min(
+            max(float(self.sequence_model_min_confidence), 0.0), 1.0
+        )
+        self.sequence_model_min_model_probability = min(
+            max(float(self.sequence_model_min_model_probability), 0.0), 1.0
+        )
+        self.sequence_model_min_occurrences = max(int(self.sequence_model_min_occurrences), 2)
+        self.health_min_days = max(int(self.health_min_days), 1)
+        self.health_min_predicted_for_dormant = max(int(self.health_min_predicted_for_dormant), 1)
+        self.health_noisy_override_rate = min(
+            max(float(self.health_noisy_override_rate), 0.0), 1.0
+        )
+        self.health_overridden_override_rate = min(
+            max(float(self.health_overridden_override_rate), 0.0), 1.0
+        )
+        self.health_min_fires_for_verdict = max(int(self.health_min_fires_for_verdict), 1)
+        self.health_shortfall_ratio = min(max(float(self.health_shortfall_ratio), 0.0), 1.0)
+        # A rule the user is only sometimes wrong about (noisy) has to be a
+        # lower bar than one they are wrong about most of the time
+        # (overridden), or every noisy automation would also read as
+        # overridden - the escalation this module recommends would never
+        # actually escalate.
+        if self.health_overridden_override_rate < self.health_noisy_override_rate:
+            self.health_overridden_override_rate = self.health_noisy_override_rate
 
     # ------------------------------------------------------------------
     def is_excluded(self, entity_id: str) -> bool:
@@ -307,6 +459,7 @@ class Options:
             "explanations": bool(self.llm_explain),
             "scenes": bool(self.llm_scenes),
             "area_inference": bool(self.llm_areas),
+            "home_mode_labels": bool(self.llm_home_mode_labels),
         }
 
     @property

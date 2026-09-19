@@ -25,10 +25,31 @@ def wired(ha_config_dir, store, fake_client):
 
 def test_every_page_renders(wired):
     client, _store, _runner, _ha = wired
-    for path in ("/", "/gaps", "/audit", "/dismissed", "/status"):
+    for path in ("/", "/gaps", "/audit", "/dismissed", "/status", "/automations"):
         response = client.get(path)
         assert response.status_code == 200, path
         assert "Automation Miner" in response.text
+
+
+def test_status_page_explains_the_off_default_after_a_real_run(wired):
+    """report.sequence_model is populated (fitted: False, a fallback_reason
+    of "disabled...") even when the feature is off, exactly like every other
+    optional feature's report entry - the template must still show the
+    friendlier, actionable explanation for the off state, not the terse
+    per-run fallback reason that entry carries (see the fix for the dead
+    branch this pins down)."""
+    client, _store, _runner, _ha = wired
+    body = client.get("/status").text
+    section = body[body.index("Learned sequence model"):]
+    assert "Off by default" in section
+    assert "Did not run this time" not in section
+
+
+def test_automations_page_is_empty_before_anything_is_applied(wired):
+    client, _store, _runner, _ha = wired
+    response = client.get("/automations")
+    assert response.status_code == 200
+    assert "Nothing applied yet" in response.text
 
 
 def test_suggestion_detail_shows_evidence_and_backtest(wired):
@@ -214,6 +235,33 @@ def test_apply_writes_and_reloads(wired):
     assert "id" not in written  # the id travels in the URL, per HA's config API
 
 
+def test_a_successful_apply_is_remembered_for_health_checks(wired):
+    """apply.py writing the automation is only half the job: runner.apply must
+    also record the stable marker and a snapshot, or amminer.health has
+    nothing to ever check."""
+    client, store, _runner, ha = wired
+    actionable = [s for s in store.list_suggestions(status="new") if s["payload"].get("actions")]
+    suggestion_id = actionable[0]["id"]
+    result = client.post(f"/api/suggestions/{suggestion_id}/apply").json()
+    assert result["ok"] is True
+
+    applied = store.list_applied_automations()
+    assert len(applied) == 1
+    row = applied[0]
+    assert row["automation_id"] == result["automation_id"]
+    assert row["automation_id"] in ha.written
+    assert row["suggestion_id"] == suggestion_id
+    assert row["candidate_payload"]["actions"]
+    # The exact config written to Home Assistant, id included - apply.py
+    # strips it only from the HTTP body, not from what this add-on keeps.
+    assert row["shipped_config"]["id"] == row["automation_id"]
+    assert row["health"] is None  # no run has judged it yet
+
+    page = client.get("/automations")
+    assert page.status_code == 200
+    assert str(escape(row["title"])) in page.text
+
+
 def test_apply_is_refused_when_validation_fails(wired):
     client, store, runner, ha = wired
     ha.check_config_result = "invalid"
@@ -222,6 +270,7 @@ def test_apply_is_refused_when_validation_fails(wired):
     assert result["ok"] is False
     assert result["errors"]
     assert not ha.written
+    assert store.list_applied_automations() == []
 
 
 def test_apply_refuses_audit_findings(wired):
@@ -331,8 +380,13 @@ def test_a_hidden_suggestion_is_shown_with_the_rule_that_hid_it(wired):
     assert "Hidden by a preference" in page
     assert "Never automate the guest room." in page
     assert title in page
-    # And it is not on the suggestions page it was hidden from.
-    assert title not in client.get("/").text
+    # And it is not on the suggestions page it was hidden from.  Checked by
+    # the card's own element id rather than by title text: two mined
+    # candidates can legitimately describe overlapping actions (a single-step
+    # habit and a routine that includes that same step), so one's title can
+    # be a plain-text substring of another's sentence without either being a
+    # duplicate - the id is what is actually unique.
+    assert f'id="s-{suggestion["id"]}"' not in client.get("/").text
 
 
 def test_switching_a_preference_off_restores_what_it_hid(wired):
@@ -685,3 +739,4 @@ def test_building_the_provider_does_not_freeze_the_ui_either(
     assert health_status == 200
     assert answered_while_waiting, "/health waited for the provider to be built"
     assert elapsed < 0.5, f"/health waited {elapsed:.2f}s while a provider was built"
+

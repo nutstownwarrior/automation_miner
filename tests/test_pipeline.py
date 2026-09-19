@@ -81,6 +81,143 @@ def test_overrides_are_persisted(ha_config_dir, store, fake_client):
     assert "automation.bedtime_dim" in store.override_counts()
 
 
+# --- automation health (amminer.health), against the same real fixture ---
+# The synthetic dataset already contains, on every day of its 45: an
+# "automation.bedtime_dim" that fires and is overridden about 70% of the
+# time (Pattern 4), and an "automation.holiday_mode" that updates its own
+# state daily but never actually fires (no context - Pattern "stale
+# automation"). That is two of this feature's required scenarios for free,
+# through the real causality/override pipeline rather than hand-built data.
+def _record_applied(store, monkeypatch, automation_id, title, at, target_entity, applied_ts):
+    """Insert an applied_automations row stamped at *applied_ts*, not "now" -
+    record_applied_automation always uses time.time(), and the fixture's
+    history is fixed at a 2024 date far from any real current time."""
+    import time as time_module
+
+    from amminer.miners.base import Action, Candidate, Trigger
+
+    candidate = Candidate(
+        miner="time_of_day",
+        title=title,
+        triggers=[Trigger(kind="time", at=at)],
+        actions=[Action(service="light.turn_on", entity_id=target_entity)],
+    )
+    monkeypatch.setattr(time_module, "time", lambda: applied_ts)
+    try:
+        store.record_applied_automation(
+            automation_id, "sugg-" + automation_id, title, candidate.as_dict(),
+            {"id": automation_id},
+        )
+    finally:
+        monkeypatch.undo()
+
+
+def test_a_real_habit_the_user_keeps_overriding_is_flagged_by_a_real_run(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    _record_applied(
+        store, monkeypatch, "bedtime1", "Bedtime dim", "22:15:00", "light.bedroom",
+        applied_ts=0.0,  # long before the fixture's window: the whole thing is evaluated
+    )
+    report, _ = run(ha_config_dir, store, fake_client)
+    assert report.automations["checked"] == 1
+
+    applied = store.get_applied_automation("bedtime1")
+    payload = applied["health"]["payload"]
+    # It really did fire most days, and was overridden most of those times -
+    # both read from real causality classification and real detected
+    # overrides, not from anything this test constructed by hand.
+    assert payload["actual_fires"] > 30
+    assert payload["overrides"] > 15
+    assert payload["override_rate"] > 0.5
+    assert applied["health"]["verdict"] in ("overridden", "noisy")
+    assert "undid it" in payload["evidence"]
+
+
+def test_a_stale_automation_that_never_fires_is_reported_dormant_by_a_real_run(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    _record_applied(
+        store, monkeypatch, "holiday1", "Holiday mode", "03:00:00", "light.hallway",
+        applied_ts=0.0,
+    )
+    run(ha_config_dir, store, fake_client)
+
+    applied = store.get_applied_automation("holiday1")
+    payload = applied["health"]["payload"]
+    # The pattern it would fire on (every day, by the clock) is plainly there;
+    # Home Assistant's own record of this automation running is not.
+    assert payload["predicted_fires"] > 30
+    assert payload["actual_fires"] == 0
+    assert applied["health"]["verdict"] == "dormant"
+
+
+def test_an_automation_applied_two_days_ago_is_not_enough_data_from_a_real_run(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    first_report, _ = run(ha_config_dir, store, fake_client)
+    applied_ts = first_report.window[1] - 2 * 86400.0
+    _record_applied(
+        store, monkeypatch, "bedtime1", "Bedtime dim", "22:15:00", "light.bedroom", applied_ts
+    )
+    run(ha_config_dir, store, fake_client)
+
+    applied = store.get_applied_automation("bedtime1")
+    assert applied["health"]["verdict"] == "insufficient_data"
+    assert applied["health"]["status"] == "active"
+
+
+def test_a_deleted_automation_is_reported_gone_by_a_real_run(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    _record_applied(
+        store, monkeypatch, "never_existed", "Ghost automation", "22:15:00", "light.bedroom",
+        applied_ts=0.0,
+    )
+    run(ha_config_dir, store, fake_client)
+
+    applied = store.get_applied_automation("never_existed")
+    assert applied["health"]["status"] == "deleted"
+    assert applied["health"]["verdict"] == "n/a"
+
+
+def test_a_corrupt_applied_row_does_not_blank_the_others_health_from_a_real_run(
+    ha_config_dir, store, fake_client, monkeypatch
+):
+    """One malformed applied_automations row must cost only its own verdict -
+    every other applied automation's health still comes out of the same run."""
+    import time as time_module
+
+    _record_applied(
+        store, monkeypatch, "bedtime1", "Bedtime dim", "22:15:00", "light.bedroom",
+        applied_ts=0.0,
+    )
+    monkeypatch.setattr(time_module, "time", lambda: 0.0)
+    try:
+        # "holiday1" is automation.holiday_mode - a real, live, enabled
+        # automation in this fixture (states-only, so its config is never
+        # compared against shipped_config), giving evaluate() a live
+        # automation to proceed against far enough to actually attempt
+        # candidate_from_payload and hit the corrupt trigger shape.
+        store.record_applied_automation(
+            "holiday1", "sugg-broken", "Broken automation",
+            {"triggers": [{"kind": "state", "no_such_field": "x"}], "actions": []},
+            {"id": "holiday1"},
+        )
+    finally:
+        monkeypatch.undo()
+
+    report, _ = run(ha_config_dir, store, fake_client)
+    assert report.automations["checked"] == 2
+
+    good = store.get_applied_automation("bedtime1")
+    assert good["health"]["verdict"] in ("overridden", "noisy")
+
+    broken = store.get_applied_automation("holiday1")
+    assert broken["health"]["status"] == "error"
+    assert "could not check" in broken["health"]["payload"]["evidence"].lower()
+
+
 def test_gap_suggestions_are_produced(ha_config_dir, store, fake_client):
     run(ha_config_dir, store, fake_client)
     gaps = store.list_gaps()
@@ -932,3 +1069,63 @@ def test_no_activity_in_holdout_is_reported_as_a_run_level_degradation(
     monkeypatch.setattr(pipeline_module, "backtest_all", stub)
     report, _candidates = run(ha_config_dir, store, fake_client)
     assert any("no activity in the held-out period" in d for d in report.degradations)
+
+
+# --- ranking (amminer.learn.ranking) ------------------------------------
+def test_ranking_scores_and_orders_suggestions_from_a_cold_start(
+    ha_config_dir, store, fake_client
+):
+    """Zero-config, zero-history: still gets a calibrated ordering from the prior."""
+    report, _candidates = run(ha_config_dir, store, fake_client)
+
+    assert report.ranking
+    assert report.ranking["n_labels"] == 0
+    assert report.ranking["fallback_to_prior"] is True
+
+    rows = store.list_suggestions(status="new")
+    actionable = [r for r in rows if r["payload"].get("actions")]
+    assert actionable
+    for row in actionable:
+        assert row["accept_probability"] is not None
+        assert 0.0 <= row["accept_probability"] <= 1.0
+        ranking_extra = row["payload"]["extra"]["ranking"]
+        assert ranking_extra["probability"] == pytest.approx(row["accept_probability"])
+        assert "have not accepted or dismissed" in ranking_extra["confidence_note"]
+
+    # accept_probability, not score, decides the order the index page reads.
+    ordered_by_probability = [r["id"] for r in
+                               sorted(rows, key=lambda r: -(r["accept_probability"] or -1))]
+    assert [r["id"] for r in store.list_suggestions(status="new")] == ordered_by_probability
+
+
+def test_ranking_disabled_falls_back_to_todays_score_ordering(ha_config_dir, store, fake_client):
+    report, _candidates = run(ha_config_dir, store, fake_client, ranking_enabled=False)
+
+    assert report.ranking == {}
+    rows = store.list_suggestions(status="new")
+    assert rows
+    for row in rows:
+        assert row["accept_probability"] is None
+        assert "ranking" not in (row["payload"].get("extra") or {})
+    assert [r["id"] for r in rows] == [
+        r["id"] for r in sorted(rows, key=lambda r: -r["score"])
+    ]
+
+
+def test_ranking_model_is_retrained_from_real_accept_dismiss_decisions(
+    ha_config_dir, store, fake_client
+):
+    """A second run picks up decisions made after the first, and only those."""
+    run(ha_config_dir, store, fake_client)
+    rows = [r for r in store.list_suggestions(status="new") if r["payload"].get("actions")]
+    store.accept(rows[0]["id"])
+    store.dismiss(rows[1]["id"], "not for me")
+
+    report, _candidates = run(ha_config_dir, store, fake_client)
+
+    # Two real decisions is below MIN_LABELS_TO_FIT, so the prior is still
+    # used - but the model now knows two labels exist, proving the labels
+    # made it from the store into the retrained model.
+    assert report.ranking["n_labels"] == 2
+    stored_model = store.get_ranking_model()
+    assert stored_model["n_labels"] == 2

@@ -10,11 +10,13 @@
 <article class="detail">
   <header>
     <span class="tag miner">{{ suggestion.miner.replace('_', ' ') }}</span>
+    {{ m.ranking_badge(p.extra) }}
     <span class="score">{{ '%.2f' % suggestion.score }}</span>
     <span class="tag status">{{ suggestion.status }}</span>
   </header>
   <h2>{{ suggestion.title }}</h2>
   <p class="sentence lead">{{ p.sentence or suggestion.summary }}</p>
+  {{ m.ranking_note(p.extra) }}
   {{ m.explanation_block(p.extra) }}
 
   <section class="rule">

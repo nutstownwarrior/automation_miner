@@ -1,6 +1,6 @@
 ---
 name: Automation Miner
-version: "0.6.0"
+version: "0.9.0"
 slug: automation_miner
 description: >-
   Mines your Home Assistant history for genuinely useful, explainable automation
@@ -43,6 +43,12 @@ options:
   backtest_holdout_fraction: 0.25
   backtest_min_holdout_days: 7
   backtest_min_train_days: 14
+  health_min_days: 7
+  health_min_predicted_for_dormant: 3
+  health_noisy_override_rate: 0.3
+  health_overridden_override_rate: 0.6
+  health_min_fires_for_verdict: 5
+  health_shortfall_ratio: 0.3
   allow_security_actions: false
   notify_on_new_suggestions: true
   notify_service: ""
@@ -62,6 +68,16 @@ options:
   llm_explain: false
   llm_scenes: false
   llm_areas: false
+  llm_home_mode_labels: false
+  home_mode_enabled: true
+  home_mode_min_train_days: 14
+  ranking_enabled: true
+  ranking_prior_strength: 30.0
+  sequence_model_enabled: false
+  sequence_model_min_train_days: 30
+  sequence_model_min_confidence: 0.75
+  sequence_model_min_model_probability: 0.6
+  sequence_model_min_occurrences: 5
 schema:
   log_level: list(trace|debug|info|notice|warning|error|fatal)?
   schedule: str?
@@ -83,6 +99,12 @@ schema:
   backtest_holdout_fraction: float(0.0,0.9)?
   backtest_min_holdout_days: int(1,3650)?
   backtest_min_train_days: int(1,3650)?
+  health_min_days: int(1,3650)?
+  health_min_predicted_for_dormant: int(1,1000)?
+  health_noisy_override_rate: float(0.0,1.0)?
+  health_overridden_override_rate: float(0.0,1.0)?
+  health_min_fires_for_verdict: int(1,1000)?
+  health_shortfall_ratio: float(0.0,1.0)?
   allow_security_actions: bool?
   notify_on_new_suggestions: bool?
   notify_service: str?
@@ -105,7 +127,17 @@ schema:
   llm_explain: bool?
   llm_scenes: bool?
   llm_areas: bool?
+  llm_home_mode_labels: bool?
   llm_classification_batch: int(5,200)?
   llm_hypothesis_candidates: int(0,100)?
   llm_hypotheses_per_candidate: int(0,10)?
   llm_triage_penalty: float(0.0,1.0)?
+  home_mode_enabled: bool?
+  home_mode_min_train_days: int(1,3650)?
+  ranking_enabled: bool?
+  ranking_prior_strength: float(0.01,1000.0)?
+  sequence_model_enabled: bool?
+  sequence_model_min_train_days: int(1,3650)?
+  sequence_model_min_confidence: float(0.0,1.0)?
+  sequence_model_min_model_probability: float(0.0,1.0)?
+  sequence_model_min_occurrences: int(2,1000)?

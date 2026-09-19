@@ -192,6 +192,14 @@ def create_app(
             ),
         )
 
+    @app.get("/automations", response_class=HTMLResponse)
+    def automations_view(request: Request):
+        return templates.TemplateResponse(
+            request=request,
+            name="automations.html",
+            context=context(request, applied=store.list_applied_automations()),
+        )
+
     @app.get("/status", response_class=HTMLResponse)
     def status_view(request: Request):
         llm = build_provider(options).status().as_dict()
@@ -376,8 +384,7 @@ def create_app(
         if result is None:
             raise HTTPException(status_code=404, detail="unknown suggestion")
         if result.get("ok"):
-            store.set_status(suggestion_id, STATUS_ACCEPTED)
-            store.add_feedback(suggestion_id, "accepted", result)
+            store.accept(suggestion_id, result)
         elif result.get("needs_confirmation"):
             # Not a failure: the user has not answered yet.
             store.add_feedback(suggestion_id, "apply_needs_confirmation", result)

@@ -91,6 +91,25 @@
   {% endif %}
 {% endmacro %}
 
+{% macro ranking_badge(extra) %}
+  {# Ordering only - amminer/learn/ranking.py. This never changes which
+     suggestions are shown, only where they land in the list; the miner's own
+     score alongside it is untouched. #}
+  {% set ranking = (extra or {}).get('ranking') %}
+  {% if ranking %}
+  <span class="score" title="{{ ranking.confidence_note }}">
+    {{ '%.0f%%' % (ranking.probability * 100) }} likely accepted
+  </span>
+  {% endif %}
+{% endmacro %}
+
+{% macro ranking_note(extra) %}
+  {% set ranking = (extra or {}).get('ranking') %}
+  {% if ranking %}
+  <p class="small muted">Ordering: {{ ranking.confidence_note }}.</p>
+  {% endif %}
+{% endmacro %}
+
 {% macro assist_block(extra) %}
   {% set triage = (extra or {}).get('triage') %}
   {% set hypothesis = (extra or {}).get('hypothesis') %}

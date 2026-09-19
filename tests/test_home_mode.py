@@ -1,0 +1,804 @@
+"""The inferred household-mode model (amminer.learn.home_mode).
+
+Five things this file exists to prove, each picked because a subtly broken
+version of this feature would still pass a superficial test:
+
+* it recovers a real, planted latent structure from synthetic activity,
+* it does not manufacture states a quiet, simple home does not have,
+* it is bit-reproducible given the same input, in a *fresh* process,
+* it never learns anything from data outside the window it is given, even
+  when a caller hands it extra rows by mistake,
+* a miner actually produces a better-conditioned candidate once the signal
+  is available, where clock time alone was not enough.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import random
+import subprocess
+import sys
+from itertools import permutations
+from pathlib import Path
+
+import numpy as np
+import pytest
+from amminer import backtest as backtest_module
+from amminer.config import Options
+from amminer.enrich.detect import SignalSet
+from amminer.enrich.signals import SignalStore
+from amminer.learn import home_mode as hm
+from amminer.miners import conditional, time_of_day
+from amminer.miners.time_of_day import human_action_events
+from amminer.recorderdb.models import Cause, StateChange
+from amminer.store import Store
+from amminer.testing.synthetic import build_two_regime_activity, build_winddown_habit_activity
+
+os.environ.setdefault("TZ", "UTC")
+
+#: The multi-seed EM sweeps below are genuine evidence (see each test's own
+#: docstring) but each one fits several full, production-shaped models - the
+#: same "needs its own CI job, not the default matrix" tradeoff
+#: test_recorder_queries.py's MariaDB dialect test already makes for a
+#: different kind of expensive-but-worth-running test. Gated the same way:
+#: a marker for `-m` selection (see the `test-model-sweeps` CI job) plus a
+#: skip unless the env var is set, so a plain `pytest` locally or in the
+#: default three-version matrix does not pay for it either.
+RUN_SLOW_MODEL_TESTS = os.environ.get("AMMINER_RUN_SLOW_MODEL_TESTS")
+_slow_model = pytest.mark.skipif(
+    not RUN_SLOW_MODEL_TESTS,
+    reason="set AMMINER_RUN_SLOW_MODEL_TESTS=1 to run the multi-seed home-mode EM sweeps "
+    "(see the dedicated test-model-sweeps CI job)",
+)
+
+
+@pytest.fixture
+def options() -> Options:
+    return Options()
+
+
+def _best_agreement(labels: np.ndarray, truth: list[int], n_states: int) -> float:
+    """Best label-permutation match - states are unlabelled, so index 0 in
+    the fit need not be index 0 in the ground truth."""
+    truth_arr = np.asarray(truth[: len(labels)])
+    best = 0.0
+    for perm in permutations(range(n_states)):
+        mapped = np.array([perm[label] for label in labels])
+        best = max(best, float((mapped == truth_arr).mean()))
+    return best
+
+
+# --- recovering a planted structure -------------------------------------
+def _clean_two_regime(days: int, seed: int = 1, busy_start_hour: int = 8, busy_end_hour: int = 22):
+    """A regime whose ground truth is directly what the activity shows.
+
+    build_two_regime_activity's own bursts are short and randomly timed
+    within an hour that is merely *eligible* for activity - which is
+    realistic, but means "the hour is busy" and "there is visible activity"
+    are not the same claim, and a model reading only activity has no way to
+    recover an "eligibility" label it was never shown evidence of (see the
+    diagnosis in this test's own history). This fixture makes the two claims
+    the same one on purpose - each busy hour is active for (almost) the
+    whole hour, aligned to bin boundaries - specifically so recovery against
+    ground truth is a meaningful thing to assert on.
+    """
+    rng = random.Random(seed)
+    entity_id = "light.living"
+    changes: list[StateChange] = []
+    n_bins = int(days * 86400.0 // 900.0)
+    regime_by_bin = [0] * n_bins
+    for bin_idx in range(n_bins):
+        hour = int((bin_idx * 900.0 % 86400.0) // 3600)
+        regime_by_bin[bin_idx] = 1 if busy_start_hour <= hour < busy_end_hour else 0
+    for day in range(days):
+        for hour in range(24):
+            hour_start = day * 86400.0 + hour * 3600.0
+            busy = busy_start_hour <= hour < busy_end_hour
+            p = 0.95 if busy else 0.03
+            if rng.random() >= p:
+                continue
+            duration = 3600.0 if busy else rng.uniform(300.0, 600.0)
+            on = StateChange(entity_id, "on", hour_start, old_state="off")
+            on.cause = Cause.HUMAN
+            changes.append(on)
+            off = StateChange(entity_id, "off", hour_start + duration, old_state="on")
+            off.cause = Cause.HUMAN
+            changes.append(off)
+    return changes, (0.0, days * 86400.0), regime_by_bin
+
+
+def test_recovers_known_modes_from_synthetic_data(options):
+    """A clean two-regime household: the decoded labels should track it."""
+    changes, window, regime_by_bin = _clean_two_regime(days=45, seed=1)
+    model = hm.fit(changes, SignalSet(), options, window)
+    assert model.fitted
+
+    counts, first_idx = hm.build_feature_matrix(changes, SignalSet(), options, *window)
+    x = hm._to_features(counts)
+    labels = hm.decode_labels(x, model.initial, model.transition, model.means, model.variances,
+                               model.var_floor)
+    assert first_idx == 0
+    agreement = _best_agreement(labels, regime_by_bin, model.n_states)
+    # Not 100%: causal filtering will occasionally mislabel a bin at a
+    # transition edge, or when a "busy" hour happened to be quiet. A test
+    # that demanded perfection would break on the first unlucky bin; one
+    # that accepts anything would not be testing recovery at all.
+    assert agreement > 0.85, f"decoded labels only agreed with ground truth {agreement:.0%}"
+
+
+def test_recovered_states_are_honestly_described(options):
+    """State summaries must describe what was observed, not invent a name."""
+    fixture = build_two_regime_activity(days=45, seed=1)
+    model = hm.fit(fixture.changes, SignalSet(), options, fixture.window)
+    assert model.fitted
+    assert len(model.state_summaries) == model.n_states
+    busy = [s for s in model.state_summaries if s["top_domains"]]
+    assert busy, "no state picked up the daytime light activity at all"
+    for summary in model.state_summaries:
+        # Never a name asserting a fact the model cannot know.
+        assert summary["llm_label"] is None
+        assert summary["llm_label_is_advisory"] is True
+        assert 0.0 <= summary["occupancy_share"] <= 1.0
+        assert summary["label"] == f"mode_{summary['state']}"
+
+
+# --- minimum training history -----------------------------------------
+def test_too_little_history_skips_the_fit_and_says_so(options):
+    """Below ``home_mode_min_train_days``, no model is fit at all - fast, and
+    honest about why, the same "not enough history yet" pattern this project
+    already gives ``backtest_min_train_days``/``health_min_days`` (see that
+    field's own docstring in ``amminer.config``)."""
+    fixture = build_two_regime_activity(days=5, seed=1)
+    train_days = (fixture.window[1] - fixture.window[0]) / 86400.0
+    assert train_days < options.home_mode_min_train_days
+    model = hm.fit(fixture.changes, SignalSet(), options, fixture.window)
+    assert not model.fitted
+    assert "days of training history" in model.fallback_reason
+    assert f"< {options.home_mode_min_train_days}" in model.fallback_reason
+
+
+def test_home_mode_min_train_days_is_configurable():
+    """Lowering the option lets a fit that would otherwise be skipped run -
+    the same knob every other "enough history to trust this" bar in this
+    project already exposes."""
+    fixture = build_two_regime_activity(days=5, seed=1)
+    lowered = Options(home_mode_min_train_days=4)
+    model = hm.fit(fixture.changes, SignalSet(), lowered, fixture.window)
+    assert model.fitted
+
+
+def test_a_short_window_still_falls_back_to_bic_when_configured_for_it():
+    """A window too thin for a held-out slice to mean anything (see
+    ``hm.MIN_BINS_FOR_HELD_OUT_SELECTION``) still gets a fit - via this
+    module's other sanctioned criterion, in-sample BIC - when the caller has
+    actively asked to fit on that little (a lowered
+    ``home_mode_min_train_days``), honestly labelled as the less trustworthy
+    of the two (see :func:`hm.select_model`'s own docstring)."""
+    small = Options(home_mode_min_train_days=5)
+    fixture = build_two_regime_activity(days=8, seed=1)
+    model = hm.fit(fixture.changes, SignalSet(), small, fixture.window)
+    assert model.fitted
+    assert model.selection_method == "bic"
+
+
+# --- shared fixture fits for the state-count sweeps below -----------------
+#
+# The tests below all exercise `build_two_regime_activity` across a spread
+# of seeds (or, for the cheap always-on "_smoke" tests, a single seed drawn
+# from that same spread), and several of them exercise the *same* (days,
+# seed) pairs to check different properties of the same fit (never
+# collapses to one state; never inflates past a few states; is not
+# weakly-separated when it does report more than two). Fitting is
+# deterministic given the same input (see
+# test_fit_is_deterministic_within_a_process) - so re-fitting the same
+# synthetic history from scratch in each test bought nothing but CPU: a full
+# production-shaped fit costs several seconds each, and the naive version of
+# the full sweeps performed 32 of them where only 18 distinct (days, seed)
+# pairs are ever actually needed - and a smoke test sharing a seed with the
+# sweep it stands in for (see each one's own docstring) costs nothing extra
+# at all whenever both happen to run in the same process. This cache makes
+# that sharing explicit rather than accidental duplication, without
+# weakening any assertion or reducing which seeds the sweeps check - every
+# seed and every property is still exercised exactly as before, just
+# against a fit computed once instead of several times.
+_TWO_REGIME_FIT_CACHE: dict[tuple[int, int], hm.HomeModeModel] = {}
+
+
+def _fit_two_regime(days: int, seed: int) -> hm.HomeModeModel:
+    key = (days, seed)
+    if key not in _TWO_REGIME_FIT_CACHE:
+        fixture = build_two_regime_activity(days=days, seed=seed)
+        _TWO_REGIME_FIT_CACHE[key] = hm.fit(
+            fixture.changes, SignalSet(), Options(), fixture.window
+        )
+    return _TWO_REGIME_FIT_CACHE[key]
+
+
+# --- state-count selection ------------------------------------------------
+@pytest.mark.slow_model
+@_slow_model
+def test_state_count_stays_small_for_a_quiet_home():
+    """A simple two-regime home must never be *confidently* reported as
+    having five separate modes - it may honestly find more than the two true
+    regimes, but only when it also says, plainly, that they are not well
+    separated.
+
+    This fixture's activity durations are close to constant (a burst lasts
+    "about an hour", not an exponential time), which a first-order Markov
+    chain's memoryless dwell time cannot represent with one state per true
+    regime - splitting one regime into two states with *the same* emission
+    distribution but different transition dynamics genuinely improves
+    held-out likelihood a little (approximating a non-exponential dwell time
+    with an extra "phase"), which is exactly why raw state count alone is
+    not this test's assertion: two states with identical means are, by
+    construction, not distinguishable to a description built from what was
+    observed (see :attr:`HomeModeModel.weakly_separated`), and it is that
+    honesty flag - not the count - this feature's users are actually
+    protected by. What must never happen is *both* an inflated count *and*
+    a confident (unflagged) story about it: see amminer/learn/home_mode.py's
+    "Honesty about what the modes are".
+    """
+    for seed in range(1, 6):
+        model = _fit_two_regime(days=45, seed=seed)
+        assert model.fitted
+        assert model.n_states <= max(hm.STATE_CANDIDATES)
+        if model.n_states > 2:
+            assert model.weakly_separated, (
+                f"seed {seed}: reported {model.n_states} states for a genuinely "
+                "two-regime home without flagging them as weakly separated "
+                f"(scores: {model.score_by_states})"
+            )
+
+
+def test_state_count_stays_small_for_a_quiet_home_smoke():
+    """Cheap, always-on stand-in for test_state_count_stays_small_for_a_quiet_home
+    (``@pytest.mark.slow_model`` - see the dedicated ``test-model-sweeps`` CI job for
+    the full 5-seed sweep this proves across). One seed cannot prove the property
+    holds in general, but it does catch a gross regression - e.g. selection
+    regressing to "always pick the top of STATE_CANDIDATES" - in every default
+    matrix run, not just whenever the sweep job happens to run. Seed 1 is chosen
+    deliberately: at this seed the home *does* report more than two states (see
+    the sweep above), so this is also the smoke coverage for the
+    :attr:`HomeModeModel.weakly_separated` honesty flag, not just the ceiling.
+    """
+    model = _fit_two_regime(days=45, seed=1)
+    assert model.fitted
+    assert model.n_states <= max(hm.STATE_CANDIDATES)
+    if model.n_states > 2:
+        assert model.weakly_separated, (
+            f"reported {model.n_states} states for a genuinely two-regime home "
+            f"without flagging them as weakly separated (scores: {model.score_by_states})"
+        )
+
+
+def test_a_third_real_regime_is_still_found(options):
+    """The flip side: real, separated structure must not be flattened away."""
+    fixture = build_winddown_habit_activity(days=60, seed=3)
+    model = hm.fit(fixture.changes, SignalSet(), options, fixture.window)
+    assert model.fitted
+    assert model.n_states >= 3, (
+        "a genuinely distinct third regime (wind-down) should not collapse into two"
+    )
+
+
+def test_em_does_not_silently_collapse_to_one_effective_state():
+    """A model that reports k>=2 but only ever occupies one of them is exactly
+    as dishonest as reporting k=1 outright.
+
+    A *single* EM run can land in a degenerate local optimum by chance - that
+    is exactly why fitting is never done with just one (see RESTARTS and
+    _drop_unoccupied_states's own docstring on this failure mode). What must
+    never happen is the *actual* fitting path - best-of-restarts, then
+    pruned - reporting two states while only ever deciding one of them, on
+    data genuinely built to have two.
+    """
+    changes, window, _regime = _clean_two_regime(days=45, seed=1)
+    x, _ = hm.build_feature_matrix(changes, SignalSet(), Options(), *window)
+    x = hm._to_features(x)
+    var_floor = hm._variance_floor(x)
+    fits = hm._fit_candidates(x, var_floor, max_k_exclusive=len(x))
+    best = hm._drop_unoccupied_states(fits[2], x, var_floor)
+    labels = hm.decode_labels(x, best.initial, best.transition, best.means, best.variances,
+                               var_floor)
+    occupied = {int(label) for label in labels}
+    assert len(occupied) == len(best.initial) == 2, (
+        f"only state(s) {occupied} were ever decoded, on data built to have two"
+    )
+
+
+def test_selection_survives_an_unlucky_restart_draw():
+    """The exact case a review of this module reproduced: selection found
+    (what looked like) clear held-out evidence for several states, but the
+    full-quality refit's own restarts could, by bad luck, causally
+    distinguish fewer of them - and the old rule for picking among restarts
+    ("exactly k or fall back to raw smoothed likelihood") could then report
+    a single undifferentiated mode even though selection's own evidence said
+    otherwise.
+
+    ``build_two_regime_activity(days=365, seed=7)`` was the original
+    reproduction: with only :data:`hm.SELECTION_RESTARTS` ``== 2`` (since
+    raised - see that constant's own comment), ``select_model`` scored k=4
+    far above k=2/3, but the old exact-k-or-bust rule's three restarts on
+    the full-quality refit causally occupied only ``{1, 2, 2}`` states -
+    none hit 4 - so it fell back to whichever of those three had the best
+    *smoothed* training likelihood, which happened to be the one occupying
+    only 1. That was not a fit that happened to disagree with selection by
+    one or two states; it was the complete opposite conclusion (one mode,
+    not several) from evidence that was never in question - see
+    ``_select_best_restart``'s own docstring, which is the fix this
+    specific case motivated and still tests.
+
+    What this case's *own* evidence actually supports has since changed:
+    that "k=4 far above k=2/3" reading was itself an artifact of the same
+    family of bug, one level up - ``k=2``'s ranking-stage fit was, at only 2
+    cheap restarts, *itself* landing on a degenerate (1-effective-state) fit,
+    making every larger k look dramatically better by comparison to a
+    baseline that never represented the data it already had (see
+    :func:`hm._larger_fit_adds_a_novel_state`'s own docstring, and
+    :data:`hm.SELECTION_RESTARTS`'s comment on why it was raised). Refit
+    fairly, this fixture's true, defensible count is 2 - so this test
+    asserts what actually matters and is still true either way: whatever
+    the fair count turns out to be, it is never reported as a single
+    undifferentiated mode when the data underneath it is genuinely built
+    from (at least) two regimes.
+    """
+    model = _fit_two_regime(days=365, seed=7)
+    assert model.fitted
+    assert model.n_states >= 2, (
+        "held-out selection found strong evidence for multiple states, but the "
+        f"reported model collapsed to {model.n_states} (scores: {model.score_by_states})"
+    )
+
+
+@pytest.mark.slow_model
+@_slow_model
+def test_two_regime_structure_is_never_collapsed_to_one_state():
+    """Across a spread of seeds, a household built from two genuinely
+    different regimes must never be reported as a single undifferentiated
+    mode - regardless of which restart happens to have the best *smoothed*
+    training likelihood (see test_selection_survives_an_unlucky_restart_draw
+    and _select_best_restart's own docstring for why that used to matter).
+    """
+    collapsed = []
+    for seed in range(8):
+        model = _fit_two_regime(days=365, seed=seed)
+        if model.fitted and model.n_states < 2:
+            collapsed.append((seed, model.n_states, model.score_by_states))
+    assert not collapsed, (
+        f"a two-regime household collapsed to a single mode for: {collapsed}"
+    )
+
+
+def test_two_regime_structure_is_never_collapsed_smoke():
+    """Cheap, always-on stand-in for both test_two_regime_structure_is_never_collapsed_to_one_state
+    and the 365-day half of test_state_count_stays_small_across_seeds (both
+    ``@pytest.mark.slow_model`` - see the dedicated ``test-model-sweeps`` CI job for the
+    full sweeps this proves across). One seed cannot prove either property holds in
+    general, but it does catch a gross regression - collapse *or* inflation - in every
+    default matrix run.
+    """
+    ceiling = max(hm.STATE_CANDIDATES) - 1
+    model = _fit_two_regime(days=365, seed=0)
+    assert model.fitted
+    assert model.n_states >= 2, (
+        "a two-regime household collapsed to a single mode "
+        f"(scores: {model.score_by_states})"
+    )
+    assert model.n_states <= ceiling, (
+        f"expected at most {ceiling} states for a simple two-regime home, got "
+        f"{model.n_states} (scores: {model.score_by_states})"
+    )
+
+
+@pytest.mark.slow_model
+@_slow_model
+def test_state_count_stays_small_across_seeds():
+    """The flip side of the two tests above, and the one the honesty-contract
+    assertion in test_state_count_stays_small_for_a_quiet_home cannot catch
+    on its own: ``weakly_separated=True whenever count > 2`` is satisfied by
+    *every* over-segmented fit, so it would keep passing even if selection
+    regressed to "always pick the top of STATE_CANDIDATES" - which is
+    exactly what happened when occupied-count-first restart selection (the
+    fix for the collapse bug above) was also applied inside the per-candidate
+    *ranking* stage: a restart that fragments one true regime into several
+    near-duplicate states always looked preferable there too, systematically
+    pulling every seed to 4 or 5 states, never 2 (see
+    ``_select_best_restart``'s own docstring for the mechanism, and
+    ``_larger_fit_adds_a_novel_state`` for the fix - a larger k must add a
+    state that is not just a near-duplicate of one the smaller model
+    already had, not merely score significantly better).
+
+    This bounds the *outcome* directly rather than trusting any single
+    internal mechanism: a genuinely two-regime household's reported count
+    must stay well clear of :data:`hm.STATE_CANDIDATES`'s top end, across a
+    spread of seeds and both the 45- and 365-day windows this module's other
+    fixtures already use.
+    """
+    ceiling = max(hm.STATE_CANDIDATES) - 1  # "well below max k", not merely "not max k"
+    counts: list[int] = []
+    for seed in range(1, 11):
+        model = _fit_two_regime(days=45, seed=seed)
+        assert model.fitted
+        counts.append(model.n_states)
+        assert model.n_states <= ceiling, (
+            f"45-day seed {seed}: expected at most {ceiling} states for a simple "
+            f"two-regime home, got {model.n_states} (scores: {model.score_by_states})"
+        )
+    mean_count = sum(counts) / len(counts)
+    assert mean_count <= 3.5, (
+        f"mean state count across seeds drifted toward the top of the candidate "
+        f"range: {counts} (mean {mean_count:.2f})"
+    )
+
+    for seed in range(8):
+        model = _fit_two_regime(days=365, seed=seed)
+        assert model.fitted
+        assert model.n_states <= ceiling, (
+            f"365-day seed {seed}: expected at most {ceiling} states for a simple "
+            f"two-regime home, got {model.n_states} (scores: {model.score_by_states})"
+        )
+
+
+# --- determinism -----------------------------------------------------------
+def test_fit_is_deterministic_within_a_process(options):
+    fixture = build_two_regime_activity(days=45, seed=1)
+    first = hm.fit(fixture.changes, SignalSet(), options, fixture.window)
+    second = hm.fit(fixture.changes, SignalSet(), options, fixture.window)
+    assert first.n_states == second.n_states
+    assert np.array_equal(first.means, second.means)
+    assert np.array_equal(first.transition, second.transition)
+    assert np.array_equal(first.initial, second.initial)
+    assert first.log_likelihood == second.log_likelihood
+
+
+def test_fit_is_deterministic_across_processes(tmp_path: Path):
+    """The same input must give the same model in a *fresh* Python process -
+    not merely the same process twice, which would miss anything seeded from
+    wall-clock time, PYTHONHASHSEED-sensitive dict/set ordering, or per-process
+    global state."""
+    script = tmp_path / "fit_once.py"
+    amminer_root = str(Path(__file__).resolve().parents[1] / "automation_miner")
+    script.write_text(
+        "import json, sys, os\n"
+        "os.environ['TZ'] = 'UTC'\n"
+        f"sys.path.insert(0, {amminer_root!r})\n"
+        "from amminer.config import Options\n"
+        "from amminer.enrich.detect import SignalSet\n"
+        "from amminer.learn import home_mode as hm\n"
+        "from amminer.testing.synthetic import build_two_regime_activity\n"
+        "fixture = build_two_regime_activity(days=45, seed=1)\n"
+        "model = hm.fit(fixture.changes, SignalSet(), Options(), fixture.window)\n"
+        "print(json.dumps({\n"
+        "    'n_states': model.n_states,\n"
+        "    'means': model.means.tolist(),\n"
+        "    'transition': model.transition.tolist(),\n"
+        "    'log_likelihood': model.log_likelihood,\n"
+        "}))\n"
+    )
+    results = []
+    for _ in range(2):
+        proc = subprocess.run(
+            [sys.executable, str(script)], capture_output=True, text=True, check=True, timeout=120
+        )
+        results.append(json.loads(proc.stdout))
+
+    assert results[0]["n_states"] == results[1]["n_states"]
+    assert results[0]["log_likelihood"] == results[1]["log_likelihood"]
+    assert np.allclose(results[0]["means"], results[1]["means"])
+    assert np.allclose(results[0]["transition"], results[1]["transition"])
+
+
+# --- mode identity across runs ----------------------------------------------
+def _relabelled(model: hm.HomeModeModel, order: list[int]) -> hm.HomeModeModel:
+    """A model carrying exactly ``model``'s own states, renumbered by ``order``
+    (state ``i``'s data becomes state ``order[i]``) - a stand-in for "the
+    model a previous, otherwise-identical run happened to persist", used to
+    prove alignment is actually driven by ``previous`` and not merely today's
+    own (deterministic, so otherwise indistinguishable) fit order.
+    """
+    idx = np.argsort(order)
+    return hm.HomeModeModel(
+        fitted=True,
+        n_states=model.n_states,
+        feature_names=model.feature_names,
+        means=model.means[idx],
+        variances=model.variances[idx],
+        initial=model.initial[idx],
+        transition=model.transition[np.ix_(idx, idx)],
+    )
+
+
+def test_state_identity_is_aligned_to_the_previous_run(options):
+    """EM's states are unlabelled - two fits of the same underlying behaviour
+    have no reason to number their states the same way. Passing the previous
+    run's model must relabel this run's states to match it wherever the two
+    line up, without changing anything about the fit itself (the same
+    activity groups the same way; only which integer names each group can
+    move).
+    """
+    fixture = build_two_regime_activity(days=45, seed=1)
+    baseline = hm.fit(fixture.changes, SignalSet(), options, fixture.window)
+    assert baseline.fitted and baseline.n_states >= 2
+
+    # A "previous run" that is baseline's own fit with states 0 and 1 swapped -
+    # exactly what an independent restart draw on identical behaviour could
+    # have produced.
+    order = list(range(baseline.n_states))
+    order[0], order[1] = order[1], order[0]
+    previous = _relabelled(baseline, order)
+
+    aligned = hm.fit(fixture.changes, SignalSet(), options, fixture.window, previous=previous)
+    assert aligned.fitted
+    assert np.allclose(aligned.means[0], baseline.means[1])
+    assert np.allclose(aligned.means[1], baseline.means[0])
+    assert np.allclose(aligned.variances[0], baseline.variances[1])
+    assert np.allclose(aligned.variances[1], baseline.variances[0])
+    # A pure relabelling changes no fitted number, including the likelihood.
+    assert aligned.log_likelihood == baseline.log_likelihood
+    assert aligned.n_states == baseline.n_states
+
+    # Decoded labels must move with the relabelling too, not just the
+    # parameters describing each state - otherwise "mode_0" in the decoded
+    # signal and "mode_0" in state_summaries could disagree about which
+    # physical state it names.
+    counts, first_idx = hm.build_feature_matrix(fixture.changes, SignalSet(), options,
+                                                 *fixture.window)
+    x = hm._to_features(counts)
+    baseline_labels = hm.decode_labels(x, baseline.initial, baseline.transition, baseline.means,
+                                        baseline.variances, baseline.var_floor)
+    aligned_labels = hm.decode_labels(x, aligned.initial, aligned.transition, aligned.means,
+                                       aligned.variances, aligned.var_floor)
+    swapped_expected = np.where(
+        baseline_labels == 0, 1, np.where(baseline_labels == 1, 0, baseline_labels)
+    )
+    assert np.array_equal(aligned_labels, swapped_expected)
+
+
+def test_no_alignment_without_a_matching_previous_model(options):
+    """No previous model, a differently-shaped one, or one with a different
+    state count must all leave this run's own (arbitrary but deterministic)
+    order alone rather than guessing at a partial relabelling."""
+    fixture = build_two_regime_activity(days=45, seed=1)
+    baseline = hm.fit(fixture.changes, SignalSet(), options, fixture.window)
+    assert baseline.fitted
+
+    no_previous = hm.fit(fixture.changes, SignalSet(), options, fixture.window, previous=None)
+    assert np.array_equal(no_previous.means, baseline.means)
+
+    unfitted_previous = hm.HomeModeModel(fitted=False, fallback_reason="cold start")
+    still_default = hm.fit(
+        fixture.changes, SignalSet(), options, fixture.window, previous=unfitted_previous
+    )
+    assert np.array_equal(still_default.means, baseline.means)
+
+    fewer_states_previous = hm.HomeModeModel(
+        fitted=True,
+        n_states=1,
+        feature_names=baseline.feature_names,
+        means=baseline.means[:1],
+        variances=baseline.variances[:1],
+        initial=np.array([1.0]),
+        transition=np.array([[1.0]]),
+    )
+    mismatched_k = hm.fit(
+        fixture.changes, SignalSet(), options, fixture.window, previous=fewer_states_previous
+    )
+    assert np.array_equal(mismatched_k.means, baseline.means)
+
+
+# --- the holdout discipline -------------------------------------------------
+def test_fit_ignores_activity_outside_the_given_window(options):
+    """Rows in the input that fall outside [start, end) must never move the fit -
+    the guarantee is in build_feature_matrix's own filtering, not in callers
+    being careful about what they pass."""
+    fixture = build_two_regime_activity(days=45, seed=1)
+    split_ts = fixture.window[0] + 30 * 86400.0
+    train_window = (fixture.window[0], split_ts)
+    train_only = [c for c in fixture.changes if c.ts < split_ts]
+
+    clean = hm.fit(train_only, SignalSet(), options, train_window)
+
+    # A markedly different "holdout" - a home that never turns anything off,
+    # so if it leaked in at all it would show up unmistakably.
+    polluted_tail = []
+    for change in fixture.changes:
+        if change.ts >= split_ts:
+            noisy = StateChange(
+                change.entity_id, "on", change.ts, old_state="off"
+            )
+            noisy.cause = Cause.HUMAN
+            polluted_tail.append(noisy)
+    polluted = hm.fit(train_only + polluted_tail, SignalSet(), options, train_window)
+
+    assert clean.fitted and polluted.fitted
+    assert clean.n_states == polluted.n_states
+    assert np.array_equal(clean.means, polluted.means)
+    assert np.array_equal(clean.transition, polluted.transition)
+    assert clean.train_bins == polluted.train_bins
+    assert clean.log_likelihood == polluted.log_likelihood
+
+
+def test_pipeline_fits_the_mode_model_on_the_training_window_only(
+    ha_config_dir, store: Store, fake_client, monkeypatch
+):
+    """The actual wiring, not just the module's own robustness: amminer.pipeline
+    must call home_mode.fit with the train window, never the full one."""
+    from amminer import pipeline as pipeline_module
+
+    calls: list[tuple[float, float]] = []
+    real_fit = pipeline_module.home_mode_module.fit
+
+    def spy(changes, signals, options, train_window, resolver=None, previous=None):
+        calls.append(train_window)
+        return real_fit(changes, signals, options, train_window, resolver, previous)
+
+    monkeypatch.setattr(pipeline_module.home_mode_module, "fit", spy)
+
+    options = Options(ha_config_dir=str(ha_config_dir), state_dir=str(ha_config_dir))
+    from amminer.discovery.ha_config import HAConfig
+
+    report, _candidates = pipeline_module.run_analysis(
+        options, store, fake_client, HAConfig(ha_config_dir)
+    )
+
+    assert calls, "home_mode.fit was never called"
+    called_window = calls[0]
+    expected = backtest_module.split_window(report.window, options).train
+    assert called_window == expected
+    # And it must be strictly shorter than the full analysis window whenever
+    # there is a real holdout - the whole point of the split.
+    assert called_window[1] <= report.window[1]
+    assert called_window[1] < report.window[1] or report.window[1] == report.window[0]
+
+
+# --- "must never gate" ------------------------------------------------------
+def test_disabling_home_mode_only_removes_a_signal_never_a_gate(ha_config_dir, fake_client):
+    """Turning home_mode off must change nothing about what passes or fails -
+    only the signal offered to the conditional miner, exactly like a signal
+    amminer.enrich.detect never found."""
+    from amminer.discovery.ha_config import HAConfig
+    from amminer.pipeline import run_analysis
+
+    on_options = Options(ha_config_dir=str(ha_config_dir), state_dir=str(ha_config_dir),
+                          home_mode_enabled=True)
+    off_options = Options(ha_config_dir=str(ha_config_dir), state_dir=str(ha_config_dir),
+                           home_mode_enabled=False)
+
+    with Store(":memory:") as store_on:
+        report_on, candidates_on = run_analysis(on_options, store_on, fake_client,
+                                                  HAConfig(ha_config_dir))
+    with Store(":memory:") as store_off:
+        report_off, candidates_off = run_analysis(off_options, store_off, fake_client,
+                                                    HAConfig(ha_config_dir))
+
+    assert report_off.home_mode == {}
+    # home_mode may (or may not, on this particular fixture) let the
+    # conditional miner surface one extra candidate that uses it - that is
+    # the feature working, not it gating anything. What "never gates" means
+    # here is narrower and exact: every candidate that did *not* depend on
+    # the mode signal must be identical, id for id, whether or not the
+    # feature ran at all - a coincidence of two same-sized but different sets
+    # would not satisfy this.
+    ids_on_without_mode = {
+        c.id for c in candidates_on if hm.HOME_MODE_ENTITY_ID not in c.entities
+    }
+    ids_off = {c.id for c in candidates_off}
+    assert ids_on_without_mode == ids_off
+
+
+# --- a miner actually benefiting from the signal ---------------------------
+def test_conditional_miner_recovers_a_habit_clock_time_cannot_explain(options):
+    """The motivating example from the module's own docstring: a habit spread
+    across a wide time window that only the inferred mode can explain."""
+    fixture = build_winddown_habit_activity(days=60, seed=3)
+
+    # Plain clock time: no candidate for the habit clears the bar.
+    tod_candidates = time_of_day.mine(fixture.changes, options, fixture.window)
+    habit_tod = [
+        c for c in tod_candidates
+        if c.actions and c.actions[0].entity_id == fixture.habit_entity_id
+    ]
+    assert not habit_tod, "time-of-day alone should not have recovered this habit"
+
+    # The action really did happen often enough to be a real habit - the
+    # miner failing above is about consistency, not about there being
+    # nothing there.
+    grouped = human_action_events(fixture.changes, options)
+    hits = grouped.get((fixture.habit_entity_id, fixture.habit_state), [])
+    assert len(hits) >= options.min_occurrences
+
+    model = hm.fit(fixture.changes, SignalSet(), options, fixture.window)
+    assert model.fitted
+    signals = SignalSet(home_mode=[hm.HOME_MODE_ENTITY_ID])
+    series = hm.decode_series(model, fixture.changes, signals, options, fixture.window)
+    assert series is not None
+    store = SignalStore()
+    store.add(series)
+
+    conditional_candidates = conditional.mine(
+        fixture.changes, options, signals, store, fixture.window, resolver=None
+    )
+    habit_cond = [
+        c for c in conditional_candidates
+        if c.actions and c.actions[0].entity_id == fixture.habit_entity_id
+    ]
+    assert habit_cond, "conditioning on the inferred mode should have recovered this habit"
+    found = habit_cond[0]
+    assert hm.HOME_MODE_ENTITY_ID in found.entities
+    assert found.evidence.consistency >= conditional.MIN_PURITY
+    assert found.evidence.lift >= conditional.MIN_LIFT
+    # The improvement this whole feature exists to deliver: conditioned on
+    # the mode, this habit is comfortably more consistent than any bare
+    # clock-time reading of the same occurrences could have been.
+    assert found.evidence.consistency > options.min_consistency
+
+
+# --- migration on a populated database --------------------------------------
+def test_home_mode_table_appears_on_a_populated_v4_database(tmp_path: Path):
+    """CREATE TABLE IF NOT EXISTS is a no-op on a table that already exists,
+    so the new table has to be exercised against a database that predates it
+    - not a fresh one, which would pass even if the migration only worked by
+    accident of being the first thing ever run against that file."""
+    from amminer.store import db as db_module
+
+    path = tmp_path / "state.db"
+    start = db_module._SCHEMA.index(
+        "-- A single row (id fixed at 1) holding whatever household-mode"
+    )
+    marker = "CREATE TABLE IF NOT EXISTS home_mode_models"
+    table_start = db_module._SCHEMA.index(marker, start)
+    end = db_module._SCHEMA.index(");", table_start) + len(");")
+    v4_schema = db_module._SCHEMA[:start] + db_module._SCHEMA[end:]
+    assert "home_mode_models" not in v4_schema
+
+    import sqlite3
+
+    conn = sqlite3.connect(str(path))
+    conn.executescript(v4_schema)
+    conn.execute("INSERT INTO meta(key, value) VALUES('schema_version', '4')")
+    conn.execute(
+        "INSERT INTO suggestions(id, miner, title, summary, score, status, payload,"
+        " first_seen_ts, last_seen_ts, seen_count, run_id) VALUES"
+        " ('sugg1', 'time_of_day', 'A suggestion', 'summary', 0.5, 'new', '{}', 1.0, 1.0, 1, 1)"
+    )
+    conn.execute(
+        "INSERT INTO ranking_models(id, feature_schema_version, n_labels, trained_ts,"
+        " fallback_to_prior, fallback_reason, l2, bias, weights, scaler) VALUES"
+        " (1, 1, 0, 1.0, 1, 'cold start', 30.0, -1.0, '{}', '{}')"
+    )
+    conn.commit()
+    conn.close()
+
+    store = Store(path)
+    try:
+        assert store.get_meta("schema_version") == str(db_module.SCHEMA_VERSION)
+        # Pre-existing data survived the migration untouched.
+        suggestion = store.get_suggestion("sugg1")
+        assert suggestion is not None
+        assert suggestion["title"] == "A suggestion"
+        assert store.get_ranking_model() is not None
+
+        # The new table exists and is immediately usable.
+        assert store.get_home_mode_model() is None
+        fixture = build_two_regime_activity(days=45, seed=1)
+        model = hm.fit(fixture.changes, SignalSet(), Options(), fixture.window)
+        store.save_home_mode_model(model.as_dict())
+        row = store.get_home_mode_model()
+        assert row is not None
+        assert row["fitted"] is True
+        assert row["n_states"] == model.n_states
+
+        rebuilt = hm.HomeModeModel.from_row(row)
+        assert rebuilt is not None
+        assert rebuilt.n_states == model.n_states
+        assert np.allclose(rebuilt.means, model.means)
+    finally:
+        store.close()
+
+
+def test_home_mode_counted_in_store_counts(store: Store, options):
+    fixture = build_two_regime_activity(days=45, seed=1)
+    model = hm.fit(fixture.changes, SignalSet(), options, fixture.window)
+    store.save_home_mode_model(model.as_dict())
+    assert store.counts()["home_mode_models"] == 1
